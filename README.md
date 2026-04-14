@@ -88,7 +88,9 @@ salloc -A m4341_g -C "gpu&hbm40g" -N 1 -t 00:30:00 -q interactive
 python tests/gen_testdata.py
 ```
 
-This creates `testdata/small/` (debug) and `testdata/large/` (validation) with inputs and PyTorch-computed reference answers.
+This creates `testdata/small/` (debug) and `testdata/large/` (validation) with inputs and PyTorch-computed reference answers. Uses a fixed random seed (42) so everyone gets identical test data.
+
+**Note:** `testdata/` is git-ignored because `.bin` files are large binaries. Each person runs `gen_testdata.py` locally after cloning — the fixed seed ensures identical results.
 
 ## Development Workflow
 
@@ -128,8 +130,20 @@ Each script reports:
 
 ### A100 theoretical peaks
 
-- FP16 Tensor Core: 312 TFLOPS
-- INT8 Tensor Core: 624 TOPS
+| Precision | Peak (without sparsity) |
+|-----------|------------------------|
+| FP16 Tensor Core | 312 TFLOPS |
+| INT8 Tensor Core | 624 TOPS |
+
+Source: [NVIDIA A100 Data Sheet](https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf) (applies to both PCIe and SXM4 variants).
+
+### Industry comparison references
+
+Benchmark scripts automatically measure these on the same GPU for apples-to-apples comparison:
+
+- **FlashAttention-2**: `F.scaled_dot_product_attention` — PyTorch 2.x built-in, backed by [Dao (2023)](https://arxiv.org/abs/2307.08691). Reports 50-73% A100 utilization in the paper.
+- **cuBLAS FP16**: `torch.mm` — PyTorch's matrix multiply, backed by NVIDIA cuBLAS.
+- **cuBLAS INT8**: `torch._int_mm` — PyTorch's INT8 integer matrix multiply, backed by cuBLAS `cublasLtMatmul`.
 
 ## Correctness Tolerances
 

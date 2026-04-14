@@ -4,38 +4,38 @@ CUDA-optimized Transformer kernels for CS 5220 (Spring 2025). We implement fused
 
 ## Team
 
-| Member    | Responsibility                              |
-|-----------|---------------------------------------------|
-| Jonathan  | FP16 attention kernel (`kernels/attention.cu`) |
-| Shengjing | FP16 MLP kernel (`kernels/mlp.cu`)           |
-| Heling    | INT8 kernels & quantization utilities (`kernels/int8_attention.cu`, `kernels/int8_mlp.cu`, `kernels/quant_utils.cu`) |
+| Member    | Kernel files | Test files |
+|-----------|-------------|------------|
+| Jonathan  | `kernels/attention.cu` | `tests/cuda/test_attention.cu`, `tests/test_attention.py` |
+| Shengjing | `kernels/mlp.cu` | `tests/cuda/test_mlp.cu`, `tests/test_mlp.py` |
+| Heling    | `kernels/int8_attention.cu`, `kernels/int8_mlp.cu`, `kernels/quant_utils.cu` | `tests/cuda/test_int8.cu`, `tests/test_int8.py` |
 
 ## Project Structure
 
 ```
 cuda-transformer-opt/
-├── kernels/
-│   ├── attention.cu        # FP16 fused attention kernel (Jonathan)
-│   ├── mlp.cu              # FP16 fused MLP kernel (Shengjing)
-│   ├── int8_attention.cu   # INT8 quantized attention kernel (Heling)
-│   ├── int8_mlp.cu         # INT8 quantized MLP kernel (Heling)
-│   └── quant_utils.cu      # Shared quantization helpers (Heling)
+├── kernels/                    # CUDA kernel source code
+│   ├── attention.cu            # FP16 fused attention
+│   ├── mlp.cu                  # FP16 fused MLP
+│   ├── int8_attention.cu       # INT8 quantized attention
+│   ├── int8_mlp.cu             # INT8 quantized MLP
+│   └── quant_utils.cu          # Shared quantization helpers
 ├── tests/
-│   ├── cuda/
+│   ├── cuda/                   # Pure CUDA correctness tests
 │   │   ├── test_utils.h        # Shared: load_bin, check_result, parse_config
-│   │   ├── test_attention.cu   # Jonathan: pure CUDA correctness test
-│   │   ├── test_mlp.cu         # Shengjing: pure CUDA correctness test
-│   │   └── test_int8.cu        # Heling: pure CUDA correctness test
+│   │   ├── test_attention.cu
+│   │   ├── test_mlp.cu
+│   │   └── test_int8.cu
 │   ├── gen_testdata.py         # Generate test inputs + reference answers
-│   ├── test_attention.py       # Jonathan: Python benchmark + comparison
-│   ├── test_mlp.py             # Shengjing: Python benchmark + comparison
-│   └── test_int8.py            # Heling: Python benchmark + comparison
-├── testdata/               # Generated .bin files (git-ignored)
-├── baseline.py             # PyTorch FP16 reference implementations
-├── benchmark.py            # GPU timing harness
-├── correctness.py          # Numerical correctness checker
-├── Makefile                # CUDA compilation targets
-├── sweep.py                # Parameter sweep (TBD)
+│   ├── test_attention.py       # Python benchmark + industry comparison
+│   ├── test_mlp.py
+│   └── test_int8.py
+├── testdata/                   # Generated .bin files (git-ignored)
+├── baseline.py                 # PyTorch FP16 reference implementations
+├── benchmark.py                # GPU timing harness
+├── correctness.py              # Numerical correctness checker
+├── Makefile                    # CUDA compilation targets
+├── sweep.py                    # Parameter sweep (TBD)
 └── README.md
 ```
 

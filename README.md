@@ -144,7 +144,9 @@ Source: [NVIDIA A100 Data Sheet](https://www.nvidia.com/content/dam/en-zz/Soluti
 
 ### Industry comparison references
 
-Benchmark scripts automatically measure these on the same GPU for apples-to-apples comparison:
+Benchmark scripts automatically measure these on the same GPU for apples-to-apples comparison.
+
+**Important:** Perlmutter has both A100-PCIe-40GB and A100-SXM4-40GB nodes. The `salloc` constraint `gpu&hbm40g` does not distinguish between them, so you may get either variant across sessions. SXM4 has ~30% higher memory bandwidth than PCIe, which affects latency. **All benchmark numbers for the final report must be collected in a single `salloc` session** to ensure they are measured on the same node.
 
 - **FlashAttention-2**: `F.scaled_dot_product_attention` — PyTorch 2.x built-in, backed by [Dao (2023)](https://arxiv.org/abs/2307.08691). Reports 50-73% A100 utilization in the paper.
 - **cuBLAS FP16**: `torch.mm` — PyTorch's matrix multiply, backed by NVIDIA cuBLAS.

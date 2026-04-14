@@ -37,7 +37,14 @@ def mlp_baseline(x: torch.Tensor, W1: torch.Tensor, W2: torch.Tensor) -> torch.T
     return hidden @ W2
 
 
+def check_cuda():
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available. Did you forget: module load pytorch?")
+    print(f"[CUDA] {torch.cuda.get_device_name(0)}  |  PyTorch {torch.__version__}")
+
+
 if __name__ == "__main__":
+    check_cuda()
     device = "cuda"
     dtype = torch.float16
     batch, heads, seq_len, head_dim = 2, 8, 512, 64

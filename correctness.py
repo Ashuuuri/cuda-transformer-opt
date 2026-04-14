@@ -30,6 +30,9 @@ def check_correctness(
 
 
 if __name__ == "__main__":
+    from baseline import check_cuda
+    check_cuda()
+
     device = "cuda"
     dtype = torch.float16
 

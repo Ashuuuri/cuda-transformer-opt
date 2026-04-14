@@ -27,35 +27,59 @@ cuda-transformer-opt/
 └── README.md
 ```
 
-## Requirements
+## Setup on Perlmutter (NERSC)
 
-- Python 3.8+
-- PyTorch with CUDA support (`torch.cuda.is_available()` must be `True`)
-- NVIDIA GPU with compute capability >= 7.0 (for FP16/INT8 tensor cores)
+### 1. Load the environment
 
-## Quick Start
+```bash
+module load pytorch
+```
 
-### Run the baseline (sanity check)
+This provides Python 3, PyTorch 2.8.0, and CUDA 12.9. Do **not** load the `python` module separately — it will conflict.
+
+### 2. Get a GPU node
+
+```bash
+salloc -A m4341_g -C "gpu&hbm40g" -N 1 -t 00:30:00 -q interactive
+```
+
+### 3. Verify CUDA is available
+
+Every script prints a CUDA confirmation line at startup. You can also check manually:
+
+```bash
+python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+```
+
+Expected output:
+```
+True
+NVIDIA A100-SXM4-40GB
+```
+
+## Running
+
+### Baseline (sanity check)
 
 ```bash
 python baseline.py
 ```
 
-This prints the output shapes of the attention and MLP baselines to confirm everything loads correctly.
+Prints output shapes of attention and MLP to confirm the environment works.
 
-### Run correctness checks
+### Correctness checks
 
 ```bash
 python correctness.py
 ```
 
-Compares kernel outputs against the PyTorch baseline. Uses `torch.allclose` with:
+Compares kernel outputs against the PyTorch baseline using `torch.allclose`:
 - **FP16 kernels**: `atol = 1e-2`
 - **INT8 kernels**: `atol = 0.1`
 
 Reports max absolute error and PASSED/FAILED for each test.
 
-### Run benchmarks
+### Benchmarks
 
 ```bash
 python benchmark.py

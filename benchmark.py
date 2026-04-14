@@ -44,7 +44,8 @@ def benchmark(fn: Callable[..., Any], *args, n_iter: int = 50, n_warmup: int = 1
 
 
 if __name__ == "__main__":
-    from baseline import attention_baseline, mlp_baseline
+    from baseline import attention_baseline, mlp_baseline, check_cuda
+    check_cuda()
 
     device = "cuda"
     dtype = torch.float16

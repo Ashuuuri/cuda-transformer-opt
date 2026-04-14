@@ -6,32 +6,35 @@
 #   make all               — compile all
 #   make clean             — remove compiled binaries
 
-NVCC      = nvcc
+NVCC       = nvcc
 NVCC_FLAGS = -arch=sm_80 --std=c++17 -O2
-INCLUDES  = -I kernels
+INCLUDES   = -I kernels -I tests/cuda
 
 .PHONY: all clean
 
 all: test_attention test_mlp test_int8
 
 # ── Attention (Jonathan) ────────────────────────────────────────────────
-test_attention: kernels/attention.cu
+test_attention: kernels/attention.cu tests/cuda/test_attention.cu
 	$(NVCC) $(NVCC_FLAGS) $(INCLUDES) \
 		kernels/attention.cu \
+		tests/cuda/test_attention.cu \
 		-o test_attention
 
 # ── MLP (Shengjing) ────────────────────────────────────────────────────
-test_mlp: kernels/mlp.cu
+test_mlp: kernels/mlp.cu tests/cuda/test_mlp.cu
 	$(NVCC) $(NVCC_FLAGS) $(INCLUDES) \
 		kernels/mlp.cu \
+		tests/cuda/test_mlp.cu \
 		-o test_mlp
 
 # ── INT8 (Heling) ──────────────────────────────────────────────────────
-test_int8: kernels/int8_attention.cu kernels/int8_mlp.cu kernels/quant_utils.cu
+test_int8: kernels/int8_attention.cu kernels/int8_mlp.cu kernels/quant_utils.cu tests/cuda/test_int8.cu
 	$(NVCC) $(NVCC_FLAGS) $(INCLUDES) \
 		kernels/int8_attention.cu \
 		kernels/int8_mlp.cu \
 		kernels/quant_utils.cu \
+		tests/cuda/test_int8.cu \
 		-o test_int8
 
 clean:

@@ -3,3 +3,11 @@ __pycache__/
 *.pyc
 *.o
 *.so
+
+# Generated test data
+testdata/
+
+# Compiled CUDA test binaries
+test_attention
+test_mlp
+test_int8

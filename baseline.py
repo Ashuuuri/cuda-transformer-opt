@@ -33,7 +33,7 @@ def mlp_baseline(x: torch.Tensor, W1: torch.Tensor, W2: torch.Tensor) -> torch.T
     Returns:
         Output tensor of shape (batch, seq_len, d_model).
     """
-    hidden = F.gelu(x @ W1)
+    hidden = F.gelu(x @ W1, approximate="tanh")
     return hidden @ W2
 
 

@@ -1,6 +1,6 @@
 # cuda-transformer-opt
 
-CUDA-optimized Transformer kernels for CS 5220 (Spring 2025). We implement fused FP16 and INT8-quantized attention and MLP kernels, then benchmark them against a PyTorch baseline.
+CUDA-optimized Transformer kernels for CS 5220 (Spring 2025). We implement fused FP16 and INT8-quantized attention and MLP kernels, then benchmark them against PyTorch baselines and industry references (FlashAttention-2, cuBLAS).
 
 ## Team
 
@@ -15,16 +15,55 @@ CUDA-optimized Transformer kernels for CS 5220 (Spring 2025). We implement fused
 ```
 cuda-transformer-opt/
 ├── kernels/
-│   ├── attention.cu        # FP16 fused attention kernel
-│   ├── mlp.cu              # FP16 fused MLP kernel
-│   ├── int8_attention.cu   # INT8 quantized attention kernel
-│   ├── int8_mlp.cu         # INT8 quantized MLP kernel
-│   └── quant_utils.cu      # Shared quantization helpers
+│   ├── attention.cu        # FP16 fused attention kernel (Jonathan)
+│   ├── mlp.cu              # FP16 fused MLP kernel (Shengjing)
+│   ├── int8_attention.cu   # INT8 quantized attention kernel (Heling)
+│   ├── int8_mlp.cu         # INT8 quantized MLP kernel (Heling)
+│   └── quant_utils.cu      # Shared quantization helpers (Heling)
+├── tests/
+│   ├── gen_testdata.py     # Generate test inputs + reference answers
+│   ├── test_attention.py   # Jonathan: correctness + benchmark
+│   ├── test_mlp.py         # Shengjing: correctness + benchmark
+│   └── test_int8.py        # Heling: correctness + benchmark
+├── testdata/               # Generated .bin files (git-ignored)
 ├── baseline.py             # PyTorch FP16 reference implementations
 ├── benchmark.py            # GPU timing harness
 ├── correctness.py          # Numerical correctness checker
+├── Makefile                # CUDA compilation targets
 ├── sweep.py                # Parameter sweep (TBD)
 └── README.md
+```
+
+## Kernel Interfaces
+
+All kernels use row-major contiguous layout. Do not change these signatures.
+
+```cpp
+// attention.cu — Jonathan
+void attention_forward(
+    const half* Q, const half* K, const half* V, half* out,
+    int batch, int heads, int seq_len, int head_dim
+);  // scale = 1/sqrt(head_dim), computed internally
+
+// mlp.cu — Shengjing
+void mlp_forward(
+    const half* x, const half* W1, const half* W2, half* out,
+    int batch, int seq_len, int d_model, int d_ff
+);  // GELU uses tanh approximation
+
+// int8_attention.cu — Heling
+void int8_attention_forward(
+    const int8_t* Q, const int8_t* K, const int8_t* V, int8_t* out,
+    const float* scale_Q, const float* scale_K, const float* scale_V,
+    int batch, int heads, int seq_len, int head_dim
+);
+
+// int8_mlp.cu — Heling
+void int8_mlp_forward(
+    const int8_t* x, const int8_t* W1, const int8_t* W2, int8_t* out,
+    const float* scale_x, const float* scale_W1, const float* scale_W2,
+    int batch, int seq_len, int d_model, int d_ff
+);
 ```
 
 ## Setup on Perlmutter (NERSC)
@@ -43,49 +82,58 @@ This provides Python 3.12, PyTorch 2.8.0, and CUDA 12.9. Do **not** load the `py
 salloc -A m4341_g -C "gpu&hbm40g" -N 1 -t 00:30:00 -q interactive
 ```
 
-### 3. Verify CUDA is available
-
-Every script prints a CUDA confirmation line at startup. You can also check manually:
+### 3. Generate test data (first time only)
 
 ```bash
-python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+python tests/gen_testdata.py
 ```
 
-Expected output:
-```
-True
-NVIDIA A100-SXM4-40GB
-```
+This creates `testdata/small/` (debug) and `testdata/large/` (validation) with inputs and PyTorch-computed reference answers.
 
-## Running
+## Development Workflow
 
-### Baseline (sanity check)
+Each person works independently on their `.cu` file. Nobody needs to touch shared files.
+
+### Step 1: Compile + test (pure CUDA)
 
 ```bash
-python baseline.py
+make test_attention && ./test_attention    # Jonathan
+make test_mlp && ./test_mlp                # Shengjing
+make test_int8 && ./test_int8              # Heling
 ```
 
-Prints output shapes of attention and MLP to confirm the environment works.
+Reads `.bin` test data, compares kernel output against reference. Reports PASS/FAIL + max error.
 
-### Correctness checks
+### Step 2: Benchmark against industry references (Python)
 
 ```bash
-python correctness.py
+python tests/test_attention.py    # Jonathan
+python tests/test_mlp.py          # Shengjing
+python tests/test_int8.py         # Heling
 ```
 
-Compares kernel outputs against the PyTorch baseline using `torch.allclose`:
+Each script reports:
+- Correctness vs PyTorch baseline
+- Latency comparison (your kernel vs naive baseline vs industry reference)
+- TFLOPS and A100 utilization %
+
+## Benchmark Comparisons
+
+| Kernel | Comparison baselines |
+|--------|---------------------|
+| FP16 Attention (Jonathan) | Naive PyTorch, FlashAttention-2 (`F.scaled_dot_product_attention`) |
+| FP16 MLP (Shengjing) | Naive PyTorch, cuBLAS (`torch.mm`) |
+| INT8 Attention (Heling) | FP16 baseline, FP16 kernel (Jonathan's) |
+| INT8 MLP (Heling) | FP16 baseline, cuBLAS INT8 (`torch._int_mm`) |
+
+### A100 theoretical peaks
+
+- FP16 Tensor Core: 312 TFLOPS
+- INT8 Tensor Core: 624 TOPS
+
+## Correctness Tolerances
+
 - **FP16 kernels**: `atol = 1e-2`
 - **INT8 kernels**: `atol = 0.1`
 
-Reports max absolute error and PASSED/FAILED for each test.
-
-### Benchmarks
-
-```bash
-python benchmark.py
-```
-
-Times each kernel using `torch.cuda.Event`:
-- 10 warmup iterations (discarded)
-- 50 timed iterations
-- Reports mean latency in milliseconds
+When a test fails, the checker prints diagnostics: worst error location, first 8 elements comparison, and percentage of elements exceeding tolerance.

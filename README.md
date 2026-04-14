@@ -35,7 +35,7 @@ cuda-transformer-opt/
 module load pytorch
 ```
 
-This provides Python 3, PyTorch 2.8.0, and CUDA 12.9. Do **not** load the `python` module separately — it will conflict.
+This provides Python 3.12, PyTorch 2.8.0, and CUDA 12.9. Do **not** load the `python` module separately — it will conflict.
 
 ### 2. Get a GPU node
 

@@ -21,10 +21,15 @@ cuda-transformer-opt/
 │   ├── int8_mlp.cu         # INT8 quantized MLP kernel (Heling)
 │   └── quant_utils.cu      # Shared quantization helpers (Heling)
 ├── tests/
-│   ├── gen_testdata.py     # Generate test inputs + reference answers
-│   ├── test_attention.py   # Jonathan: correctness + benchmark
-│   ├── test_mlp.py         # Shengjing: correctness + benchmark
-│   └── test_int8.py        # Heling: correctness + benchmark
+│   ├── cuda/
+│   │   ├── test_utils.h        # Shared: load_bin, check_result, parse_config
+│   │   ├── test_attention.cu   # Jonathan: pure CUDA correctness test
+│   │   ├── test_mlp.cu         # Shengjing: pure CUDA correctness test
+│   │   └── test_int8.cu        # Heling: pure CUDA correctness test
+│   ├── gen_testdata.py         # Generate test inputs + reference answers
+│   ├── test_attention.py       # Jonathan: Python benchmark + comparison
+│   ├── test_mlp.py             # Shengjing: Python benchmark + comparison
+│   └── test_int8.py            # Heling: Python benchmark + comparison
 ├── testdata/               # Generated .bin files (git-ignored)
 ├── baseline.py             # PyTorch FP16 reference implementations
 ├── benchmark.py            # GPU timing harness
@@ -96,7 +101,7 @@ This creates `testdata/small/` (debug) and `testdata/large/` (validation) with i
 
 Each person works independently on their `.cu` file. Nobody needs to touch shared files.
 
-### Step 1: Compile + test (pure CUDA)
+### Step 1: Compile + correctness check (pure CUDA, fast iteration)
 
 ```bash
 make test_attention && ./test_attention    # Jonathan
@@ -104,9 +109,9 @@ make test_mlp && ./test_mlp                # Shengjing
 make test_int8 && ./test_int8              # Heling
 ```
 
-Reads `.bin` test data, compares kernel output against reference. Reports PASS/FAIL + max error.
+Reads `.bin` test data from `testdata/`, runs your kernel, compares output against pre-computed reference. Reports PASS/FAIL + max error. Uses `tests/cuda/test_utils.h` for shared utilities.
 
-### Step 2: Benchmark against industry references (Python)
+### Step 2: Benchmark + industry comparison (Python)
 
 ```bash
 python tests/test_attention.py    # Jonathan

@@ -1,0 +1,23 @@
+=== MLP Kernel Test ===
+
+--- Correctness ---
+[PASSED] small  |  max err = 0.000001  |  mean err = 0.000000  |  atol = 0.0100
+[PASSED] large  |  max err = 0.000977  |  mean err = 0.000070  |  atol = 0.0100
+
+All tests PASSED.
+
+--- Timing (50 runs, 10 warmup) ---
+[Timing] small   mean =   0.011 ms  |  0.00 TFLOPS
+[Timing] large   mean =   1.203 ms  |  3.57 TFLOPS
+Collecting data...
+Generating '/tmp/nsys-report-5ac6.qdstrm'
+[1/7] [0%                          ] nsys_mlp.nsys-rep[1/7] [0%                          ] nsys_mlp.nsys-rep[1/7] [8%                          ] nsys_mlp.nsys-rep[1/7] [==20%                       ] nsys_mlp.nsys-rep[1/7] [===23%                      ] nsys_mlp.nsys-rep[1/7] [====27%                     ] nsys_mlp.nsys-rep[1/7] [============57%             ] nsys_mlp.nsys-rep[1/7] [=====================88%    ] nsys_mlp.nsys-rep[1/7] [======================90%   ] nsys_mlp.nsys-rep[1/7] [======================91%   ] nsys_mlp.nsys-rep[1/7] [========================97% ] nsys_mlp.nsys-rep[1/7] [========================100%] nsys_mlp.nsys-rep
+Importer error status: Importation failed.
+Import Failed with unexpected exception: /dvs/p4/build/sw/devtools/Agora/Rel/QuadD_Main/QuadD/Common/StreamSections/FileStream.cpp(294): Throw in function void QuadDCommon::FileStream::openFile(bool, bool, bool)
+Dynamic exception type: boost::wrapexcept<QuadDCommon::CreateFileException>
+std::exception::what: CreateFileException
+[QuadDCommon::tag_report_file_name*] = "/global/u1/s/sz755/cuda-transformer-opt/results/nsys_mlp.nsys-rep"
+[boost::errinfo_errno_*] = 524, "Unknown error 524"
+[boost::errinfo_file_name_*] = /global/u1/s/sz755/cuda-transformer-opt/results/nsys_mlp.nsys-rep
+Generated:
+	/global/u1/s/sz755/cuda-transformer-opt/results/nsys_mlp.qdstrm

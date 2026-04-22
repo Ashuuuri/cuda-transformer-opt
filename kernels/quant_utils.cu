@@ -61,6 +61,27 @@ __global__ void quantize_kernel(const half* input, int8_t* output, float scale, 
     output[idx] = (int8_t)q;
 }
 
+// ── Step 2b: Quantize reading scale from device memory (no CPU sync) ──
+__global__ void quantize_kernel_dev(const half* input, int8_t* output,
+                                      const float* scale_ptr, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float scale = *scale_ptr;
+    float x = __half2float(input[idx]);
+    int q = __float2int_rn(x / scale);
+    if (q > 127)  q = 127;
+    if (q < -128) q = -128;
+    output[idx] = (int8_t)q;
+}
+
+// ── Finalize scale: max / 127 → scale, on device ──────────────────────
+__global__ void finalize_scale_kernel(float* scale) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *scale = (*scale) / 127.0f;
+    }
+}
+
 // ── Step 3: Dequantize each element back to FP16 ───────────────────────
 __global__ void dequantize_kernel(const int8_t* input, half* output, float scale, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -80,18 +101,15 @@ extern "C" void quantize_fp16_to_int8(
     const int threads = 256;
     const int blocks = (n + threads - 1) / threads;
 
-    // 1. Find max(|x|) — store into scale_out temporarily
-    cudaMemset(scale_out, 0, sizeof(float));
+    // 1. Find max(|x|) — async, no CPU sync
+    cudaMemsetAsync(scale_out, 0, sizeof(float));
     abs_max_kernel<<<blocks, threads, threads * sizeof(float)>>>(input, scale_out, n);
 
-    // 2. Compute scale = max / 127 on host (simpler than another kernel)
-    float h_max;
-    cudaMemcpy(&h_max, scale_out, sizeof(float), cudaMemcpyDeviceToHost);
-    float h_scale = h_max / 127.0f;
-    cudaMemcpy(scale_out, &h_scale, sizeof(float), cudaMemcpyHostToDevice);
+    // 2. Divide by 127 in place (device-side, no CPU involvement)
+    finalize_scale_kernel<<<1, 1>>>(scale_out);
 
-    // 3. Quantize using the scale
-    quantize_kernel<<<blocks, threads>>>(input, output, h_scale, n);
+    // 3. Quantize reading scale from device memory
+    quantize_kernel_dev<<<blocks, threads>>>(input, output, scale_out, n);
 }
 
 // Dequantize INT8 tensor back to FP16 using a known scale (host scalar).

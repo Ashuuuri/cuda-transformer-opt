@@ -26,7 +26,10 @@ def load_mlp_ext():
             os.path.join(kernel_dir, "mlp.cu"),
             os.path.join(kernel_dir, "mlp_ext.cu"),
         ],
-        extra_cuda_cflags=["-O3", "--std=c++17", "-arch=sm_80", "--use_fast_math"],
+        extra_cuda_cflags=[
+            "-O3", "--std=c++17", "-arch=sm_80", "--use_fast_math",
+            "-DMLP_STAGE_K=32",
+        ],
         verbose=False,
     )
 

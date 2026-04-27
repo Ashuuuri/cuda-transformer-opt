@@ -1,7 +1,7 @@
 """sweep.py — Unified parameter sweep for all three CUDA kernels.
 
 Sweeps (from proposal §4):
-  seq_len  : 512, 1024, 2048, 4096, 8192
+  seq_len  : 512, 1024, 2048, 4096
   d_model  : 512, 1024, 2048   (d_ff = 4 × d_model)
   head_dim : fixed at 64       (standard; heads fixed at 8)
   batch    : fixed at 8
@@ -49,7 +49,7 @@ A100_HBM_BW_TBps = 2.0    # HBM bandwidth peak (TB/s)
 # ══════════════════════════════════════════════════════════════════════════
 #  Sweep grid  (§4 of proposal)
 # ══════════════════════════════════════════════════════════════════════════
-SEQ_LENS  = [512, 1024, 2048, 4096, 8192]
+SEQ_LENS  = [512, 1024, 2048, 4096]
 D_MODELS  = [512, 1024, 2048]
 BATCH     = 8
 HEADS     = 8
@@ -215,7 +215,7 @@ def bench_mlp(ext, batch, seq_len, d_model):
 def bench_attention(ext, batch, seq_len, d_model):
     import torch.nn.functional as F
     heads    = HEADS
-    head_dim = d_model // heads
+    head_dim = HEAD_DIM  # fixed at 64; attention sweeps seq_len, not d_model
     device   = "cuda"
     dtype    = torch.float16
     torch.manual_seed(42)

@@ -14,6 +14,7 @@
 // Ablation flags (pass via -D at compile time):
 //   ATTN_WMMA=0       use scalar fused kernel instead of WMMA
 //   ATTN_FAST_MATH=0  use expf instead of __expf
+//   ATTN_SWIZZLE=0    disable smem row padding (shows bank conflict cost)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -26,6 +27,10 @@
 
 #ifndef ATTN_WMMA
 #define ATTN_WMMA 1
+#endif
+
+#ifndef ATTN_SWIZZLE
+#define ATTN_SWIZZLE 1
 #endif
 
 #if ATTN_FAST_MATH
@@ -173,7 +178,12 @@ using namespace nvcuda::wmma;
 // Pad each smem row by 8 halves (16 bytes) to reduce bank conflicts.
 // Rows whose byte-stride is a multiple of 128 (32 bank widths) alias to the
 // same banks; PAD=8 breaks that alignment and reduces conflicts.
-#define SMEM_PAD     8
+// Disable with -DATTN_SWIZZLE=0 to measure the bank conflict cost.
+#if ATTN_SWIZZLE
+#  define SMEM_PAD 8
+#else
+#  define SMEM_PAD 0
+#endif
 
 // cp.async helpers (Ampere+). cp.async.cg bypasses L1, goes through L2.
 // commit_group() seals a stage, wait_group<N>() stalls until at most N remain in flight.

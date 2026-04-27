@@ -11,11 +11,26 @@ import os
 import sys
 import torch
 import torch.nn.functional as F
+from torch.utils.cpp_extension import load as _load
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baseline import attention_baseline, check_cuda
 from correctness import check_correctness
 from benchmark import benchmark
+
+_root = os.path.join(os.path.dirname(__file__), "..")
+_attn_ext = _load(
+    name="attention_ext",
+    sources=[
+        os.path.join(_root, "kernels", "attention.cu"),
+        os.path.join(_root, "kernels", "attention_ext.cu"),
+    ],
+    extra_cuda_cflags=["-arch=sm_80", "--std=c++17", "-O2"],
+    verbose=False,
+)
+
+def run_kernel(Q, K, V):
+    return _attn_ext.attention_forward(Q, K, V)
 
 # ── A100 FP16 Tensor Core peak ──────────────────────────────────────────
 A100_FP16_TFLOPS = 312.0
@@ -52,8 +67,7 @@ def main():
     #   attn_module = load(name="attention", sources=["kernels/attention.cu"], verbose=True)
     #   out = attn_module.attention_forward(Q, K, V)
     print("\n=== Correctness ===")
-    print("[SKIP] attention kernel not yet implemented — using baseline as placeholder")
-    out = attention_baseline(Q, K, V)  # placeholder
+    out = run_kernel(Q, K, V)
     check_correctness(ref, out, label="fp16_attention", mode="fp16")
 
     # ── Benchmark ───────────────────────────────────────────────────────
@@ -61,8 +75,7 @@ def main():
 
     naive_ms = benchmark(attention_baseline, Q, K, V)
 
-    # Your kernel (placeholder for now)
-    kernel_ms = benchmark(attention_baseline, Q, K, V)  # TODO: replace
+    kernel_ms = benchmark(run_kernel, Q, K, V)
 
     # FlashAttention-2 (PyTorch built-in)
     flash_ms = benchmark(F.scaled_dot_product_attention, Q, K, V)

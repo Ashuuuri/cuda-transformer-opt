@@ -114,7 +114,9 @@ def main():
     # ── Benchmark: INT8 MLP ─────────────────────────────────────────────
     print("\n=== Benchmark: INT8 MLP ===")
 
-    fp16_mlp_ms = benchmark(mlp_baseline, x, W1, W2)
+    # Fair FP16 reference for INT8: benchmark the same values that the INT8
+    # kernel sees after quantize/dequantize, not the original unquantized input.
+    fp16_mlp_ms = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)
 
     # Your INT8 kernel (placeholder)
     int8_mlp_ms = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)  # TODO: replace

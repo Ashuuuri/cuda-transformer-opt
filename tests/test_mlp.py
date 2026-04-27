@@ -10,8 +10,10 @@ naive baseline and cuBLAS (torch.mm).
 import os
 import sys
 import torch
+from torch.utils.cpp_extension import load
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, ROOT)
 from baseline import mlp_baseline, check_cuda
 from correctness import check_correctness
 from benchmark import benchmark
@@ -30,6 +32,19 @@ def compute_mlp_flops(batch, seq_len, d_model, d_ff):
     return gemm1 + gemm2
 
 
+def load_mlp_ext():
+    kernel_dir = os.path.join(ROOT, "kernels")
+    return load(
+        name="mlp_ext",
+        sources=[
+            os.path.join(kernel_dir, "mlp.cu"),
+            os.path.join(kernel_dir, "mlp_ext.cu"),
+        ],
+        extra_cuda_cflags=["-O3", "--std=c++17", "-arch=sm_80", "--use_fast_math"],
+        verbose=False,
+    )
+
+
 def main():
     check_cuda()
 
@@ -45,14 +60,13 @@ def main():
     # ── Reference ───────────────────────────────────────────────────────
     ref = mlp_baseline(x, W1, W2)
 
+    print("Compiling MLP WMMA extension...")
+    mlp_ext = load_mlp_ext()
+    print("Done.")
+
     # ── Your kernel ─────────────────────────────────────────────────────
-    # TODO: Replace this with your CUDA kernel once implemented.
-    #   from torch.utils.cpp_extension import load
-    #   mlp_module = load(name="mlp", sources=["kernels/mlp.cu"], verbose=True)
-    #   out = mlp_module.mlp_forward(x, W1, W2)
     print("\n=== Correctness ===")
-    print("[SKIP] MLP kernel not yet implemented — using baseline as placeholder")
-    out = mlp_baseline(x, W1, W2)  # placeholder
+    out = mlp_ext.mlp_forward(x, W1, W2)
     check_correctness(ref, out, label="fp16_mlp", mode="fp16")
 
     # ── Benchmark ───────────────────────────────────────────────────────
@@ -60,8 +74,7 @@ def main():
 
     naive_ms = benchmark(mlp_baseline, x, W1, W2)
 
-    # Your kernel (placeholder for now)
-    kernel_ms = benchmark(mlp_baseline, x, W1, W2)  # TODO: replace
+    kernel_ms = benchmark(mlp_ext.mlp_forward, x, W1, W2)
 
     # cuBLAS comparison: just the two GEMMs (no GELU), as upper bound
     x_2d = x.view(-1, d_model)

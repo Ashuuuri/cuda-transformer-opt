@@ -7,7 +7,7 @@
 #   make clean             — remove compiled binaries
 
 NVCC       = nvcc
-NVCC_FLAGS = -arch=sm_80 --std=c++17 -O2
+NVCC_FLAGS = -arch=sm_80 --std=c++17 -O3
 INCLUDES   = -I kernels -I tests/cuda
 
 .PHONY: all clean
@@ -23,7 +23,7 @@ test_attention: kernels/attention.cu tests/cuda/test_attention.cu
 
 # ── MLP (Shengjing) ────────────────────────────────────────────────────
 test_mlp: kernels/mlp.cu tests/cuda/test_mlp.cu
-	$(NVCC) $(NVCC_FLAGS) $(INCLUDES) \
+	$(NVCC) $(NVCC_FLAGS) --use_fast_math $(INCLUDES) \
 		kernels/mlp.cu \
 		tests/cuda/test_mlp.cu \
 		-o test_mlp

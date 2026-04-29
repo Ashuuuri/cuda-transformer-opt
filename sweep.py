@@ -244,6 +244,46 @@ def bench_attention(ext, batch, seq_len, d_model):
     )
 
 
+# ── INT8 Attention ────────────────────────────────────────────────────────
+def bench_int8_attn(ext, batch, seq_len, d_model):
+    import torch.nn.functional as F
+    heads    = HEADS
+    head_dim = d_model // heads
+    device   = "cuda"
+    dtype    = torch.float16
+    torch.manual_seed(42)
+
+    Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+
+    Q_i8, sQ = quantize_to_int8(Q)
+    K_i8, sK = quantize_to_int8(K)
+    V_i8, sV = quantize_to_int8(V)
+    Q_deq = Q_i8.float().mul(sQ).half()
+    K_deq = K_i8.float().mul(sK).half()
+    V_deq = V_i8.float().mul(sV).half()
+
+    def run_int8():
+        ext.int8_attention_forward(Q_i8, K_i8, V_i8, float(sQ), float(sK), float(sV))
+
+    kernel_ms = benchmark(run_int8)
+    naive_ms  = benchmark(attention_baseline, Q_deq, K_deq, V_deq)
+    flash_ms  = benchmark(F.scaled_dot_product_attention, Q_deq, K_deq, V_deq)
+
+    flops     = attention_flops(batch, heads, seq_len, head_dim)
+    peak_tops = A100_INT8_TOPS
+
+    return _make_row(
+        batch, seq_len, d_model,
+        kernel_ms, naive_ms, flash_ms,
+        flops, peak_tops,
+        attn_hbm_fused(batch, heads, seq_len, head_dim),
+        attn_hbm_unfused(batch, heads, seq_len, head_dim),
+        ref2_label="FlashAttn-2",
+    )
+
+
 # ── INT8 MLP ──────────────────────────────────────────────────────────────
 def bench_int8(ext, batch, seq_len, d_model):
     d_ff   = d_model * 4
@@ -552,6 +592,12 @@ KERNELS = {
         "peak_tops": A100_INT8_TOPS,
         "owner":     "Heling",
     },
+    "int8_attn": {
+        "loader":    load_int8_ext,
+        "bench_fn":  bench_int8_attn,
+        "peak_tops": A100_INT8_TOPS,
+        "owner":     "Heling",
+    },
 }
 
 
@@ -566,7 +612,7 @@ def main():
         "--kernel",
         choices=list(KERNELS.keys()),
         required=True,
-        help="Which kernel to sweep: mlp | attention | int8",
+        help="Which kernel to sweep: mlp | attention | int8 | int8_attn",
     )
     args = parser.parse_args()
 

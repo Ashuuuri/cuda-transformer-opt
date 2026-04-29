@@ -420,7 +420,13 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
 
     naive_label = rows[0].get("naive_label", "Naive PyTorch")
     ref2_label  = rows[0]["ref2_label"]
-    kname       = kernel_name.upper()
+    KNAME_DISPLAY = {
+        "int8_attn": "INT8 Attention Kernel",
+        "int8":      "INT8 MLP Kernel",
+        "attention": "FP16 Attention Kernel",
+        "mlp":       "FP16 MLP Kernel",
+    }
+    kname = KNAME_DISPLAY.get(kernel_name, kernel_name.upper())
     kernel_label = "INT8 kernel" if kernel_name.startswith("int8") else "Fused kernel"
 
     # Map our internal keys to display names for the legend

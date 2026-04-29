@@ -154,6 +154,8 @@ void int8_wmma_attention_kernel(
     const float scale_K       = __ldg(d_scale_K);
     const float scale_V       = __ldg(d_scale_V);
     const float inv_out_scale = 1.f / scale_V;
+    // Combined scale applied to INT32 QK^T accumulator to get attention scores.
+    const float qk_scale      = scale_Q * scale_K * attn_scale;
     const int bh      = blockIdx.y;
     const int qi_base = blockIdx.x * ATTN_TILE_Q;
     const int tid     = threadIdx.x;
@@ -161,23 +163,26 @@ void int8_wmma_attention_kernel(
     const int lane    = tid % 32;
 
     extern __shared__ char smem_raw[];
-    const int qs = head_dim + ATTN_SMEM_PAD;       // padded row stride (halves)
-    const int ss = ATTN_TILE_KV + ATTN_SMEM_PAD;   // padded score row stride
+    // INT8 row stride: head_dim bytes (head_dim is always a multiple of 16 for WMMA).
+    const int ks_i8 = head_dim;
+    // FP16 strides (in half elements).
+    const int vs = head_dim + ATTN_SMEM_PAD;      // V row stride
+    const int ss = ATTN_TILE_KV + ATTN_SMEM_PAD;  // scores row stride
 
-    half* s_Q      = (half*) smem_raw;
-    half* s_K0     = s_Q  + ATTN_TILE_Q  * qs;
-    half* s_K1     = s_K0 + ATTN_TILE_KV * qs;
-    half* s_V0     = s_K1 + ATTN_TILE_KV * qs;
-    half* s_V1     = s_V0 + ATTN_TILE_KV * qs;
-    half* s_scores = s_V1 + ATTN_TILE_KV * qs;
+    // Smem layout: [Q INT8][K INT8][V FP16][scores FP16]
+    // Q and K together = (TILE_Q + TILE_KV) * head_dim bytes, always even → FP16 alignment OK.
+    int8_t* s_Q_i8   = (int8_t*) smem_raw;
+    int8_t* s_K_i8   = s_Q_i8 + ATTN_TILE_Q  * ks_i8;
+    half*   s_V_fp16 = (half*)(s_K_i8 + ATTN_TILE_KV * ks_i8);
+    half*   s_scores = s_V_fp16 + ATTN_TILE_KV * vs;
 
-    // Load and dequantize Q tile into FP16 shared memory.
+    // Load Q tile as INT8 — no dequantization, scale folded into qk_scale.
     for (int idx = tid; idx < ATTN_TILE_Q * head_dim; idx += ATTN_BDIM) {
         const int row = idx / head_dim, col = idx % head_dim;
         const int qi  = qi_base + row;
-        s_Q[row * qs + col] = (qi < seq_len)
-            ? __float2half((float)Q[((size_t)bh * seq_len + qi) * head_dim + col] * scale_Q)
-            : __float2half(0.f);
+        s_Q_i8[row * ks_i8 + col] = (qi < seq_len)
+            ? Q[((size_t)bh * seq_len + qi) * head_dim + col]
+            : (int8_t)0;
     }
 
     const int frow0   = lane / 4;
@@ -187,7 +192,7 @@ void int8_wmma_attention_kernel(
     float rmax0 = -1e38f, rmax1 = -1e38f;
     float rsum0 = 0.f,    rsum1 = 0.f;
 
-    const int n_slices    = head_dim / ATTN_WMMA_N;   // e.g. 4 for head_dim=64
+    const int n_slices    = head_dim / ATTN_WMMA_N;
     const int n_kv_groups = ATTN_TILE_KV / ATTN_WMMA_N;
 
     fragment<accumulator, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, float> frag_out[ATTN_MAX_SLICES];
@@ -198,45 +203,40 @@ void int8_wmma_attention_kernel(
     const int num_tiles = seq_len / ATTN_TILE_KV;
 
     for (int t = 0; t < num_tiles; ++t) {
-        half* s_K_cur = (t & 1) ? s_K1 : s_K0;
-        half* s_V_cur = (t & 1) ? s_V1 : s_V0;
-
-        // Load K,V tile for tile t: dequantize INT8 → FP16 in smem.
-        // No cp.async here — avoids needing a separate INT8 smem buffer.
+        // Load K tile as INT8; load V tile dequantized to FP16 for attn×V WMMA.
         const size_t kv_base = ((size_t)bh * seq_len + t * ATTN_TILE_KV) * head_dim;
         for (int idx = tid; idx < ATTN_TILE_KV * head_dim; idx += ATTN_BDIM) {
             const int row = idx / head_dim, col = idx % head_dim;
             const size_t off = kv_base + row * head_dim + col;
-            s_K_cur[row * qs + col] = __float2half((float)K[off] * scale_K);
-            s_V_cur[row * qs + col] = __float2half((float)V[off] * scale_V);
+            s_K_i8[row * ks_i8 + col]  = K[off];
+            s_V_fp16[row * vs   + col]  = __float2half((float)V[off] * scale_V);
         }
         __syncthreads();
 
-        // QK^T via FP16 WMMA (identical to Jonathan's kernel).
-        fragment<accumulator, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, float>
+        // QK^T via INT8 WMMA → INT32 accumulator.
+        // K stored row-major → loaded col_major gives K^T implicitly.
+        fragment<accumulator, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int32_t>
             frag_qk[ATTN_TILE_KV / ATTN_WMMA_N];
         for (int g = 0; g < n_kv_groups; ++g) {
-            fill_fragment(frag_qk[g], 0.f);
+            fill_fragment(frag_qk[g], (int32_t)0);
             for (int k = 0; k < head_dim; k += ATTN_WMMA_K) {
-                fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, half, row_major> fq;
-                fragment<matrix_b, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, half, col_major> fk;
-                load_matrix_sync(fq, s_Q     + warp_id * ATTN_WMMA_M * qs + k, qs);
-                load_matrix_sync(fk, s_K_cur + g * ATTN_WMMA_N * qs + k,       qs);
+                fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, row_major> fq;
+                fragment<matrix_b, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, col_major> fk;
+                load_matrix_sync(fq, s_Q_i8 + warp_id * ATTN_WMMA_M * ks_i8 + k, ks_i8);
+                load_matrix_sync(fk, s_K_i8 + g * ATTN_WMMA_N * ks_i8 + k,       ks_i8);
                 mma_sync(frag_qk[g], fq, fk, frag_qk[g]);
             }
         }
 
-        // Per-row max over frag_qk (Jonathan's register-level online softmax).
+        // Cast INT32 accumulators to float and apply qk_scale.
+        // Store in sf[group][element] since we can't write float back to int32_t frag.
+        float sf[ATTN_TILE_KV / ATTN_WMMA_N][8];
         float lmax0 = -1e38f, lmax1 = -1e38f;
         for (int g = 0; g < n_kv_groups; ++g) {
-            const float s0 = frag_qk[g].x[0] * attn_scale,  s1 = frag_qk[g].x[1] * attn_scale;
-            const float s8 = frag_qk[g].x[4] * attn_scale,  s9 = frag_qk[g].x[5] * attn_scale;
-            frag_qk[g].x[0]=s0; frag_qk[g].x[1]=s1; frag_qk[g].x[4]=s8; frag_qk[g].x[5]=s9;
-            lmax0 = fmaxf(lmax0, fmaxf(fmaxf(s0,s1), fmaxf(s8,s9)));
-            const float t0 = frag_qk[g].x[2] * attn_scale,  t1 = frag_qk[g].x[3] * attn_scale;
-            const float t8 = frag_qk[g].x[6] * attn_scale,  t9 = frag_qk[g].x[7] * attn_scale;
-            frag_qk[g].x[2]=t0; frag_qk[g].x[3]=t1; frag_qk[g].x[6]=t8; frag_qk[g].x[7]=t9;
-            lmax1 = fmaxf(lmax1, fmaxf(fmaxf(t0,t1), fmaxf(t8,t9)));
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) sf[g][i] = (float)frag_qk[g].x[i] * qk_scale;
+            lmax0 = fmaxf(lmax0, fmaxf(fmaxf(sf[g][0],sf[g][1]), fmaxf(sf[g][4],sf[g][5])));
+            lmax1 = fmaxf(lmax1, fmaxf(fmaxf(sf[g][2],sf[g][3]), fmaxf(sf[g][6],sf[g][7])));
         }
         lmax0 = fmaxf(lmax0, __shfl_xor_sync(0xffffffff, lmax0, 1));
         lmax0 = fmaxf(lmax0, __shfl_xor_sync(0xffffffff, lmax0, 2));
@@ -254,19 +254,19 @@ void int8_wmma_attention_kernel(
             frag_out[s].x[6]*=corr1; frag_out[s].x[7]*=corr1;
         }
 
-        // Softmax weights → s_scores.
+        // Softmax weights → s_scores (FP16, for attn×V WMMA).
         float lsum0 = 0.f, lsum1 = 0.f;
         for (int g = 0; g < n_kv_groups; ++g) {
             const int qr0 = warp_id * ATTN_WMMA_M + frow0;
             const int qr1 = warp_id * ATTN_WMMA_M + frow1;
             const int kc  = g * ATTN_WMMA_N + fcol_lo;
-            const float w0=__expf(frag_qk[g].x[0]-rmax0), w1=__expf(frag_qk[g].x[1]-rmax0);
-            const float w8=__expf(frag_qk[g].x[4]-rmax0), w9=__expf(frag_qk[g].x[5]-rmax0);
+            const float w0=__expf(sf[g][0]-rmax0), w1=__expf(sf[g][1]-rmax0);
+            const float w8=__expf(sf[g][4]-rmax0), w9=__expf(sf[g][5]-rmax0);
             lsum0 += w0+w1+w8+w9;
             s_scores[qr0*ss+kc]=__float2half(w0); s_scores[qr0*ss+kc+1]=__float2half(w1);
             s_scores[qr0*ss+kc+8]=__float2half(w8); s_scores[qr0*ss+kc+9]=__float2half(w9);
-            const float u0=__expf(frag_qk[g].x[2]-rmax1), u1=__expf(frag_qk[g].x[3]-rmax1);
-            const float u8=__expf(frag_qk[g].x[6]-rmax1), u9=__expf(frag_qk[g].x[7]-rmax1);
+            const float u0=__expf(sf[g][2]-rmax1), u1=__expf(sf[g][3]-rmax1);
+            const float u8=__expf(sf[g][6]-rmax1), u9=__expf(sf[g][7]-rmax1);
             lsum1 += u0+u1+u8+u9;
             s_scores[qr1*ss+kc]=__float2half(u0); s_scores[qr1*ss+kc+1]=__float2half(u1);
             s_scores[qr1*ss+kc+8]=__float2half(u8); s_scores[qr1*ss+kc+9]=__float2half(u9);
@@ -277,7 +277,7 @@ void int8_wmma_attention_kernel(
         lsum1 += __shfl_xor_sync(0xffffffff, lsum1, 2);
         rsum0 += lsum0;  rsum1 += lsum1;
 
-        // attn × V via FP16 WMMA.
+        // attn × V via FP16 WMMA (s_V_fp16 is already FP16).
         __syncwarp();
         for (int s = 0; s < n_slices; ++s) {
             const int d_base = s * ATTN_WMMA_N;
@@ -285,7 +285,7 @@ void int8_wmma_attention_kernel(
                 fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, half, row_major> fw;
                 fragment<matrix_b, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, half, row_major> fv;
                 load_matrix_sync(fw, s_scores + warp_id * ATTN_WMMA_M * ss + k, ss);
-                load_matrix_sync(fv, s_V_cur  + k * qs + d_base,                qs);
+                load_matrix_sync(fv, s_V_fp16 + k * vs + d_base,                vs);
                 mma_sync(frag_out[s], fw, fv, frag_out[s]);
             }
         }
@@ -331,9 +331,11 @@ void int8_attention_forward(
     if (head_dim % ATTN_WMMA_K == 0 && seq_len % ATTN_TILE_KV == 0) {
         const int BH = batch * heads;
         dim3 grid((seq_len + ATTN_TILE_Q - 1) / ATTN_TILE_Q, BH);
+        // Q + K in INT8, V in FP16 (dequant on load), scores in FP16.
         const size_t smem =
-            ((size_t)(ATTN_TILE_Q + 4 * ATTN_TILE_KV) * (head_dim + ATTN_SMEM_PAD) +
-             (size_t) ATTN_TILE_Q * (ATTN_TILE_KV + ATTN_SMEM_PAD)) * sizeof(half);
+            (size_t)(ATTN_TILE_Q + ATTN_TILE_KV) * head_dim * sizeof(int8_t) +
+            (size_t) ATTN_TILE_KV * (head_dim + ATTN_SMEM_PAD) * sizeof(half) +
+            (size_t) ATTN_TILE_Q  * (ATTN_TILE_KV + ATTN_SMEM_PAD) * sizeof(half);
         cudaFuncSetAttribute(int8_wmma_attention_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         int8_wmma_attention_kernel<<<grid, ATTN_BDIM, smem>>>(

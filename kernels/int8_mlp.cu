@@ -199,17 +199,157 @@ __global__ void gemm_int8_wmma_kernel(
     }
 }
 
+// ── Static scale computation (1 thread, runs once per forward call) ───
+// scale_hidden = sx * sw1 * d_model  (conservative per-tensor static bound)
+// scale_out    = scale_hidden * sw2 * d_ff
+__global__ void compute_static_scales_kernel(
+    const float* __restrict__ sx,
+    const float* __restrict__ sw1,
+    const float* __restrict__ sw2,
+    float* d_scale_hidden, float* d_inv_scale_hidden,
+    float* d_scale_out,    float* d_inv_scale_out,
+    int d_model, int d_ff
+) {
+    const float sh = __ldg(sx) * __ldg(sw1) * (float)d_model;
+    const float so = sh * __ldg(sw2) * (float)d_ff;
+    *d_scale_hidden     = sh;
+    *d_inv_scale_hidden = 1.f / sh;
+    *d_scale_out        = so;
+    *d_inv_scale_out    = 1.f / so;
+}
+
+// ── INT8 WMMA GEMM → INT8 output ──────────────────────────────────────
+// Same as gemm_int8_wmma_kernel but epilogue writes INT8 using a static scale.
+template <bool apply_gelu>
+__global__ void gemm_int8_wmma_i8_kernel(
+    const int8_t* __restrict__ A,
+    const int8_t* __restrict__ B,
+    int8_t* __restrict__       C,
+    int M, int N, int K,
+    const float* __restrict__ d_scale_A,
+    const float* __restrict__ d_scale_B,
+    const float* __restrict__ d_inv_scale_out
+) {
+    const float scale     = __ldg(d_scale_A) * __ldg(d_scale_B);
+    const float inv_scale = __ldg(d_inv_scale_out);
+    __shared__ __align__(16) int8_t  sA[2][BLOCK_M * A_SMEM_STRIDE];
+    __shared__ __align__(16) int8_t  sB[2][STAGE_K * B_SMEM_STRIDE];
+    __shared__               int32_t c_smem[WARPS_PER_BLOCK * WARP_COL_TILES * WMMA_M * WMMA_N];
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int warp_m  = warp_id / WARP_COL_GROUPS;
+    const int warp_ng = warp_id % WARP_COL_GROUPS;
+
+    const int block_m = blockIdx.y * BLOCK_M;
+    const int block_n = blockIdx.x * BLOCK_N;
+    const int tile_m  = block_m + warp_m * WMMA_M;
+    const int tile_n0 = block_n + warp_ng * WARP_COL_TILES * WMMA_N;
+    const int tile_n1 = tile_n0 + WMMA_N;
+
+    wmma::fragment<wmma::matrix_a,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> b_frag0, b_frag1;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int32_t> acc0, acc1;
+    wmma::fill_fragment(acc0, (int32_t)0);
+    wmma::fill_fragment(acc1, (int32_t)0);
+
+    int stage = 0;
+    load_int8_tile_async(A, B, sA[0], sB[0], block_m, block_n, 0, K, N);
+    i8_cp_async_commit();
+
+    for (int k0 = 0; k0 < K; k0 += STAGE_K) {
+        i8_cp_async_wait_all();
+        __syncthreads();
+        const int next_k0 = k0 + STAGE_K;
+        const int next_s  = stage ^ 1;
+        if (next_k0 < K) {
+            load_int8_tile_async(A, B, sA[next_s], sB[next_s],
+                                 block_m, block_n, next_k0, K, N);
+            i8_cp_async_commit();
+        }
+        #pragma unroll
+        for (int kk = 0; kk < STAGE_K; kk += WMMA_K) {
+            const int8_t* a_ptr  = sA[stage] + warp_m * WMMA_M * A_SMEM_STRIDE + kk;
+            const int8_t* b_ptr0 = sB[stage] + kk * B_SMEM_STRIDE + warp_ng * WARP_COL_TILES * WMMA_N;
+            const int8_t* b_ptr1 = b_ptr0 + WMMA_N;
+            wmma::load_matrix_sync(a_frag,  a_ptr,  A_SMEM_STRIDE);
+            wmma::load_matrix_sync(b_frag0, b_ptr0, B_SMEM_STRIDE);
+            wmma::load_matrix_sync(b_frag1, b_ptr1, B_SMEM_STRIDE);
+            wmma::mma_sync(acc0, a_frag, b_frag0, acc0);
+            wmma::mma_sync(acc1, a_frag, b_frag1, acc1);
+        }
+        __syncthreads();
+        stage = next_s;
+    }
+
+    // Epilogue: INT32 → float → ×scale → [GELU] → INT8
+    int32_t* c0 = c_smem + warp_id * WARP_COL_TILES * WMMA_M * WMMA_N;
+    int32_t* c1 = c0 + WMMA_M * WMMA_N;
+    wmma::store_matrix_sync(c0, acc0, WMMA_N, wmma::mem_row_major);
+    wmma::store_matrix_sync(c1, acc1, WMMA_N, wmma::mem_row_major);
+    __syncwarp();
+
+    #pragma unroll
+    for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
+        const int r = i / WMMA_N, c = i % WMMA_N;
+        float v0 = (float)c0[i] * scale;
+        float v1 = (float)c1[i] * scale;
+        if (apply_gelu) { v0 = int8_gelu(v0); v1 = int8_gelu(v1); }
+        C[(tile_m + r) * N + (tile_n0 + c)] = f32_to_i8(v0, inv_scale);
+        C[(tile_m + r) * N + (tile_n1 + c)] = f32_to_i8(v1, inv_scale);
+    }
+}
+
+// ── Scalar fallback → INT8 output ─────────────────────────────────────
+template <bool apply_gelu>
+__global__ void gemm_int8_scalar_i8_kernel(
+    const int8_t* __restrict__ A,
+    const int8_t* __restrict__ B,
+    int8_t* __restrict__       C,
+    int M, int N, int K,
+    const float* __restrict__ d_scale_A,
+    const float* __restrict__ d_scale_B,
+    const float* __restrict__ d_inv_scale_out
+) {
+    const float scale     = __ldg(d_scale_A) * __ldg(d_scale_B);
+    const float inv_scale = __ldg(d_inv_scale_out);
+    __shared__ float sA[SCALAR_TILE][SCALAR_TILE];
+    __shared__ float sB[SCALAR_TILE][SCALAR_TILE];
+
+    const int row = blockIdx.y * SCALAR_TILE + threadIdx.y;
+    const int col = blockIdx.x * SCALAR_TILE + threadIdx.x;
+    float acc = 0.f;
+
+    for (int t = 0; t < (K + SCALAR_TILE - 1) / SCALAR_TILE; ++t) {
+        const int kA = t * SCALAR_TILE + threadIdx.x;
+        const int kB = t * SCALAR_TILE + threadIdx.y;
+        sA[threadIdx.y][threadIdx.x] = (row < M && kA < K) ? (float)A[row*K + kA] : 0.f;
+        sB[threadIdx.y][threadIdx.x] = (kB  < K && col < N) ? (float)B[kB *N + col] : 0.f;
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < SCALAR_TILE; ++k) acc += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        float v = acc * scale;
+        if (apply_gelu) v = int8_gelu(v);
+        C[row * N + col] = f32_to_i8(v, inv_scale);
+    }
+}
+
 // ── File-scope device buffer cache ────────────────────────────────────
-// Kept at file scope so int8_mlp_get_output_scale() can access s_scale_out.
-static half*   s_hidden_fp16  = nullptr;
-static int8_t* s_hidden_int8  = nullptr;
-static half*   s_out_fp16     = nullptr;
-static float*  s_scale_hidden = nullptr;
-static float*  s_scale_out    = nullptr;
-static size_t  s_hidden_cap   = 0;
-static size_t  s_out_cap      = 0;
+static int8_t* s_hidden_int8      = nullptr;
+static float*  s_scale_hidden     = nullptr;
+static float*  s_inv_scale_hidden = nullptr;
+static float*  s_scale_out        = nullptr;
+static float*  s_inv_scale_out    = nullptr;
+static size_t  s_hidden_cap       = 0;
 
 // ── Public interface ───────────────────────────────────────────────────
+// Uses static per-tensor scales (scale_x * scale_W1 * d_model for hidden,
+// extended by scale_W2 * d_ff for output) to avoid dynamic reduce passes.
+// Both GEMM epilogues write INT8 directly — no intermediate quantize kernels.
 void int8_mlp_forward(
     const int8_t* x, const int8_t* W1, const int8_t* W2, int8_t* out,
     const float* scale_x, const float* scale_W1, const float* scale_W2,
@@ -217,62 +357,60 @@ void int8_mlp_forward(
 ) {
     const int T = batch * seq_len;
 
-    const size_t hidden_fp16_sz = (size_t)T * d_ff    * sizeof(half);
-    const size_t hidden_i8_sz   = (size_t)T * d_ff    * sizeof(int8_t);
-    const size_t out_fp16_sz    = (size_t)T * d_model * sizeof(half);
+    const size_t hidden_i8_sz = (size_t)T * d_ff * sizeof(int8_t);
 
-    if (hidden_fp16_sz > s_hidden_cap) {
-        cudaFree(s_hidden_fp16);  cudaFree(s_hidden_int8);  cudaFree(s_scale_hidden);
-        cudaMalloc(&s_hidden_fp16,  hidden_fp16_sz);
-        cudaMalloc(&s_hidden_int8,  hidden_i8_sz);
-        cudaMalloc(&s_scale_hidden, sizeof(float));
-        s_hidden_cap = hidden_fp16_sz;
+    if (hidden_i8_sz > s_hidden_cap) {
+        cudaFree(s_hidden_int8);
+        cudaFree(s_scale_hidden);  cudaFree(s_inv_scale_hidden);
+        cudaFree(s_scale_out);     cudaFree(s_inv_scale_out);
+        cudaMalloc(&s_hidden_int8,      hidden_i8_sz);
+        cudaMalloc(&s_scale_hidden,     sizeof(float));
+        cudaMalloc(&s_inv_scale_hidden, sizeof(float));
+        cudaMalloc(&s_scale_out,        sizeof(float));
+        cudaMalloc(&s_inv_scale_out,    sizeof(float));
+        s_hidden_cap = hidden_i8_sz;
     }
-    if (out_fp16_sz > s_out_cap) {
-        cudaFree(s_out_fp16);  cudaFree(s_scale_out);
-        cudaMalloc(&s_out_fp16,  out_fp16_sz);
-        cudaMalloc(&s_scale_out, sizeof(float));
-        s_out_cap = out_fp16_sz;
-    }
+
+    // Compute static scales on device — no cudaMemcpy, no extra kernel passes.
+    compute_static_scales_kernel<<<1, 1>>>(
+        scale_x, scale_W1, scale_W2,
+        s_scale_hidden, s_inv_scale_hidden,
+        s_scale_out,    s_inv_scale_out,
+        d_model, d_ff);
 
     const bool use_wmma =
         (T      % BLOCK_M == 0) && (d_model % BLOCK_N == 0) &&
         (d_ff   % BLOCK_N == 0) && (d_model % STAGE_K == 0) &&
         (d_ff   % STAGE_K == 0);
 
-    // ── GEMM 1: x @ W1 → FP16 hidden (with GELU) ───────────────────────
-    // scale_x and scale_W1 are device pointers — no cudaMemcpy needed.
+    // ── GEMM 1: x @ W1 → INT8 hidden (with GELU, static scale) ─────────
     if (use_wmma) {
         dim3 grid(d_ff / BLOCK_N, T / BLOCK_M);
-        gemm_int8_wmma_kernel<true><<<grid, THREADS_PER_BLOCK>>>(
-            x, W1, s_hidden_fp16, T, d_ff, d_model, scale_x, scale_W1);
+        gemm_int8_wmma_i8_kernel<true><<<grid, THREADS_PER_BLOCK>>>(
+            x, W1, s_hidden_int8, T, d_ff, d_model,
+            scale_x, scale_W1, s_inv_scale_hidden);
     } else {
         dim3 grid((d_ff + SCALAR_TILE-1)/SCALAR_TILE, (T + SCALAR_TILE-1)/SCALAR_TILE);
-        gemm_int8_scalar_kernel<true><<<grid, dim3(SCALAR_TILE, SCALAR_TILE)>>>(
-            x, W1, s_hidden_fp16, T, d_ff, d_model, scale_x, scale_W1);
+        gemm_int8_scalar_i8_kernel<true><<<grid, dim3(SCALAR_TILE, SCALAR_TILE)>>>(
+            x, W1, s_hidden_int8, T, d_ff, d_model,
+            scale_x, scale_W1, s_inv_scale_hidden);
     }
 
-    // ── Quantize hidden (FP16 → INT8, computes s_scale_hidden on device) ─
-    quantize_fp16_to_int8(s_hidden_fp16, s_hidden_int8, s_scale_hidden, T * d_ff);
-
-    // ── GEMM 2: hidden @ W2 → FP16 out ─────────────────────────────────
-    // s_scale_hidden is already on device; pass alongside scale_W2 directly.
+    // ── GEMM 2: hidden @ W2 → INT8 out (static scale) ───────────────────
     if (use_wmma) {
         dim3 grid(d_model / BLOCK_N, T / BLOCK_M);
-        gemm_int8_wmma_kernel<false><<<grid, THREADS_PER_BLOCK>>>(
-            s_hidden_int8, W2, s_out_fp16, T, d_model, d_ff, s_scale_hidden, scale_W2);
+        gemm_int8_wmma_i8_kernel<false><<<grid, THREADS_PER_BLOCK>>>(
+            s_hidden_int8, W2, out, T, d_model, d_ff,
+            s_scale_hidden, scale_W2, s_inv_scale_out);
     } else {
         dim3 grid((d_model + SCALAR_TILE-1)/SCALAR_TILE, (T + SCALAR_TILE-1)/SCALAR_TILE);
-        gemm_int8_scalar_kernel<false><<<grid, dim3(SCALAR_TILE, SCALAR_TILE)>>>(
-            s_hidden_int8, W2, s_out_fp16, T, d_model, d_ff, s_scale_hidden, scale_W2);
+        gemm_int8_scalar_i8_kernel<false><<<grid, dim3(SCALAR_TILE, SCALAR_TILE)>>>(
+            s_hidden_int8, W2, out, T, d_model, d_ff,
+            s_scale_hidden, scale_W2, s_inv_scale_out);
     }
-
-    // ── Quantize output (FP16 → INT8) ────────────────────────────────────
-    quantize_fp16_to_int8(s_out_fp16, out, s_scale_out, T * d_model);
 }
 
-// Returns the per-tensor output scale used in the most recent int8_mlp_forward call.
-// Needed by the Python binding to correctly dequantize for correctness checking.
+// Returns the static output scale from the most recent int8_mlp_forward call.
 void int8_mlp_get_output_scale(float* host_out) {
     if (s_scale_out)
         cudaMemcpy(host_out, s_scale_out, sizeof(float), cudaMemcpyDeviceToHost);

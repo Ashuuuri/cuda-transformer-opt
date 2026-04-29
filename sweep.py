@@ -63,6 +63,7 @@ COLORS = {
     "Naive PyTorch":     "#DC2626",
     "FP16 WMMA (Sherry)": "#DC2626",
     "FP16 WMMA (Jonathan)": "#DC2626",
+    "FP16 WMMA baseline": "#DC2626",
     "cuBLAS / Flash":    "#16A34A",
 }
 MARKERS = {
@@ -70,6 +71,7 @@ MARKERS = {
     "Naive PyTorch":     "s",
     "FP16 WMMA (Sherry)": "s",
     "FP16 WMMA (Jonathan)": "s",
+    "FP16 WMMA baseline": "s",
     "cuBLAS / Flash":    "^",
 }
 
@@ -286,7 +288,7 @@ def bench_int8_attn(ext, batch, seq_len, d_model):
         flops, peak_tops,
         attn_hbm_fused(batch, heads, seq_len, head_dim),
         attn_hbm_unfused(batch, heads, seq_len, head_dim),
-        naive_label="FP16 WMMA (Jonathan)",
+        naive_label="FP16 WMMA baseline",
         ref2_label="FlashAttn-2",
     )
 
@@ -331,7 +333,7 @@ def bench_int8(ext, batch, seq_len, d_model):
         flops, peak_tops,
         mlp_hbm_fused(batch, seq_len, d_model, d_ff),
         mlp_hbm_unfused(batch, seq_len, d_model, d_ff),
-        naive_label="FP16 WMMA (Sherry)",
+        naive_label="FP16 WMMA baseline",
         ref2_label="cuBLAS INT8",
     )
 

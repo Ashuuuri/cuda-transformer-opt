@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Poster Draft — CUDA Transformer Optimizations</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Georgia', serif; background: #ffffff; color: #222; }
+
+  .header {
+    background: #8b1a1a;
+    color: white;
+    text-align: center;
+    padding: 18px 24px 14px;
+  }
+  .header h1 { font-size: 1.7rem; font-weight: bold; margin-bottom: 6px; }
+  .header h2 { font-size: 1.0rem; font-weight: normal; margin-bottom: 4px; }
+  .header h3 { font-size: 0.88rem; font-weight: normal; opacity: 0.85; }
+
+  .poster {
+    display: grid;
+    grid-template-columns: 1fr 2fr 1fr;
+    gap: 14px;
+    padding: 14px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+
+  .panel {
+    background: white;
+    border: 2px solid #ccc;
+    border-radius: 4px;
+    padding: 16px 18px;
+  }
+  .panel-title {
+    background: #8b1a1a;
+    color: white;
+    font-size: 0.85rem;
+    font-weight: bold;
+    letter-spacing: 0.1em;
+    text-align: center;
+    padding: 5px 0;
+    margin: -16px -18px 14px;
+    border-radius: 2px 2px 0 0;
+  }
+
+  .panel p, .panel li { font-size: 0.78rem; line-height: 1.6; color: #333; }
+  .panel ul { padding-left: 16px; margin-top: 5px; }
+  .panel li { margin-bottom: 5px; }
+  .panel h4 {
+    font-size: 0.8rem;
+    color: #8b1a1a;
+    margin: 12px 0 5px;
+    border-bottom: 1px solid #e0c0c0;
+    padding-bottom: 2px;
+  }
+  .panel h4:first-of-type { margin-top: 0; }
+
+  /* centre panel */
+  .results { grid-column: 2; grid-row: 1 / 3; }
+  .chart-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin-bottom: 14px;
+  }
+  .chart-box {
+    background: #ffffff;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    padding: 10px;
+  }
+  .chart-box h5 {
+    font-size: 0.71rem;
+    text-align: center;
+    color: #444;
+    margin-bottom: 8px;
+    font-weight: bold;
+    line-height: 1.4;
+  }
+  canvas { max-height: 185px; }
+
+  .highlight {
+    background: #fff8e1;
+    border-left: 4px solid #8b1a1a;
+    padding: 9px 13px;
+    margin: 10px 0;
+    font-size: 0.78rem;
+    line-height: 1.55;
+  }
+  .highlight strong { color: #8b1a1a; }
+
+  /* story step blocks */
+  .step {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    margin-bottom: 10px;
+  }
+  .step-num {
+    background: #8b1a1a;
+    color: white;
+    font-size: 0.75rem;
+    font-weight: bold;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  .step-text { font-size: 0.78rem; line-height: 1.55; color: #333; }
+  .step-text strong { color: #8b1a1a; }
+
+  .right-col { display: flex; flex-direction: column; gap: 14px; }
+
+  .refs { font-size: 0.7rem; color: #555; line-height: 1.7; margin-top: 6px; }
+
+  .arrow-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    margin: 8px 0;
+    flex-wrap: wrap;
+  }
+  .arrow-box {
+    background: #f0f0f0;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    padding: 5px 10px;
+    font-size: 0.72rem;
+    text-align: center;
+    line-height: 1.4;
+  }
+  .arrow-box.active {
+    background: #8b1a1a;
+    color: white;
+    border-color: #8b1a1a;
+  }
+  .arrow { font-size: 1rem; color: #888; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>A Study of CUDA Optimizations in Transformer Layers</h1>
+  <h2>Heling Huang &nbsp;·&nbsp; Shengjing Zhang &nbsp;·&nbsp; Jonathan Chen</h2>
+  <h3>Cornell University &nbsp;·&nbsp; CS 5220: Applications of Parallel Computers &nbsp;·&nbsp; NVIDIA A100 (Perlmutter / NERSC)</h3>
+</div>
+
+<div class="poster">
+
+  <!-- ── LEFT ── -->
+  <div style="display:flex;flex-direction:column;gap:14px;">
+
+    <div class="panel">
+      <div class="panel-title">INTRODUCTION</div>
+
+      <p>Transformer models power modern AI—but their two core operations, <strong>attention</strong> and the <strong>feed-forward (MLP) layer</strong>, are often slower than they should be. On the A100 GPU, these kernels are bottlenecked by <strong>memory bandwidth</strong>, not compute.</p>
+
+      <div class="highlight">
+        The GPU spends more time <strong>moving data</strong> than doing math. Closing this gap requires rethinking how data is laid out and how precision is used.
+      </div>
+
+      <p>We explore two complementary strategies:</p>
+      <ul>
+        <li><strong>Algorithmic optimization</strong> — redesign kernels to reduce data movement (fused attention, tiled GEMM with Tensor Cores)</li>
+        <li><strong>Precision reduction</strong> — compress 16-bit floats to 8-bit integers (INT8), halving memory traffic and doubling theoretical throughput</li>
+      </ul>
+
+      <h4>Our central question</h4>
+      <p>We first push FP16 performance as far as possible. Then we ask: <em>can INT8 quantization go further?</em> And if not immediately — why not?</p>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">METHODOLOGY</div>
+
+      <p>Custom CUDA kernels for attention and MLP, evaluated on an A100 (sm_80) across sequence lengths 512–4096 and model sizes 512–2048. The first four strategies form our optimized FP16 baseline; INT8 quantization is then layered on top.</p>
+      <ul>
+        <li><strong>Kernel Fusion</strong> — The full attention pass (QKᵀ→softmax→Attn×V) is fused into a single kernel via online softmax and K/V tiling, so the N×N score matrix never materializes in HBM. GELU is fused into the MLP GEMM₁ epilogue.</li>
+        <li><strong>WMMA Tensor Cores</strong> — MLP GEMMs use FP16 WMMA with 64×64 block tiles, sustaining near-peak throughput on A100's 312 TFLOPS FP16 units.</li>
+        <li><strong>cp.async Double Buffering</strong> — Asynchronous tile loads are overlapped with Tensor Core computation, hiding HBM latency and keeping compute units continuously fed.</li>
+        <li><strong>Shared Memory Swizzling</strong> — Shared memory addresses are permuted to eliminate bank conflicts on tile loads, maximizing smem bandwidth.</li>
+        <li><strong>INT8 Quantization</strong> — Per-tensor symmetric INT8 is applied to both layers, built on the same tiling structure as the FP16 kernels. Naïve INT8 was slower — pipeline overhead (host syncs, extra kernel launches, premature dequantization) outweighed the 2× throughput advantage. We removed each bottleneck systematically.</li>
+      </ul>
+    </div>
+
+  </div><!-- end left -->
+
+  <!-- ── CENTRE ── -->
+  <div class="panel results">
+    <div class="panel-title">RESULTS</div>
+
+    <!-- Architecture diagrams -->
+    <div class="chart-row" style="margin-bottom:16px;">
+
+      <!-- Diagram 1: Transformer layer -->
+      <div class="chart-box" style="padding:14px; border:none;">
+        <h5 style="margin-bottom:10px;">FP16 Baseline</h5>
+        <svg viewBox="0 0 742 94" xmlns="http://www.w3.org/2000/svg" font-family="Arial,sans-serif" width="100%">
+          <defs>
+            <marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+              <polygon points="0 0,8 3,0 6" fill="#555"/>
+            </marker>
+          </defs>
+
+          <rect x="4" y="38" width="95" height="40" rx="6" fill="#eee" stroke="#999" stroke-width="1.5"/>
+          <text x="52" y="62" text-anchor="middle" font-size="11.5" fill="#444">Input (FP16)</text>
+          <line x1="99" y1="58" x2="113" y2="58" stroke="#555" stroke-width="1" marker-end="url(#arr)"/>
+
+          <rect x="113" y="5" width="250" height="82" rx="10" fill="#fdf0f0" stroke="#8b1a1a" stroke-width="2.5"/>
+          <text x="238" y="25" text-anchor="middle" font-size="12" font-weight="bold" fill="#8b1a1a">Multi-Head Attention</text>
+          <rect x="123" y="40" width="70" height="36" rx="5" fill="#8b1a1a"/>
+          <text x="158" y="62" text-anchor="middle" font-size="11" fill="white">Q · Kᵀ</text>
+          <line x1="193" y1="58" x2="203" y2="58" stroke="#8b1a1a" stroke-width="1" marker-end="url(#arr)"/>
+          <rect x="203" y="40" width="70" height="36" rx="5" fill="#555"/>
+          <text x="238" y="62" text-anchor="middle" font-size="11" fill="white">Softmax</text>
+          <line x1="273" y1="58" x2="283" y2="58" stroke="#8b1a1a" stroke-width="1" marker-end="url(#arr)"/>
+          <rect x="283" y="40" width="70" height="36" rx="5" fill="#8b1a1a"/>
+          <text x="318" y="62" text-anchor="middle" font-size="11" fill="white">Attn × V</text>
+
+          <line x1="363" y1="58" x2="377" y2="58" stroke="#555" stroke-width="1" marker-end="url(#arr)"/>
+
+          <rect x="377" y="5" width="250" height="82" rx="10" fill="#eef3fb" stroke="#2a5fa5" stroke-width="2.5"/>
+          <text x="502" y="25" text-anchor="middle" font-size="12" font-weight="bold" fill="#2a5fa5">Feed-Forward MLP</text>
+          <rect x="387" y="40" width="70" height="36" rx="5" fill="#2a5fa5"/>
+          <text x="422" y="62" text-anchor="middle" font-size="11" fill="white">GEMM₁</text>
+          <line x1="457" y1="58" x2="467" y2="58" stroke="#2a5fa5" stroke-width="1" marker-end="url(#arr)"/>
+          <rect x="467" y="40" width="70" height="36" rx="5" fill="#2a5fa5"/>
+          <text x="502" y="62" text-anchor="middle" font-size="11" fill="white">GELU</text>
+          <line x1="537" y1="58" x2="547" y2="58" stroke="#2a5fa5" stroke-width="1" marker-end="url(#arr)"/>
+          <rect x="547" y="40" width="70" height="36" rx="5" fill="#2a5fa5"/>
+          <text x="582" y="62" text-anchor="middle" font-size="11" fill="white">GEMM₂</text>
+
+          <line x1="627" y1="58" x2="641" y2="58" stroke="#555" stroke-width="1" marker-end="url(#arr)"/>
+          <rect x="641" y="38" width="95" height="40" rx="6" fill="#eee" stroke="#999" stroke-width="1.5"/>
+          <text x="689" y="62" text-anchor="middle" font-size="11.5" fill="#444">Output (FP16)</text>
+        </svg>
+      </div>
+
+      <!-- Diagram 2: INT8 optimized architecture -->
+      <div class="chart-box" style="padding:14px; border:none;">
+        <h5 style="margin-bottom:10px;">INT8 Optimized Architecture</h5>
+        <svg viewBox="0 0 742 94" xmlns="http://www.w3.org/2000/svg" font-family="Arial,sans-serif" width="100%">
+          <defs>
+            <marker id="arr2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+              <polygon points="0 0,8 3,0 6" fill="#555"/>
+            </marker>
+          </defs>
+
+          <rect x="4" y="38" width="95" height="40" rx="6" fill="#eee" stroke="#999" stroke-width="1.5"/>
+          <text x="52" y="62" text-anchor="middle" font-size="11.5" fill="#444">Input (INT8)</text>
+          <line x1="99" y1="58" x2="113" y2="58" stroke="#555" stroke-width="1" marker-end="url(#arr2)"/>
+
+          <rect x="113" y="5" width="250" height="82" rx="10" fill="#fdf0f0" stroke="#8b1a1a" stroke-width="2.5"/>
+          <text x="238" y="25" text-anchor="middle" font-size="12" font-weight="bold" fill="#8b1a1a">Multi-Head Attention</text>
+          <rect x="123" y="40" width="70" height="36" rx="5" fill="#1a5c38"/>
+          <text x="158" y="54" text-anchor="middle" font-size="10" fill="white">INT8 QKᵀ</text>
+          <text x="158" y="67" text-anchor="middle" font-size="7.5" fill="#aaffcc">WMMA→INT32</text>
+          <line x1="193" y1="58" x2="203" y2="58" stroke="#8b1a1a" stroke-width="1" marker-end="url(#arr2)"/>
+          <rect x="203" y="40" width="70" height="36" rx="5" fill="#555"/>
+          <text x="238" y="54" text-anchor="middle" font-size="10" fill="white">scale+</text>
+          <text x="238" y="67" text-anchor="middle" font-size="10" fill="white">Softmax</text>
+          <line x1="273" y1="58" x2="283" y2="58" stroke="#8b1a1a" stroke-width="1" marker-end="url(#arr2)"/>
+          <rect x="283" y="40" width="70" height="36" rx="5" fill="#8b1a1a"/>
+          <text x="318" y="54" text-anchor="middle" font-size="10" fill="white">FP16</text>
+          <text x="318" y="67" text-anchor="middle" font-size="10" fill="#ffcccc">Attn×V</text>
+
+          <line x1="363" y1="58" x2="377" y2="58" stroke="#555" stroke-width="1" marker-end="url(#arr2)"/>
+
+          <rect x="377" y="5" width="250" height="82" rx="10" fill="#eef3fb" stroke="#2a5fa5" stroke-width="2.5"/>
+          <text x="502" y="25" text-anchor="middle" font-size="12" font-weight="bold" fill="#2a5fa5">Feed-Forward MLP</text>
+          <rect x="387" y="40" width="70" height="36" rx="5" fill="#8b1a1a"/>
+          <text x="422" y="54" text-anchor="middle" font-size="10" fill="white">INT8 GEMM₁</text>
+          <text x="422" y="67" text-anchor="middle" font-size="7.5" fill="#ffcccc">static scale</text>
+          <line x1="457" y1="58" x2="467" y2="58" stroke="#2a5fa5" stroke-width="1" marker-end="url(#arr2)"/>
+          <rect x="467" y="40" width="70" height="36" rx="5" fill="#2a5fa5"/>
+          <text x="502" y="62" text-anchor="middle" font-size="11" fill="white">GELU</text>
+          <line x1="537" y1="58" x2="547" y2="58" stroke="#2a5fa5" stroke-width="1" marker-end="url(#arr2)"/>
+          <rect x="547" y="40" width="70" height="36" rx="5" fill="#8b1a1a"/>
+          <text x="582" y="54" text-anchor="middle" font-size="10" fill="white">INT8 GEMM₂</text>
+          <text x="582" y="67" text-anchor="middle" font-size="7.5" fill="#ffcccc">epilogue deq.</text>
+
+          <line x1="627" y1="58" x2="641" y2="58" stroke="#555" stroke-width="1" marker-end="url(#arr2)"/>
+          <rect x="641" y="38" width="95" height="40" rx="6" fill="#eee" stroke="#999" stroke-width="1.5"/>
+          <text x="689" y="62" text-anchor="middle" font-size="11.5" fill="#444">Output (FP16)</text>
+        </svg>
+      </div>
+    </div>
+
+    <p style="font-size:0.75rem;color:#555;text-align:center;margin:-6px 0 14px;">
+      FP16 baseline: push kernel efficiency via fused attention and WMMA.
+      INT8: same algorithms, key operations quantized to target the A100's 2× INT8 throughput.
+    </p>
+
+    <div class="chart-row">
+      <div class="chart-box">
+        <h5>MLP: Speedup at Each Optimization Stage<br>
+          <span style="font-weight:normal;color:#777">(vs optimized FP16 WMMA baseline, d_model=2048)</span></h5>
+        <canvas id="mlpStages"></canvas>
+      </div>
+      <div class="chart-box">
+        <h5>Attention: Impact of Opt #3 by Head Size<br>
+          <span style="font-weight:normal;color:#777">(vs optimized FP16 fused baseline, seq=2048)</span></h5>
+        <canvas id="attnHeadDim"></canvas>
+      </div>
+    </div>
+
+    <div class="chart-row">
+      <div class="chart-box">
+        <h5>Final INT8 MLP Speedup vs Model Size<br>
+          <span style="font-weight:normal;color:#777">(vs FP16 WMMA, seq=2048, batch=8)</span></h5>
+        <canvas id="mlpFinal"></canvas>
+      </div>
+      <div class="chart-box">
+        <h5>Final INT8 Attention Speedup vs Model Size<br>
+          <span style="font-weight:normal;color:#777">(vs FP16 fused, seq=2048, batch=8)</span></h5>
+        <canvas id="attnFinal"></canvas>
+      </div>
+    </div>
+
+    <div class="highlight">
+      <strong>Key finding:</strong> Naïve INT8 substitution (0.23×) is slower than the FP16 baseline — each hidden overhead source must be diagnosed and removed individually.
+      After all three optimizations, INT8 MLP reaches <strong>0.72×</strong> and INT8 attention reaches <strong>0.70×</strong> of the already-optimized FP16 kernels.
+      The gap is not fundamental — it reflects implementation choices, not INT8's limits.
+    </div>
+
+    <p style="font-size:0.72rem;color:#999;text-align:center;margin-top:10px;">
+      ↑ FP16 kernel latency plots (attention + MLP vs. naive PyTorch) go here ↑
+    </p>
+
+  </div><!-- end centre -->
+
+  <!-- ── RIGHT ── -->
+  <div class="right-col">
+
+    <div class="panel">
+      <div class="panel-title">CONCLUSIONS</div>
+
+      <h4>Algorithmic optimization works</h4>
+      <ul>
+        <li>Fused attention with online softmax eliminates O(N²) HBM traffic — a single kernel handles QKᵀ, softmax, and Attn×V without materializing the score matrix.</li>
+        <li>WMMA MLP with 64×64 tiling and cp.async double buffering keeps Tensor Cores continuously fed, approaching hardware peak throughput.</li>
+        <li>Shared memory swizzling removes bank conflicts, maximizing smem bandwidth across both sub-layers.</li>
+      </ul>
+
+      <h4>INT8 is not a free lunch</h4>
+      <ul>
+        <li>Naïve INT8 substitution is slower than optimized FP16 — pipeline overheads dominate the 2× throughput advantage.</li>
+        <li>The culprits: host–device sync on scale values, an extra requantization kernel between GEMMs, and premature dequantization in shared memory.</li>
+      </ul>
+
+      <h4>Co-design is the key</h4>
+      <ul>
+        <li>INT8 halves the shared memory footprint — but only if values stay INT8 <em>inside</em> the kernel. Dequantizing early to FP16 wastes that space and kills occupancy.</li>
+        <li>The dtype is the easy part. Rethinking smem layout, tiling, and epilogues around INT8 is where the actual speedup comes from.</li>
+      </ul>
+
+      <div class="highlight">
+        Realizing INT8's advantages requires <strong>co-designing quantization with the memory layout</strong>. Changing the dtype is the easy part — making smem, tiling, and epilogues INT8-aware is where the gains come from.
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">FUTURE WORK</div>
+      <ul>
+        <li>Quantize softmax attention weights to enable INT8 WMMA for the attn×V step, completing the full INT8 attention pipeline</li>
+        <li>Increase INT8 MLP block tile size — freed smem budget allows 128×128 tiles vs. current 64×64</li>
+        <li>Add cp.async prefetch to INT8 kernels to overlap compute and memory load</li>
+        <li>Fuse INT8 attention and MLP into a single transformer block, amortizing quantization cost across layers</li>
+      </ul>
+
+      <h4>References</h4>
+      <div class="refs">
+        [1] Dao et al., <em>FlashAttention: Fast and Memory-Efficient Exact Attention</em>, NeurIPS 2022<br>
+        [2] Dettmers et al., <em>LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale</em>, NeurIPS 2022<br>
+        [3] NVIDIA, <em>A100 GPU Architecture Whitepaper</em>, 2020<br>
+        [4] NVIDIA, <em>CUTLASS: CUDA Templates for Linear Algebra</em>
+      </div>
+    </div>
+
+  </div><!-- end right -->
+
+</div><!-- end poster -->
+
+<script>
+const RED  = '#8b1a1a', RED2  = 'rgba(139,26,26,0.75)';
+const GRAY = '#999999', GRAY2 = 'rgba(153,153,153,0.6)';
+const BLUE = '#2a5fa5', BLUE2 = 'rgba(42,95,165,0.7)';
+
+const baseOpts = () => ({
+  responsive: true,
+  maintainAspectRatio: true,
+  plugins: {
+    legend: { labels: { font: { size: 10 }, boxWidth: 12 } }
+  },
+  scales: {
+    y: {
+      min: 0, max: 1.2,
+      title: { display: true, text: 'Speedup (relative to FP16 baseline)', font: { size: 9 } },
+      ticks: { font: { size: 9 },
+               callback: v => v === 1.0 ? '1.0× (FP16)' : v.toFixed(2)+'×' }
+    },
+    x: { ticks: { font: { size: 9 } } }
+  }
+});
+
+const baseline = {
+  label: 'FP16 baseline = 1.0×',
+  data: [1.0, 1.0, 1.0],
+  type: 'line',
+  borderColor: '#333',
+  borderDash: [5, 3],
+  pointRadius: 0,
+  borderWidth: 1.5,
+  tension: 0
+};
+
+// Chart 1: MLP optimization stages
+new Chart(document.getElementById('mlpStages'), {
+  type: 'bar',
+  data: {
+    labels: ['Naïve INT8', '+ Remove\ncudaMemcpy', '+ Static scale\n(no requantize)'],
+    datasets: [
+      { label: 'INT8 speedup', data: [0.23, 0.29, 0.72],
+        backgroundColor: [GRAY2, BLUE2, RED2],
+        borderColor: [GRAY, BLUE, RED], borderWidth: 1.5 },
+      { ...baseline, data: [1.0, 1.0, 1.0] }
+    ]
+  },
+  options: baseOpts()
+});
+
+// Chart 2: Attention head_dim before/after
+new Chart(document.getElementById('attnHeadDim'), {
+  type: 'bar',
+  data: {
+    labels: ['head_dim=64', 'head_dim=128', 'head_dim=256'],
+    datasets: [
+      { label: 'Before: FP16 smem (dequant on load)',
+        data: [0.64, 0.43, 0.21], backgroundColor: GRAY2, borderColor: GRAY, borderWidth: 1.5 },
+      { label: 'After: INT8 smem + INT8 WMMA QKᵀ',
+        data: [0.67, 0.60, 0.58], backgroundColor: RED2, borderColor: RED, borderWidth: 1.5 },
+      { ...baseline }
+    ]
+  },
+  options: baseOpts()
+});
+
+// Chart 3: MLP final
+new Chart(document.getElementById('mlpFinal'), {
+  type: 'line',
+  data: {
+    labels: ['d_model=512', 'd_model=1024', 'd_model=2048'],
+    datasets: [
+      { label: 'INT8 MLP (after all opts)',
+        data: [0.58, 0.63, 0.72], borderColor: RED, backgroundColor: RED2,
+        tension: 0.3, pointRadius: 5, fill: false },
+      { ...baseline }
+    ]
+  },
+  options: baseOpts()
+});
+
+// Chart 4: Attention final
+new Chart(document.getElementById('attnFinal'), {
+  type: 'line',
+  data: {
+    labels: ['d_model=512', 'd_model=1024', 'd_model=2048'],
+    datasets: [
+      { label: 'INT8 Attention (after all opts)',
+        data: [0.67, 0.60, 0.58], borderColor: RED, backgroundColor: RED2,
+        tension: 0.3, pointRadius: 5, fill: false },
+      { ...baseline }
+    ]
+  },
+  options: baseOpts()
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Team Plan — Meeting 2026-04-22 Consensus</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    background: #fafafa;
+    padding: 40px;
+    color: #222;
+    max-width: 1300px;
+    margin: 0 auto;
+    line-height: 1.6;
+  }
+  h1 { font-size: 26px; margin-bottom: 6px; }
+  .subtitle { color: #666; font-size: 14px; margin-bottom: 30px; }
+  h2 {
+    font-size: 20px;
+    margin-top: 44px;
+    color: #222;
+    padding-bottom: 8px;
+    border-bottom: 3px solid #4a90e2;
+  }
+  h3 { font-size: 16px; margin-top: 26px; color: #444; }
+
+  .consensus-box {
+    background: white;
+    border: 2px solid #27ae60;
+    border-radius: 12px;
+    padding: 20px 26px;
+    margin: 20px 0;
+    box-shadow: 0 2px 8px rgba(39,174,96,0.08);
+  }
+  .consensus-box h3 {
+    margin-top: 0;
+    color: #1e8449;
+    font-size: 17px;
+  }
+  .consensus-box ol {
+    margin: 10px 0;
+    padding-left: 22px;
+    font-size: 14px;
+    line-height: 1.9;
+  }
+
+  .timeline {
+    position: relative;
+    padding-left: 32px;
+    margin: 20px 0;
+  }
+  .timeline::before {
+    content: "";
+    position: absolute;
+    left: 12px;
+    top: 10px;
+    bottom: 10px;
+    width: 3px;
+    background: #c5daff;
+    border-radius: 2px;
+  }
+  .timeline-item {
+    position: relative;
+    margin-bottom: 20px;
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 14px 20px;
+  }
+  .timeline-item::before {
+    content: "";
+    position: absolute;
+    left: -27px;
+    top: 18px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #4a90e2;
+    border: 3px solid white;
+    box-shadow: 0 0 0 2px #c5daff;
+  }
+  .timeline-item.owner-sherry::before    { background: #16a085; }
+  .timeline-item.owner-jonathan::before  { background: #8e44ad; }
+  .timeline-item.owner-ashley::before    { background: #2970d7; }
+  .timeline-item.owner-team::before      { background: #f39c12; }
+  .timeline-date {
+    font-size: 13px;
+    font-weight: 700;
+    color: #666;
+    margin-bottom: 4px;
+  }
+  .timeline-title {
+    font-size: 15px;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .timeline-body {
+    font-size: 13.5px;
+    color: #333;
+    line-height: 1.65;
+  }
+
+  .owner-badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 11.5px;
+    font-weight: 700;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .owner-ashley   { background: #d4e7ff; color: #2970d7; }
+  .owner-jonathan { background: #ead4f0; color: #7d3c98; }
+  .owner-sherry   { background: #d4f5d8; color: #16a085; }
+  .owner-team     { background: #fff0c2; color: #b7791f; }
+
+  .poster-mockup {
+    background: #fafcff;
+    border: 2px solid #4a90e2;
+    border-radius: 12px;
+    padding: 20px 24px;
+    margin: 20px 0;
+  }
+  .poster-section {
+    background: white;
+    border-left: 4px solid #4a90e2;
+    padding: 14px 20px;
+    margin: 12px 0;
+    border-radius: 0 6px 6px 0;
+  }
+  .poster-section h5 {
+    margin: 0 0 8px 0;
+    font-size: 14.5px;
+  }
+  .poster-section .content {
+    font-size: 13px;
+    color: #333;
+    line-height: 1.7;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: white;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+    margin: 14px 0;
+    font-size: 13px;
+  }
+  th { background: #eef4fb; padding: 10px 12px; text-align: left; font-weight: 700; color: #2970d7; border-bottom: 2px solid #c5daff; font-size: 12.5px; }
+  td { padding: 10px 12px; border-bottom: 1px solid #eee; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+
+  code {
+    background: #f0f0f0;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-family: 'SF Mono', Monaco, monospace;
+    font-size: 12px;
+  }
+  .good { color: #27ae60; font-weight: 600; }
+  .bad  { color: #c0392b; font-weight: 600; }
+  .mid  { color: #f39c12; font-weight: 600; }
+
+  .state-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 14px;
+    margin: 16px 0;
+  }
+  .state-card {
+    background: white;
+    border-radius: 8px;
+    padding: 14px 18px;
+    border-top: 4px solid;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    font-size: 13px;
+  }
+  .state-card.ashley   { border-color: #2970d7; }
+  .state-card.jonathan { border-color: #8e44ad; }
+  .state-card.sherry   { border-color: #16a085; }
+  .state-card h4 { margin: 0 0 8px 0; font-size: 15px; }
+  .state-card.ashley h4   { color: #2970d7; }
+  .state-card.jonathan h4 { color: #8e44ad; }
+  .state-card.sherry h4   { color: #16a085; }
+  .state-card ul { margin: 6px 0; padding-left: 20px; line-height: 1.6; }
+
+  .highlight {
+    background: #fffbe6;
+    border-left: 4px solid #f39c12;
+    padding: 12px 18px;
+    border-radius: 0 6px 6px 0;
+    margin: 14px 0;
+    font-size: 13.5px;
+    line-height: 1.7;
+  }
+  .highlight strong { color: #b7791f; }
+
+  /* Agreement groups (grouped by date) */
+  .agreement-group {
+    margin-bottom: 26px;
+  }
+  .agreement-group-date {
+    font-size: 14px;
+    font-weight: 700;
+    color: #4a90e2;
+    background: #eef4fb;
+    padding: 10px 18px;
+    border-radius: 6px 6px 0 0;
+    border-bottom: 2px solid #c5daff;
+  }
+  .agreement-card {
+    background: white;
+    border: 1px solid #ddd;
+    border-top: none;
+    padding: 18px 22px;
+  }
+  .agreement-card:last-child {
+    border-radius: 0 0 6px 6px;
+  }
+  .agreement-card + .agreement-card {
+    border-top: 1px solid #eee;
+  }
+  .agreement-owners {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+  }
+  .agreement-title {
+    font-weight: 700;
+    font-size: 16px;
+    line-height: 1.4;
+    margin-bottom: 12px;
+    color: #222;
+  }
+  .agreement-card .for-what {
+    font-size: 13.5px;
+    color: #333;
+    line-height: 1.65;
+  }
+  .agreement-card .for-what .row {
+    margin-bottom: 8px;
+    padding-left: 56px;
+    text-indent: -56px;
+  }
+  .agreement-card .for-what .row:last-child {
+    margin-bottom: 0;
+  }
+  .agreement-card .for-what .label {
+    display: inline-block;
+    width: 46px;
+    color: #2970d7;
+    font-weight: 700;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    text-indent: 0;
+    margin-right: 10px;
+  }
+
+  /* Horizontal timeline bar */
+  .timeline-bar {
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 10px;
+    padding: 24px 32px 28px 32px;
+    margin: 18px 0;
+    overflow-x: auto;
+  }
+  .timeline-track {
+    position: relative;
+    padding: 90px 0 110px 0;
+    min-width: 1000px;
+  }
+  .timeline-track::before {
+    content: "";
+    position: absolute;
+    top: 106px;
+    left: 4%;
+    right: 4%;
+    height: 3px;
+    background: linear-gradient(to right, #2970d7, #8e44ad, #2970d7, #27ae60);
+    border-radius: 2px;
+  }
+  .timeline-marker {
+    position: absolute;
+    top: 100px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: white;
+    border: 3px solid #4a90e2;
+    z-index: 2;
+  }
+  .timeline-label {
+    position: absolute;
+    font-size: 11.5px;
+    text-align: left;
+    width: 260px;
+  }
+  .timeline-label .date {
+    font-weight: 700;
+    font-size: 13px;
+    color: #222;
+    display: block;
+    margin-bottom: 6px;
+  }
+  .timeline-label .detail {
+    font-size: 11.5px;
+    color: #444;
+    line-height: 1.55;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+  .timeline-label .detail .line {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 6px;
+    line-height: 1.5;
+    white-space: nowrap;
+  }
+  .timeline-label.above {
+    top: 0px;
+  }
+  .timeline-label.below {
+    top: 128px;
+  }
+  .timeline-label .owner-inline {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 8px;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1.3;
+    vertical-align: middle;
+    white-space: nowrap;
+  }
+  .timeline-label .owner-inline.owner-ashley   { background: #d4e7ff; color: #2970d7; }
+  .timeline-label .owner-inline.owner-jonathan { background: #ead4f0; color: #7d3c98; }
+  .timeline-label .owner-inline.owner-sherry   { background: #d4f5d8; color: #16a085; }
+  .timeline-label .owner-inline.owner-team     { background: #fff0c2; color: #b7791f; }
+
+  /* Per-date block (vertical version, for detail under timeline) */
+  .date-block {
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 14px 20px;
+    margin-bottom: 12px;
+  }
+  .date-block .date-head {
+    font-size: 14px;
+    font-weight: 700;
+    color: #4a90e2;
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #eee;
+  }
+  .date-block .date-row {
+    display: grid;
+    grid-template-columns: 100px 1fr;
+    gap: 12px;
+    padding: 6px 0;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  .date-block .date-row .owner-cell {
+    font-weight: 700;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    align-items: flex-start;
+  }
+</style>
+</head>
+<body>
+
+<h1>Team Plan — Meeting Consensus</h1>
+<div class="subtitle">2026-04-22 meeting · A100-SXM4-40GB · Poster deadline tracking</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     1. MEETING CONSENSUS
+     ═══════════════════════════════════════════════════════════════════ -->
+
+<h2>1. Agreed at the Meeting</h2>
+
+<div class="agreement-group">
+  <div class="agreement-group-date">Now → 4/25</div>
+  <div class="agreement-card">
+    <div class="agreement-owners"><span class="owner-badge owner-sherry">Sherry</span></div>
+    <div class="agreement-title">Generalize <code>sweep.py</code></div>
+    <div class="for-what">
+      <div class="row"><span class="label">Do</span>Extend <code>sweep.py</code> so it accepts any of the three kernels via a <code>--kernel</code> flag; merge to <code>main</code> once working.</div>
+      <div class="row"><span class="label">For</span>Uniform benchmark + plot infrastructure across the team, so every kernel's scaling analysis looks the same on the poster.</div>
+    </div>
+  </div>
+</div>
+
+<div class="agreement-group">
+  <div class="agreement-group-date">Due 4/26</div>
+  <div class="agreement-card">
+    <div class="agreement-owners"><span class="owner-badge owner-jonathan">Jonathan</span></div>
+    <div class="agreement-title">Port attention kernel to WMMA + push <code>attention_ext.cu</code></div>
+    <div class="for-what">
+      <div class="row"><span class="label">Do</span>Rewrite the fused attention kernel onto the WMMA tensor-core path; add a pybind11 binding. Push by 4/26.</div>
+      <div class="row"><span class="label">For</span>Make FP16 vs INT8 comparison apples-to-apples; unblock Ashley's integration on 4/27.</div>
+    </div>
+  </div>
+  <div class="agreement-card">
+    <div class="agreement-owners"><span class="owner-badge owner-sherry">Sherry</span></div>
+    <div class="agreement-title">Port MLP kernel to WMMA</div>
+    <div class="for-what">
+      <div class="row"><span class="label">Do</span>Replace the FP32 scalar tiled GEMM with WMMA FP16 GEMM, keeping the GELU epilogue fusion. Push by 4/26.</div>
+      <div class="row"><span class="label">For</span>Close the 22× gap vs PyTorch baseline; provide a fair FP16 reference for the INT8 comparison.</div>
+    </div>
+  </div>
+</div>
+
+<div class="agreement-group">
+  <div class="agreement-group-date">4/27 – 4/28</div>
+  <div class="agreement-card">
+    <div class="agreement-owners"><span class="owner-badge owner-ashley">Ashley</span></div>
+    <div class="agreement-title">Integration + further optimization</div>
+    <div class="for-what">
+      <div class="row"><span class="label">Do</span>Pull the teammates' WMMA implementations; run INT8 on top of their architectures; identify integration issues; keep optimizing.</div>
+      <div class="row"><span class="label">For</span>Produce the final INT8 numbers and surface any tile-shape / smem-layout / accumulator-dtype clashes across FP16 and INT8 paths.</div>
+    </div>
+  </div>
+  <div class="agreement-card">
+    <div class="agreement-owners">
+      <span class="owner-badge owner-jonathan">Jonathan</span>
+      <span class="owner-badge owner-sherry">Sherry</span>
+    </div>
+    <div class="agreement-title">Start poster writing</div>
+    <div class="for-what">
+      <div class="row"><span class="label">Do</span>Begin drafting their poster sections using the agreed structure (ablation table + insight prose + scaling plot).</div>
+      <div class="row"><span class="label">For</span>Get a full poster draft early, while Ashley is still iterating on integration numbers.</div>
+    </div>
+  </div>
+</div>
+
+<div class="agreement-group">
+  <div class="agreement-group-date">4/28 night — INT8 freeze</div>
+  <div class="agreement-card">
+    <div class="agreement-owners"><span class="owner-badge owner-ashley">Ashley</span></div>
+    <div class="agreement-title">Lock the final INT8 version</div>
+    <div class="for-what">
+      <div class="row"><span class="label">Do</span>Stop iterating. Hand off the final numbers and figures that go into the INT8 section of the poster.</div>
+      <div class="row"><span class="label">For</span>Give the team one night to review the full poster before the 4/29 deadline.</div>
+    </div>
+  </div>
+</div>
+
+<div class="agreement-group">
+  <div class="agreement-group-date">🚩 4/29 — Deadline</div>
+  <div class="agreement-card">
+    <div class="agreement-owners"><span class="owner-badge owner-team">All</span></div>
+    <div class="agreement-title">Review + submit</div>
+    <div class="for-what">
+      <div class="row"><span class="label">Do</span>Each person reviews the full poster (every section + combined layout); fix any remaining issues; submit.</div>
+      <div class="row"><span class="label">For</span>Final deadline — no more implementation work, just review + polish + submission.</div>
+    </div>
+  </div>
+</div>
+
+<div class="agreement-group">
+  <div class="agreement-group-date">Cross-cutting — writing conventions</div>
+  <div class="agreement-card" style="background: #fff5f5;">
+    <div class="agreement-owners"><span class="owner-badge owner-team">All</span></div>
+    <div class="agreement-title" style="color: #c0392b;">🚨 Same hardware for all reported numbers</div>
+    <div class="for-what">
+      <div class="row"><span class="label">Do</span>Perlmutter has <strong>two A100 variants</strong>: PCIe-40GB (1.55 TB/s HBM) and SXM4-40GB (2.04 TB/s HBM). The usual <code>salloc -C "gpu&amp;hbm40g"</code> does not distinguish between them. Pick one variant (recommend SXM4), verify the node type with <code>nvidia-smi</code> before collecting poster numbers; ideally collect all final numbers in a single <code>salloc</code> session.</div>
+      <div class="row"><span class="label">For</span>HBM bandwidth differs by 30% between variants — enough to completely change a memory-bound kernel's reported latency.</div>
+    </div>
+  </div>
+  <div class="agreement-card">
+    <div class="agreement-owners"><span class="owner-badge owner-team">All</span></div>
+    <div class="agreement-title">Poster structure: ablation + insight</div>
+    <div class="for-what">
+      <div class="row"><span class="label">Do</span>Each person's section has an ablation table (each step → % gain/loss) plus prose explaining the bottleneck → next-decision chain.</div>
+      <div class="row"><span class="label">For</span>Consistent reader experience across subsections; emphasizes reasoning, not just numbers.</div>
+    </div>
+  </div>
+  <div class="agreement-card">
+    <div class="agreement-owners"><span class="owner-badge owner-team">All</span></div>
+    <div class="agreement-title">Nsys / NCU profile analysis as bottleneck evidence</div>
+    <div class="for-what">
+      <div class="row"><span class="label">Do</span>Each person runs Nsys / NCU on their kernel and includes the key profiler findings (memory-bound? compute-bound? launch-bound? occupancy-limited?) as the "evidence" column behind every bottleneck claim in the insight prose.</div>
+      <div class="row"><span class="label">For</span>Anchors the narrative — instead of saying "we thought it was memory-bound, so we did X," we say "profile shows HBM bandwidth saturated at Y%, so we did X." Sherry already has <code>ncu_mlp_report.txt</code> + <code>nsys_mlp_stats.txt</code> as templates.</div>
+    </div>
+  </div>
+  <div class="agreement-card">
+    <div class="agreement-owners"><span class="owner-badge owner-ashley">Ashley</span></div>
+    <div class="agreement-title">Add precision / tolerance analysis</div>
+    <div class="for-what">
+      <div class="row"><span class="label">Do</span>On top of the common skeleton, report max error, atol decisions, and accuracy-speed tradeoff curves.</div>
+      <div class="row"><span class="label">For</span>INT8 is a lossy optimization; the poster must show both what was gained and what was given up.</div>
+    </div>
+  </div>
+</div>
+
+<div class="highlight">
+  <strong>Key upshot:</strong> once everyone's FP16 uses WMMA, INT8 vs FP16 becomes a fair comparison.
+  Ashley's section can meaningfully claim "INT8 achieves X× speedup over a tensor-core FP16 kernel at Y accuracy cost" —
+  no more "tensor core vs scalar FP32" disclaimer needed.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     2. TIMELINE
+     ═══════════════════════════════════════════════════════════════════ -->
+
+<h2>2. Timeline</h2>
+
+<!-- Visual horizontal timeline -->
+<div class="timeline-bar">
+  <div class="timeline-track">
+
+    <!-- Marker 1: now -->
+    <div class="timeline-marker" style="left: 4%;"></div>
+    <div class="timeline-label above" style="left: 4%;">
+      <span class="date">Today (4/22)</span>
+      <span class="detail">
+        <span class="line">Sprint kick-off</span>
+        <span class="line"><span class="owner-inline owner-sherry">Sherry</span> starts <code>sweep.py</code></span>
+      </span>
+    </div>
+
+    <!-- Marker 2: 4/26 -->
+    <div class="timeline-marker" style="left: 30%; border-color: #8e44ad;"></div>
+    <div class="timeline-label below" style="left: 30%;">
+      <span class="date">4/26 — WMMA due</span>
+      <span class="detail">
+        <span class="line"><span class="owner-inline owner-jonathan">Jonathan</span> attention WMMA + <code>attention_ext.cu</code></span>
+        <span class="line"><span class="owner-inline owner-sherry">Sherry</span> MLP WMMA</span>
+      </span>
+    </div>
+
+    <!-- Marker 3: 4/27-28 -->
+    <div class="timeline-marker" style="left: 54%; border-color: #2970d7;"></div>
+    <div class="timeline-label above" style="left: 54%;">
+      <span class="date">4/27 – 4/28</span>
+      <span class="detail">
+        <span class="line"><span class="owner-inline owner-ashley">Ashley</span> integrates + optimizes INT8</span>
+        <span class="line"><span class="owner-inline owner-jonathan">Jonathan</span> <span class="owner-inline owner-sherry">Sherry</span> draft poster</span>
+      </span>
+    </div>
+
+    <!-- Marker 4: 4/28 evening - INT8 frozen -->
+    <div class="timeline-marker" style="left: 74%; border-color: #e67e22;"></div>
+    <div class="timeline-label below" style="left: 74%;">
+      <span class="date">4/28 night — INT8 frozen</span>
+      <span class="detail">
+        <span class="line"><span class="owner-inline owner-ashley">Ashley</span> locks INT8 version</span>
+        <span class="line">Final numbers for Ashley's poster section</span>
+      </span>
+    </div>
+
+    <!-- Marker 5: 4/29 submission -->
+    <div class="timeline-marker" style="left: 94%; border-color: #c0392b;"></div>
+    <div class="timeline-label above" style="left: 94%;">
+      <span class="date">🚩 4/29 — DEADLINE</span>
+      <span class="detail">
+        <span class="line"><span class="owner-inline owner-team">All</span> review the poster</span>
+        <span class="line">Submit</span>
+      </span>
+    </div>
+
+  </div>
+</div>
+
+<!-- Per-date detail blocks -->
+
+<div class="date-block">
+  <div class="date-head">Today (4/22) → 4/25</div>
+  <div class="date-row">
+    <div class="owner-cell"><span class="owner-badge owner-sherry">Sherry</span></div>
+    <div>Generalize <code>sweep.py</code> to support all three kernels; merge to <code>main</code> once working.</div>
+  </div>
+</div>
+
+<div class="date-block">
+  <div class="date-head">Due 4/26</div>
+  <div class="date-row">
+    <div class="owner-cell"><span class="owner-badge owner-jonathan">Jonathan</span></div>
+    <div>Port attention kernel to WMMA tensor core; push to branch. Add <code>attention_ext.cu</code> Python binding.</div>
+  </div>
+  <div class="date-row">
+    <div class="owner-cell"><span class="owner-badge owner-sherry">Sherry</span></div>
+    <div>Port MLP kernel to WMMA tensor core; push to branch.</div>
+  </div>
+</div>
+
+<div class="date-block">
+  <div class="date-head">4/27 – 4/28</div>
+  <div class="date-row">
+    <div class="owner-cell"><span class="owner-badge owner-ashley">Ashley</span></div>
+    <div>Pull teammates' WMMA branches; run INT8 on top of their architecture; identify integration issues; continue optimizing.</div>
+  </div>
+  <div class="date-row">
+    <div class="owner-cell"><span class="owner-badge owner-jonathan">Jonathan</span> <span class="owner-badge owner-sherry">Sherry</span></div>
+    <div>Start drafting poster sections (ablation table + insight prose + scaling plot).</div>
+  </div>
+</div>
+
+<div class="date-block">
+  <div class="date-head">4/28 night — INT8 version frozen</div>
+  <div class="date-row">
+    <div class="owner-cell"><span class="owner-badge owner-ashley">Ashley</span></div>
+    <div>Lock the final INT8 version. Hand off the numbers / figures that go into Ashley's poster section.</div>
+  </div>
+</div>
+
+<div class="date-block" style="border: 2px solid #e74c3c;">
+  <div class="date-head" style="color: #c0392b;">🚩 4/29 — Final deadline</div>
+  <div class="date-row">
+    <div class="owner-cell"><span class="owner-badge owner-team">All</span></div>
+    <div>Review the full poster draft (each section + combined layout). Fix any remaining issues. Submit.</div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     3. POSTER STRUCTURE
+     ═══════════════════════════════════════════════════════════════════ -->
+
+<h2>3. Poster Structure (rough shape)</h2>
+
+<p>All three sections share the same skeleton:</p>
+
+<div class="poster-mockup">
+  <div class="poster-section">
+    <div class="content">
+      <strong>Per-person subsection = 3 parts:</strong>
+      <ol style="margin: 6px 0 0 0; padding-left: 22px;">
+        <li><strong>Ablation table</strong> — each optimization step + its % gain / loss</li>
+        <li><strong>Insight prose</strong> — how the bottleneck was identified, what drove the next decision</li>
+        <li><strong>Scaling plot</strong> — from the shared <code>sweep.py</code></li>
+      </ol>
+      <div style="margin-top: 10px; font-size: 12.5px; color: #555;">
+        Ashley adds one extra item: <em>precision / tolerance analysis</em> (max error, atol, accuracy-speed tradeoff).
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     4. CURRENT STATE (FROZEN SNAPSHOT)
+     ═══════════════════════════════════════════════════════════════════ -->
+
+<h2>4. Current Progress (Detailed)</h2>
+
+<style>
+  .progress-card {
+    background: white;
+    border: 1px solid #ddd;
+    border-left: 5px solid;
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin: 18px 0;
+  }
+  .progress-card.ashley   { border-left-color: #2970d7; }
+  .progress-card.jonathan { border-left-color: #8e44ad; }
+  .progress-card.sherry   { border-left-color: #16a085; }
+  .progress-card h3 {
+    margin: 0 0 4px 0;
+    font-size: 17px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .progress-card.ashley h3   { color: #2970d7; }
+  .progress-card.jonathan h3 { color: #8e44ad; }
+  .progress-card.sherry h3   { color: #16a085; }
+  .progress-card .subhead {
+    font-size: 13px;
+    color: #666;
+    margin-bottom: 14px;
+    font-family: 'SF Mono', Monaco, monospace;
+  }
+  .progress-block {
+    margin-top: 14px;
+  }
+  .progress-block .block-title {
+    font-size: 12.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #555;
+    margin-bottom: 6px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #eee;
+  }
+  .progress-block.done   .block-title { color: #27ae60; }
+  .progress-block.wip    .block-title { color: #f39c12; }
+  .progress-block.todo   .block-title { color: #c0392b; }
+  .progress-block ul {
+    margin: 6px 0;
+    padding-left: 22px;
+    font-size: 13px;
+    line-height: 1.8;
+  }
+  .progress-block ul li code {
+    font-size: 11.5px;
+  }
+  .mini-numbers {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin: 10px 0;
+  }
+  .mini-numbers .num {
+    background: #f5f5f5;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 12.5px;
+  }
+  .mini-numbers .num strong {
+    display: block;
+    font-size: 15px;
+    color: #222;
+    margin-top: 2px;
+  }
+</style>
+
+<!-- ─── Ashley ─── -->
+<div class="progress-card ashley">
+  <h3>Ashley — INT8 (Attention + MLP)</h3>
+  <div class="subhead">Branch: <code>feat/int8</code> · 6 iterations (v1 → v6) · canonical config (batch=2, seq=512)</div>
+
+  <div class="mini-numbers">
+    <div class="num">INT8 Attn<strong>0.181 ms</strong></div>
+    <div class="num">INT8 MLP<strong>0.231 ms</strong></div>
+    <div class="num">vs v1<strong>~10× faster</strong></div>
+    <div class="num">A100 Util<strong>1.0% / 3.0%</strong></div>
+    <div class="num">Correctness<strong>atol=0.1 ✓</strong></div>
+  </div>
+
+  <div class="progress-block done">
+    <div class="block-title">✓ Done</div>
+    <ul>
+      <li>WMMA INT8 tensor-core path (16×16×16 fragment), only tensor-core user on the team</li>
+      <li>Epilogue fusion: GEMM + dequant + GELU / scale + FP16 write in one kernel</li>
+      <li>Warp-level tiling: each warp holds 2×2 accumulator fragments → 32×32 output, fragment reuse halves HBM loads</li>
+      <li>Device-side scale management (no CPU ↔ GPU round-trips in <code>quant_utils</code>)</li>
+      <li>Static workspace cache (no <code>cudaMalloc</code> per forward)</li>
+      <li>PyTorch binding <code>int8_bindings.cu</code> + <code>tests/test_int8.py</code> benchmark vs cuBLAS INT8</li>
+      <li>Pure-CUDA test <code>tests/cuda/test_int8.cu</code> with PASS/FAIL correctness + tolerance diagnostics</li>
+      <li>Six documented iterations (v1 naive → v6 warp-tile) with per-version timing + rationale</li>
+      <li>Failed experiment documented: v4 smem tiling regressed 25–31% (L2 already holds working set)</li>
+    </ul>
+  </div>
+
+  <div class="progress-block todo">
+    <div class="block-title">Pending (4/27 – 4/28)</div>
+    <ul>
+      <li>Pull Jonathan's + Sherry's WMMA branches, run INT8 on top, identify integration issues</li>
+      <li>Three-way comparison: INT8 vs team's FP16-WMMA vs cuBLAS INT8 (isolate quantization vs tensor core benefit)</li>
+      <li>Extend benchmark beyond single config (use generalized <code>sweep.py</code> once merged)</li>
+      <li>Run <code>ncu</code> to identify the real bottleneck at current state</li>
+      <li>Add compile-time ablation flags (<code>INT8_WMMA</code>, <code>INT8_WARP_TILE32</code>, <code>INT8_EPILOGUE_FUSION</code>) matching Jonathan's pattern</li>
+      <li>Lock final version by night of 4/28</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ─── Jonathan ─── -->
+<div class="progress-card jonathan">
+  <h3>Jonathan — FP16 Attention</h3>
+  <div class="subhead">Branch: <code>origin/attention</code> · 1 commit</div>
+
+  <div class="progress-block done">
+    <div class="block-title">✓ Done</div>
+    <ul>
+      <li>Two kernel variants in <code>kernels/attention.cu</code>:
+        <ul style="margin-top: 4px;">
+          <li><strong>Naive</strong>: 3 kernels (QK^T → softmax → SV), separate scratch buffer</li>
+          <li><strong>Fused</strong>: single kernel with <strong>online softmax</strong> (running max + running sum rescaling)</li>
+        </ul>
+      </li>
+      <li>Shared-memory tiling: <code>TILE_KV = 64</code>, Q row + K tile + V tile + scores + out accumulator all in smem</li>
+      <li>Compile-time ablation flags (<code>ATTN_FUSION</code>, <code>ATTN_FAST_MATH</code>) — most mature ablation infra on the team</li>
+      <li>Fast-math path (<code>__expf</code>)</li>
+      <li>Makefile has <code>ablation_attention</code> target that builds all four ablation binaries in one go</li>
+    </ul>
+  </div>
+
+  <div class="progress-block todo">
+    <div class="block-title">Pending (by 4/26)</div>
+    <ul>
+      <li><strong>Migrate to WMMA tensor core</strong> — currently uses scalar FP32 accumulation in smem, which limits performance</li>
+      <li>Write <code>attention_ext.cu</code> Python binding (unblocks <code>sweep.py</code> integration + Ashley's cross-kernel comparison)</li>
+      <li>Push benchmark numbers — no latency / TFLOPS / utilization pushed yet</li>
+    </ul>
+  </div>
+
+  <div class="progress-block wip">
+    <div class="block-title">After 4/26</div>
+    <ul>
+      <li>Run <code>sweep.py</code> on attention once generalized</li>
+      <li>Run <code>ncu</code> for bottleneck evidence</li>
+      <li>Start poster section drafting on 4/27 – 4/28</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ─── Sherry ─── -->
+<div class="progress-card sherry">
+  <h3>Sherry — FP16 MLP</h3>
+  <div class="subhead">Branch: <code>origin/mlp</code> · 2 commits</div>
+
+  <div class="mini-numbers">
+    <div class="num">MLP @ batch=8<strong>3.9 – 461 ms</strong></div>
+    <div class="num">TFLOPS<strong>~4.4</strong></div>
+    <div class="num">A100 Util<strong>~1.4%</strong></div>
+    <div class="num">vs baseline<strong>22 – 35× slower</strong></div>
+  </div>
+
+  <div class="progress-block done">
+    <div class="block-title">✓ Done</div>
+    <ul>
+      <li>Tiled FP16 GEMM kernel with <code>TILE = 16</code>, FP32 accumulation in smem</li>
+      <li>GELU fused into first GEMM via C++ template (<code>apply_gelu=true</code>)</li>
+      <li>Static workspace cache for the hidden buffer (no <code>cudaMalloc</code> per forward)</li>
+      <li>PyTorch binding <code>kernels/mlp_ext.cu</code></li>
+      <li><strong>Most complete profile infra on the team</strong>:
+        <ul style="margin-top: 4px;">
+          <li><code>sweep.py</code> (385 lines, 12 configs — batch=8, varying seq_len/d_model/d_ff)</li>
+          <li><code>profile_mlp.py</code> with <code>torch.profiler</code></li>
+          <li><code>results/mlp_sweep.csv</code> with latency / TFLOPS / utilization / bandwidth columns</li>
+          <li><code>results/ncu_mlp_report.txt</code> + <code>results/nsys_mlp_stats.txt</code></li>
+          <li>Five PNG plots: latency vs seq_len, TFLOPS vs seq_len, speedup, HBM bandwidth, latency bar by d_model</li>
+        </ul>
+      </li>
+      <li>Correctness PASSED (atol=1e-2, max err 1e-6 on small / 9.7e-4 on large)</li>
+    </ul>
+  </div>
+
+  <div class="progress-block todo">
+    <div class="block-title">Pending (by 4/26)</div>
+    <ul>
+      <li><strong>Migrate MLP kernel to WMMA tensor core</strong> — current FP32 scalar path is 22× slower than PyTorch baseline</li>
+      <li><strong>Generalize <code>sweep.py</code></strong> — add <code>--kernel {attention,mlp,int8}</code> flag so all three kernels share the same benchmark harness; merge to <code>main</code></li>
+    </ul>
+  </div>
+
+  <div class="progress-block wip">
+    <div class="block-title">After 4/26</div>
+    <ul>
+      <li>Re-run sweep with the new WMMA kernel, produce updated plots</li>
+      <li>Start poster section drafting on 4/27 – 4/28</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     5. ABLATION TABLE TEMPLATE
+     ═══════════════════════════════════════════════════════════════════ -->
+
+<h2>5. Ablation Table Template (what each person fills in)</h2>
+
+<p>Expected format for each person's ablation table in the poster:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Step</th>
+      <th>What changed</th>
+      <th>Latency</th>
+      <th>Δ vs previous</th>
+      <th>TFLOPS / TOPS</th>
+      <th>Utilization</th>
+      <th>Bottleneck observation (→ next step)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>v1</td>
+      <td>Naive baseline</td>
+      <td>—</td>
+      <td>—</td>
+      <td>—</td>
+      <td>—</td>
+      <td>Which hardware unit is idle? Where are the cycles going?</td>
+    </tr>
+    <tr>
+      <td>v2</td>
+      <td>First optimization</td>
+      <td>—</td>
+      <td><span class="good">-XX%</span> / <span class="bad">+XX%</span></td>
+      <td>—</td>
+      <td>—</td>
+      <td>What's the new bottleneck?</td>
+    </tr>
+    <tr>
+      <td>...</td>
+      <td>...</td>
+      <td>...</td>
+      <td>...</td>
+      <td>...</td>
+      <td>...</td>
+      <td>...</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="highlight">
+  <strong>Ashley's version additionally carries</strong>: accuracy (max error, mean error) and atol-compliance column —
+  so the poster tells the story "as we optimized for speed, did accuracy degrade? and if so, by how much?"
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     6. INTEGRATION RISKS (what Ashley watches for on 4/27-28)
+     ═══════════════════════════════════════════════════════════════════ -->
+
+<h2>6. Integration Risks to Watch (4/27–28)</h2>
+
+<p>When pulling Jonathan's and Sherry's WMMA implementations, Ashley should explicitly check:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th style="width: 28%;">Potential issue</th>
+      <th>Why it matters for INT8</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Fragment tile shape</td>
+      <td>FP16 WMMA uses 16×16×16 tiles. INT8 WMMA can also use 16×16×16, but 8×8×32 and 32×8×16 are other options. If FP16 kernels hard-code tile layout, swapping to INT8 may require restructuring.</td>
+    </tr>
+    <tr>
+      <td>Shared-memory layout assumptions</td>
+      <td>FP16 is 2 bytes, INT8 is 1 byte. Any smem index arithmetic assuming FP16 stride will break.</td>
+    </tr>
+    <tr>
+      <td>Accumulator dtype (FP32 vs INT32)</td>
+      <td>Epilogue code (dequant, GELU, softmax) must handle INT32 accumulator for INT8 path vs FP32 for FP16 path.</td>
+    </tr>
+    <tr>
+      <td>Per-tensor vs per-row scales</td>
+      <td>If teammates' kernels assume a single scalar input, INT8's scale-handling needs adaptation.</td>
+    </tr>
+    <tr>
+      <td>Softmax precision</td>
+      <td>INT8 attention needs dequant → softmax (FP16) → quantize. FP16 kernel can do softmax inline in registers; INT8 may need a separate pass.</td>
+    </tr>
+  </tbody>
+</table>
+
+</body>
+</html>

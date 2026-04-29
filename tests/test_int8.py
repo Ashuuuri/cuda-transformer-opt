@@ -98,13 +98,14 @@ def main():
     print("\n=== Correctness ===")
     attn_out_int8 = int8_ext.int8_attention_forward(
         Q_int8, K_int8, V_int8, float(scale_Q), float(scale_K), float(scale_V))
-    mlp_out_int8 = int8_ext.int8_mlp_forward(
+    mlp_out_int8, mlp_out_scale = int8_ext.int8_mlp_forward(
         x_int8, W1_int8, W2_int8, float(scale_x), float(scale_W1), float(scale_W2))
 
-    # Dequantize INT8 output for comparison against FP16 reference.
-    # Use scale_V as output scale for attention (kernel uses same bound).
+    # Dequantize for comparison against FP16 reference.
+    # Attention: output scale = scale_V (convex combo of V rows).
+    # MLP: output scale returned by kernel (dynamically computed).
     attn_out = (attn_out_int8.float() * scale_V).half()
-    mlp_out  = (mlp_out_int8.float() * scale_x * scale_W1 * scale_W2).half()
+    mlp_out  = (mlp_out_int8.float() * mlp_out_scale).half()
 
     check_correctness(attn_ref, attn_out, label="int8_attention", mode="int8")
     check_correctness(mlp_ref,  mlp_out,  label="int8_mlp",       mode="int8")
@@ -132,9 +133,9 @@ def main():
     # kernel sees after quantize/dequantize, not the original unquantized input.
     fp16_mlp_ms = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)
 
-    int8_mlp_ms = benchmark(int8_ext.int8_mlp_forward,
-                            x_int8, W1_int8, W2_int8,
-                            float(scale_x), float(scale_W1), float(scale_W2))
+    # benchmark unpacks tuple automatically; only latency matters here
+    int8_mlp_ms = benchmark(lambda: int8_ext.int8_mlp_forward(
+        x_int8, W1_int8, W2_int8, float(scale_x), float(scale_W1), float(scale_W2)))
 
     # cuBLAS INT8 comparison (torch._int_mm, 2D only)
     x_2d_int8 = x_int8.view(-1, d_model)

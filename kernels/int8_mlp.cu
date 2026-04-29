@@ -271,3 +271,12 @@ void int8_mlp_forward(
     // ── Quantize output (FP16 → INT8) ────────────────────────────────────
     quantize_fp16_to_int8(s_out_fp16, out, s_scale_out, T * d_model);
 }
+
+// Returns the per-tensor output scale used in the most recent int8_mlp_forward call.
+// Needed by the Python binding to correctly dequantize for correctness checking.
+void int8_mlp_get_output_scale(float* host_out) {
+    if (s_scale_out)
+        cudaMemcpy(host_out, s_scale_out, sizeof(float), cudaMemcpyDeviceToHost);
+    else
+        *host_out = 1.f;
+}

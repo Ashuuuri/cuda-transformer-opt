@@ -36,6 +36,8 @@ void int8_mlp_forward(
     int batch, int seq_len, int d_model, int d_ff
 );
 
+void int8_mlp_get_output_scale(float* host_out);
+
 // ── Helper: pack Python float scalars into a 1-D CUDA float tensor ─────
 static torch::Tensor make_scale_tensor(double val, const torch::Device& dev) {
     return torch::full({1}, (float)val,
@@ -89,8 +91,11 @@ torch::Tensor int8_attention_forward_torch(
 // x  : (batch, seq_len, d_model)  torch.int8  CUDA
 // W1 : (d_model, d_ff)             torch.int8  CUDA
 // W2 : (d_ff, d_model)              torch.int8  CUDA
-// returns : (batch, seq_len, d_model)  torch.int8  CUDA
-torch::Tensor int8_mlp_forward_torch(
+// returns : tuple(
+//     int8 output tensor  (batch, seq_len, d_model),
+//     out_scale float     — dequant scale for correctness checking
+// )
+std::tuple<torch::Tensor, double> int8_mlp_forward_torch(
     torch::Tensor x,
     torch::Tensor W1,
     torch::Tensor W2,
@@ -131,7 +136,10 @@ torch::Tensor int8_mlp_forward_torch(
         batch, seq_len, d_model, d_ff
     );
 
-    return out;
+    float out_scale;
+    int8_mlp_get_output_scale(&out_scale);
+
+    return {out, (double)out_scale};
 }
 
 // ── Module registration ────────────────────────────────────────────────
@@ -139,5 +147,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("int8_attention_forward", &int8_attention_forward_torch,
           "INT8 attention (CUDA) — (batch, heads, seq_len, head_dim) int8");
     m.def("int8_mlp_forward", &int8_mlp_forward_torch,
-          "INT8 MLP (CUDA) — x:(batch,seq,d_model), W1:(d_model,d_ff), W2:(d_ff,d_model) int8");
+          "INT8 MLP (CUDA) — returns (int8_out, out_scale) tuple");
 }

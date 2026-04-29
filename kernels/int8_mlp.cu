@@ -55,8 +55,11 @@ __global__ void gemm_int8_scalar_kernel(
     const int8_t* __restrict__ A,
     const int8_t* __restrict__ B,
     half* __restrict__         C,
-    int M, int N, int K, float scale
+    int M, int N, int K,
+    const float* __restrict__ d_scale_A,
+    const float* __restrict__ d_scale_B
 ) {
+    const float scale = __ldg(d_scale_A) * __ldg(d_scale_B);
     __shared__ float sA[SCALAR_TILE][SCALAR_TILE];
     __shared__ float sB[SCALAR_TILE][SCALAR_TILE];
 
@@ -114,14 +117,17 @@ __device__ __forceinline__ void load_int8_tile_async(
 
 // ── INT8 WMMA GEMM kernel ───────────────────────────────────────────────
 // C (FP16) = dequant( A (INT8) × B (INT8) )
-//   real[i,j] = int32_acc[i,j] * scale   [+ GELU]
+//   real[i,j] = int32_acc[i,j] * scale_A * scale_B   [+ GELU]
 template <bool apply_gelu>
 __global__ void gemm_int8_wmma_kernel(
     const int8_t* __restrict__ A,
     const int8_t* __restrict__ B,
     half* __restrict__         C,
-    int M, int N, int K, float scale
+    int M, int N, int K,
+    const float* __restrict__ d_scale_A,
+    const float* __restrict__ d_scale_B
 ) {
+    const float scale = __ldg(d_scale_A) * __ldg(d_scale_B);
     __shared__ __align__(16) int8_t  sA[2][BLOCK_M * A_SMEM_STRIDE];
     __shared__ __align__(16) int8_t  sB[2][STAGE_K * B_SMEM_STRIDE];
     __shared__               int32_t c_smem[WARPS_PER_BLOCK * WARP_COL_TILES * WMMA_M * WMMA_N];
@@ -229,43 +235,36 @@ void int8_mlp_forward(
         s_out_cap = out_fp16_sz;
     }
 
-    // Read input scales to host once; avoids repeated device reads in epilogues.
-    float h_sx, h_sw1, h_sw2;
-    cudaMemcpy(&h_sx,  scale_x,  sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&h_sw1, scale_W1, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&h_sw2, scale_W2, sizeof(float), cudaMemcpyDeviceToHost);
-
     const bool use_wmma =
         (T      % BLOCK_M == 0) && (d_model % BLOCK_N == 0) &&
         (d_ff   % BLOCK_N == 0) && (d_model % STAGE_K == 0) &&
         (d_ff   % STAGE_K == 0);
 
     // ── GEMM 1: x @ W1 → FP16 hidden (with GELU) ───────────────────────
+    // scale_x and scale_W1 are device pointers — no cudaMemcpy needed.
     if (use_wmma) {
         dim3 grid(d_ff / BLOCK_N, T / BLOCK_M);
         gemm_int8_wmma_kernel<true><<<grid, THREADS_PER_BLOCK>>>(
-            x, W1, s_hidden_fp16, T, d_ff, d_model, h_sx * h_sw1);
+            x, W1, s_hidden_fp16, T, d_ff, d_model, scale_x, scale_W1);
     } else {
         dim3 grid((d_ff + SCALAR_TILE-1)/SCALAR_TILE, (T + SCALAR_TILE-1)/SCALAR_TILE);
         gemm_int8_scalar_kernel<true><<<grid, dim3(SCALAR_TILE, SCALAR_TILE)>>>(
-            x, W1, s_hidden_fp16, T, d_ff, d_model, h_sx * h_sw1);
+            x, W1, s_hidden_fp16, T, d_ff, d_model, scale_x, scale_W1);
     }
 
-    // ── Quantize hidden (FP16 → INT8, computes scale_hidden) ────────────
+    // ── Quantize hidden (FP16 → INT8, computes s_scale_hidden on device) ─
     quantize_fp16_to_int8(s_hidden_fp16, s_hidden_int8, s_scale_hidden, T * d_ff);
 
-    float h_sh;
-    cudaMemcpy(&h_sh, s_scale_hidden, sizeof(float), cudaMemcpyDeviceToHost);
-
     // ── GEMM 2: hidden @ W2 → FP16 out ─────────────────────────────────
+    // s_scale_hidden is already on device; pass alongside scale_W2 directly.
     if (use_wmma) {
         dim3 grid(d_model / BLOCK_N, T / BLOCK_M);
         gemm_int8_wmma_kernel<false><<<grid, THREADS_PER_BLOCK>>>(
-            s_hidden_int8, W2, s_out_fp16, T, d_model, d_ff, h_sh * h_sw2);
+            s_hidden_int8, W2, s_out_fp16, T, d_model, d_ff, s_scale_hidden, scale_W2);
     } else {
         dim3 grid((d_model + SCALAR_TILE-1)/SCALAR_TILE, (T + SCALAR_TILE-1)/SCALAR_TILE);
         gemm_int8_scalar_kernel<false><<<grid, dim3(SCALAR_TILE, SCALAR_TILE)>>>(
-            s_hidden_int8, W2, s_out_fp16, T, d_model, d_ff, h_sh * h_sw2);
+            s_hidden_int8, W2, s_out_fp16, T, d_model, d_ff, s_scale_hidden, scale_W2);
     }
 
     // ── Quantize output (FP16 → INT8) ────────────────────────────────────

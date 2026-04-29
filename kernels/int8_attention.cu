@@ -40,10 +40,16 @@ __global__ void int8_fused_attention_kernel(
     const int8_t* __restrict__ K,
     const int8_t* __restrict__ V,
     int8_t* __restrict__       out,
-    float scale_Q, float scale_K, float scale_V,
+    const float* __restrict__ d_scale_Q,
+    const float* __restrict__ d_scale_K,
+    const float* __restrict__ d_scale_V,
     int seq_len, int head_dim,
-    float attn_scale, float inv_out_scale   // inv_out_scale = 1/scale_V
+    float attn_scale
 ) {
+    const float scale_Q       = __ldg(d_scale_Q);
+    const float scale_K       = __ldg(d_scale_K);
+    const float scale_V       = __ldg(d_scale_V);
+    const float inv_out_scale = 1.f / scale_V;
     const int bh  = blockIdx.y;
     const int qi  = blockIdx.x;
     const int tid = threadIdx.x;
@@ -138,10 +144,16 @@ void int8_wmma_attention_kernel(
     const int8_t* __restrict__ K,
     const int8_t* __restrict__ V,
     int8_t* __restrict__       out,
-    float scale_Q, float scale_K, float scale_V,
+    const float* __restrict__ d_scale_Q,
+    const float* __restrict__ d_scale_K,
+    const float* __restrict__ d_scale_V,
     int seq_len, int head_dim,
-    float attn_scale, float inv_out_scale
+    float attn_scale
 ) {
+    const float scale_Q       = __ldg(d_scale_Q);
+    const float scale_K       = __ldg(d_scale_K);
+    const float scale_V       = __ldg(d_scale_V);
+    const float inv_out_scale = 1.f / scale_V;
     const int bh      = blockIdx.y;
     const int qi_base = blockIdx.x * ATTN_TILE_Q;
     const int tid     = threadIdx.x;
@@ -306,18 +318,14 @@ void int8_wmma_attention_kernel(
 #endif  // INT8_ATTN_WMMA
 
 // ── Public interface ───────────────────────────────────────────────────
+// scale_Q/K/V are device pointers — no cudaMemcpy in the hot path.
+// attn_scale = 1/sqrt(head_dim) is host-computable and scale-independent.
 void int8_attention_forward(
     const int8_t* Q, const int8_t* K, const int8_t* V, int8_t* out,
     const float* scale_Q, const float* scale_K, const float* scale_V,
     int batch, int heads, int seq_len, int head_dim
 ) {
-    float h_sQ, h_sK, h_sV;
-    cudaMemcpy(&h_sQ, scale_Q, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&h_sK, scale_K, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&h_sV, scale_V, sizeof(float), cudaMemcpyDeviceToHost);
-
-    const float attn_scale    = 1.f / sqrtf((float)head_dim);
-    const float inv_out_scale = 1.f / h_sV;
+    const float attn_scale = 1.f / sqrtf((float)head_dim);
 
 #if INT8_ATTN_WMMA
     if (head_dim % ATTN_WMMA_K == 0 && seq_len % ATTN_TILE_KV == 0) {
@@ -329,8 +337,8 @@ void int8_attention_forward(
         cudaFuncSetAttribute(int8_wmma_attention_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         int8_wmma_attention_kernel<<<grid, ATTN_BDIM, smem>>>(
-            Q, K, V, out, h_sQ, h_sK, h_sV,
-            seq_len, head_dim, attn_scale, inv_out_scale);
+            Q, K, V, out, scale_Q, scale_K, scale_V,
+            seq_len, head_dim, attn_scale);
         return;
     }
 #endif
@@ -342,6 +350,6 @@ void int8_attention_forward(
                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     dim3 grid(seq_len, batch * heads);
     int8_fused_attention_kernel<<<grid, SCALAR_BDIM, smem>>>(
-        Q, K, V, out, h_sQ, h_sK, h_sV,
-        seq_len, head_dim, attn_scale, inv_out_scale);
+        Q, K, V, out, scale_Q, scale_K, scale_V,
+        seq_len, head_dim, attn_scale);
 }

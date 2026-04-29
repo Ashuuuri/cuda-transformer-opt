@@ -80,29 +80,43 @@ def main():
     W2_deq = (W2_int8.float() * scale_W2).half()
     mlp_ref = mlp_baseline(x_deq, W1_deq, W2_deq)
 
+    # ── Load INT8 CUDA kernels ───────────────────────────────────────────
+    from torch.utils.cpp_extension import load
+    int8_ext = load(
+        name="int8_ext",
+        sources=[
+            "kernels/int8_attention.cu",
+            "kernels/int8_mlp.cu",
+            "kernels/quant_utils.cu",
+            "kernels/int8_ext.cu",
+        ],
+        extra_cuda_cflags=["-arch=sm_80", "--std=c++17", "-O3"],
+        verbose=False,
+    )
+
     # ── Correctness ─────────────────────────────────────────────────────
     print("\n=== Correctness ===")
-    # TODO: Replace placeholders with your CUDA kernel outputs.
-    #   from torch.utils.cpp_extension import load
-    #   int8_mod = load(name="int8_kernels",
-    #       sources=["kernels/int8_attention.cu", "kernels/int8_mlp.cu", "kernels/quant_utils.cu"],
-    #       verbose=True)
-    #   attn_out = int8_mod.int8_attention_forward(Q_int8, K_int8, V_int8, scale_Q, scale_K, scale_V)
-    #   mlp_out = int8_mod.int8_mlp_forward(x_int8, W1_int8, W2_int8, scale_x, scale_W1, scale_W2)
-    print("[SKIP] INT8 kernels not yet implemented — using dequant+baseline as placeholder")
-    attn_out = attn_ref  # placeholder
-    mlp_out = mlp_ref    # placeholder
+    attn_out_int8 = int8_ext.int8_attention_forward(
+        Q_int8, K_int8, V_int8, float(scale_Q), float(scale_K), float(scale_V))
+    mlp_out_int8 = int8_ext.int8_mlp_forward(
+        x_int8, W1_int8, W2_int8, float(scale_x), float(scale_W1), float(scale_W2))
+
+    # Dequantize INT8 output for comparison against FP16 reference.
+    # Use scale_V as output scale for attention (kernel uses same bound).
+    attn_out = (attn_out_int8.float() * scale_V).half()
+    mlp_out  = (mlp_out_int8.float() * scale_x * scale_W1 * scale_W2).half()
 
     check_correctness(attn_ref, attn_out, label="int8_attention", mode="int8")
-    check_correctness(mlp_ref, mlp_out, label="int8_mlp", mode="int8")
+    check_correctness(mlp_ref,  mlp_out,  label="int8_mlp",       mode="int8")
 
     # ── Benchmark: INT8 Attention ───────────────────────────────────────
     print("\n=== Benchmark: INT8 Attention ===")
 
     fp16_attn_ms = benchmark(attention_baseline, Q, K, V)
 
-    # Your INT8 kernel (placeholder)
-    int8_attn_ms = benchmark(attention_baseline, Q_deq, K_deq, V_deq)  # TODO: replace
+    int8_attn_ms = benchmark(int8_ext.int8_attention_forward,
+                             Q_int8, K_int8, V_int8,
+                             float(scale_Q), float(scale_K), float(scale_V))
 
     attn_flops = compute_attention_flops(batch, heads, seq_len, head_dim)
     attn_tops = attn_flops / (int8_attn_ms * 1e-3) / 1e12
@@ -118,8 +132,9 @@ def main():
     # kernel sees after quantize/dequantize, not the original unquantized input.
     fp16_mlp_ms = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)
 
-    # Your INT8 kernel (placeholder)
-    int8_mlp_ms = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)  # TODO: replace
+    int8_mlp_ms = benchmark(int8_ext.int8_mlp_forward,
+                            x_int8, W1_int8, W2_int8,
+                            float(scale_x), float(scale_W1), float(scale_W2))
 
     # cuBLAS INT8 comparison (torch._int_mm, 2D only)
     x_2d_int8 = x_int8.view(-1, d_model)

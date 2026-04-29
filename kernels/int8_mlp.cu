@@ -193,6 +193,16 @@ __global__ void gemm_int8_wmma_kernel(
     }
 }
 
+// ── File-scope device buffer cache ────────────────────────────────────
+// Kept at file scope so int8_mlp_get_output_scale() can access s_scale_out.
+static half*   s_hidden_fp16  = nullptr;
+static int8_t* s_hidden_int8  = nullptr;
+static half*   s_out_fp16     = nullptr;
+static float*  s_scale_hidden = nullptr;
+static float*  s_scale_out    = nullptr;
+static size_t  s_hidden_cap   = 0;
+static size_t  s_out_cap      = 0;
+
 // ── Public interface ───────────────────────────────────────────────────
 void int8_mlp_forward(
     const int8_t* x, const int8_t* W1, const int8_t* W2, int8_t* out,
@@ -200,16 +210,6 @@ void int8_mlp_forward(
     int batch, int seq_len, int d_model, int d_ff
 ) {
     const int T = batch * seq_len;
-
-    // Device buffers are cached across calls (avoids cudaMalloc overhead
-    // in benchmark loops — same pattern as Sherry's FP16 hidden cache).
-    static half*   s_hidden_fp16  = nullptr;
-    static int8_t* s_hidden_int8  = nullptr;
-    static half*   s_out_fp16     = nullptr;
-    static float*  s_scale_hidden = nullptr;
-    static float*  s_scale_out    = nullptr;
-    static size_t  s_hidden_cap   = 0;
-    static size_t  s_out_cap      = 0;
 
     const size_t hidden_fp16_sz = (size_t)T * d_ff    * sizeof(half);
     const size_t hidden_i8_sz   = (size_t)T * d_ff    * sizeof(int8_t);

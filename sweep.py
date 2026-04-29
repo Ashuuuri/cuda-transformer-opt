@@ -558,8 +558,8 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
 
     # ── Fig 5: HBM bandwidth utilisation ─────────────────────────────
     fig, ax = plt.subplots(figsize=(8, 4))
-    bw_methods = [("Fused kernel", "kernel_bw_util_pct"),
-                  (naive_label,   "naive_bw_util_pct")]
+    bw_methods = [(kernel_label, "kernel_bw_util_pct"),
+                  (naive_label,  "naive_bw_util_pct")]
     for i, (lbl, col) in enumerate(bw_methods):
         vals = [maxseq_rows[dm][col] for dm in D_MODELS]
         offs = [x + (i - 0.5) * 0.35 for x in range(len(D_MODELS))]

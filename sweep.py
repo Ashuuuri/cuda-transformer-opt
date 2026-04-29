@@ -421,23 +421,24 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     naive_label = rows[0].get("naive_label", "Naive PyTorch")
     ref2_label  = rows[0]["ref2_label"]
     kname       = kernel_name.upper()
+    kernel_label = "INT8 kernel" if kernel_name.startswith("int8") else "Fused kernel"
 
     # Map our internal keys to display names for the legend
     method_cols = [
-        ("Fused kernel", "kernel_ms"),
-        (naive_label,    "naive_ms"),
-        (ref2_label,     "ref2_ms"),
+        (kernel_label, "kernel_ms"),
+        (naive_label,  "naive_ms"),
+        (ref2_label,   "ref2_ms"),
     ]
     # Reuse shared colours; map labels to colour slots
     col_map = {
-        "Fused kernel": COLORS["Fused kernel"],
-        naive_label:    COLORS.get(naive_label, COLORS["Naive PyTorch"]),
-        ref2_label:     COLORS["cuBLAS / Flash"],
+        kernel_label: COLORS["Fused kernel"],
+        naive_label:  COLORS.get(naive_label, COLORS["Naive PyTorch"]),
+        ref2_label:   COLORS["cuBLAS / Flash"],
     }
     mrk_map = {
-        "Fused kernel": MARKERS["Fused kernel"],
-        naive_label:    MARKERS.get(naive_label, MARKERS["Naive PyTorch"]),
-        ref2_label:     MARKERS["cuBLAS / Flash"],
+        kernel_label: MARKERS["Fused kernel"],
+        naive_label:  MARKERS.get(naive_label, MARKERS["Naive PyTorch"]),
+        ref2_label:   MARKERS["cuBLAS / Flash"],
     }
 
     def group_by(rows, key):
@@ -542,11 +543,11 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     ax.axhline(1.0, color="gray", linestyle="--",
                linewidth=1.0, label="Baseline (1×)")
     ax.set_xlabel("Sequence length")
-    ax.set_ylabel("Speedup over naive PyTorch (×)")
+    ax.set_ylabel(f"Speedup vs {naive_label} (×)")
     ax.set_xticks(SEQ_LENS)
     ax.xaxis.set_major_formatter(
         ticker.FuncFormatter(lambda x, _: str(int(x))))
-    ax.set_title(f"{kname} Speedup vs Naive  (batch={BATCH}, FP16)")
+    ax.set_title(f"{kname} Speedup vs FP16 WMMA Baseline  (batch={BATCH}, A100)")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()

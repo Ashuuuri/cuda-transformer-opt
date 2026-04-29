@@ -61,11 +61,15 @@ HEAD_DIM  = 64   # d_model // heads for attention
 COLORS = {
     "Fused kernel":      "#2563EB",
     "Naive PyTorch":     "#DC2626",
+    "FP16 WMMA (Sherry)": "#DC2626",
+    "FP16 WMMA (Jonathan)": "#DC2626",
     "cuBLAS / Flash":    "#16A34A",
 }
 MARKERS = {
     "Fused kernel":      "o",
     "Naive PyTorch":     "s",
+    "FP16 WMMA (Sherry)": "s",
+    "FP16 WMMA (Jonathan)": "s",
     "cuBLAS / Flash":    "^",
 }
 
@@ -264,22 +268,25 @@ def bench_int8_attn(ext, batch, seq_len, d_model):
     K_deq = K_i8.float().mul(sK).half()
     V_deq = V_i8.float().mul(sV).half()
 
+    attn_ext = load_attention_ext()
+
     def run_int8():
         ext.int8_attention_forward(Q_i8, K_i8, V_i8, float(sQ), float(sK), float(sV))
 
-    kernel_ms = benchmark(run_int8)
-    naive_ms  = benchmark(attention_baseline, Q_deq, K_deq, V_deq)
-    flash_ms  = benchmark(F.scaled_dot_product_attention, Q_deq, K_deq, V_deq)
+    kernel_ms  = benchmark(run_int8)
+    fp16_wm_ms = benchmark(attn_ext.attention_forward, Q_deq, K_deq, V_deq)
+    flash_ms   = benchmark(F.scaled_dot_product_attention, Q_deq, K_deq, V_deq)
 
     flops     = attention_flops(batch, heads, seq_len, head_dim)
     peak_tops = A100_INT8_TOPS
 
     return _make_row(
         batch, seq_len, d_model,
-        kernel_ms, naive_ms, flash_ms,
+        kernel_ms, fp16_wm_ms, flash_ms,
         flops, peak_tops,
         attn_hbm_fused(batch, heads, seq_len, head_dim),
         attn_hbm_unfused(batch, heads, seq_len, head_dim),
+        naive_label="FP16 WMMA (Jonathan)",
         ref2_label="FlashAttn-2",
     )
 
@@ -302,13 +309,13 @@ def bench_int8(ext, batch, seq_len, d_model):
     W1_deq = W1_i8.float().mul(sW1).half()
     W2_deq = W2_i8.float().mul(sW2).half()
 
+    mlp_ext = load_mlp_ext()
+
     def run_int8():
         ext.int8_mlp_forward(x_i8, W1_i8, W2_i8, sx, sW1, sW2)
 
-    kernel_ms = benchmark(run_int8)
-    # Fair FP16 reference for INT8: use the quantized/dequantized values that
-    # the INT8 path actually represents, not the original unquantized tensors.
-    naive_ms  = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)
+    kernel_ms  = benchmark(run_int8)
+    fp16_wm_ms = benchmark(mlp_ext.mlp_forward, x_deq, W1_deq, W2_deq)
 
     x_2d = x_i8.view(-1, d_model)
     def cublas_int8():
@@ -320,10 +327,11 @@ def bench_int8(ext, batch, seq_len, d_model):
 
     return _make_row(
         batch, seq_len, d_model,
-        kernel_ms, naive_ms, ref2_ms,
+        kernel_ms, fp16_wm_ms, ref2_ms,
         flops, peak_tops,
         mlp_hbm_fused(batch, seq_len, d_model, d_ff),
         mlp_hbm_unfused(batch, seq_len, d_model, d_ff),
+        naive_label="FP16 WMMA (Sherry)",
         ref2_label="cuBLAS INT8",
     )
 
@@ -337,6 +345,7 @@ def _make_row(
     flops, peak_tops,
     hbm_fused, hbm_unfused,
     ref2_label,
+    naive_label="Naive PyTorch",
 ):
     def to_tops(ms):
         return flops / (ms * 1e-3) / 1e12
@@ -356,6 +365,7 @@ def _make_row(
         "kernel_ms":           kernel_ms,
         "naive_ms":            naive_ms,
         "ref2_ms":             ref2_ms,
+        "naive_label":         naive_label,
         "ref2_label":          ref2_label,
         # throughput
         "kernel_tops":         kernel_tops,
@@ -378,7 +388,7 @@ def _make_row(
 # ══════════════════════════════════════════════════════════════════════════
 FIELDNAMES = [
     "batch", "seq_len", "d_model",
-    "kernel_ms", "naive_ms", "ref2_ms", "ref2_label",
+    "kernel_ms", "naive_ms", "ref2_ms", "naive_label", "ref2_label",
     "kernel_tops", "naive_tops", "ref2_tops",
     "kernel_util_pct", "naive_util_pct",
     "kernel_bw_util_pct", "naive_bw_util_pct",
@@ -406,25 +416,26 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         print("[WARN] matplotlib not found — skipping plots.")
         return
 
-    ref2_label = rows[0]["ref2_label"]
-    kname      = kernel_name.upper()
+    naive_label = rows[0].get("naive_label", "Naive PyTorch")
+    ref2_label  = rows[0]["ref2_label"]
+    kname       = kernel_name.upper()
 
     # Map our internal keys to display names for the legend
     method_cols = [
-        ("Fused kernel",   "kernel_ms"),
-        ("Naive PyTorch",  "naive_ms"),
-        (ref2_label,       "ref2_ms"),
+        ("Fused kernel", "kernel_ms"),
+        (naive_label,    "naive_ms"),
+        (ref2_label,     "ref2_ms"),
     ]
-    # Reuse shared colours; map ref2_label to the third slot
+    # Reuse shared colours; map labels to colour slots
     col_map = {
-        "Fused kernel":  COLORS["Fused kernel"],
-        "Naive PyTorch": COLORS["Naive PyTorch"],
-        ref2_label:      COLORS["cuBLAS / Flash"],
+        "Fused kernel": COLORS["Fused kernel"],
+        naive_label:    COLORS.get(naive_label, COLORS["Naive PyTorch"]),
+        ref2_label:     COLORS["cuBLAS / Flash"],
     }
     mrk_map = {
-        "Fused kernel":  MARKERS["Fused kernel"],
-        "Naive PyTorch": MARKERS["Naive PyTorch"],
-        ref2_label:      MARKERS["cuBLAS / Flash"],
+        "Fused kernel": MARKERS["Fused kernel"],
+        naive_label:    MARKERS.get(naive_label, MARKERS["Naive PyTorch"]),
+        ref2_label:     MARKERS["cuBLAS / Flash"],
     }
 
     def group_by(rows, key):

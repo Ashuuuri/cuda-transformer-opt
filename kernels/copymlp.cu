@@ -50,10 +50,7 @@ using namespace nvcuda;
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
-#ifndef MLP_STAGE_K
-#define MLP_STAGE_K 32
-#endif
-#define STAGE_K MLP_STAGE_K
+#define STAGE_K 32
 #define STAGE_K_TILES (STAGE_K / WMMA_K)
 #define BLOCK_ROW_TILES 4
 #define BLOCK_COL_TILES 4

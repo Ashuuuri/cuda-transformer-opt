@@ -80,7 +80,10 @@ def load_mlp_ext():
             os.path.join(kdir, "mlp.cu"),
             os.path.join(kdir, "mlp_ext.cu"),
         ],
-        extra_cuda_cflags=["-O2", "--std=c++17", "-arch=sm_80"],
+        extra_cuda_cflags=[
+            "-O3", "--std=c++17", "-arch=sm_80", "--use_fast_math",
+            "-DMLP_STAGE_K=32",
+        ],
         verbose=False,
     )
 
@@ -215,7 +218,7 @@ def bench_mlp(ext, batch, seq_len, d_model):
 def bench_attention(ext, batch, seq_len, d_model):
     import torch.nn.functional as F
     heads    = HEADS
-    head_dim = HEAD_DIM  # fixed at 64; attention sweeps seq_len, not d_model
+    head_dim = d_model // heads
     device   = "cuda"
     dtype    = torch.float16
     torch.manual_seed(42)
@@ -255,12 +258,17 @@ def bench_int8(ext, batch, seq_len, d_model):
     x_i8,  sx  = quantize_to_int8(x)
     W1_i8, sW1 = quantize_to_int8(W1)
     W2_i8, sW2 = quantize_to_int8(W2)
+    x_deq  = x_i8.float().mul(sx).half()
+    W1_deq = W1_i8.float().mul(sW1).half()
+    W2_deq = W2_i8.float().mul(sW2).half()
 
     def run_int8():
         ext.int8_mlp_forward(x_i8, W1_i8, W2_i8, sx, sW1, sW2)
 
     kernel_ms = benchmark(run_int8)
-    naive_ms  = benchmark(mlp_baseline, x, W1, W2)   # FP16 baseline
+    # Fair FP16 reference for INT8: use the quantized/dequantized values that
+    # the INT8 path actually represents, not the original unquantized tensors.
+    naive_ms  = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)
 
     x_2d = x_i8.view(-1, d_model)
     def cublas_int8():

@@ -66,15 +66,15 @@ def attn_config(d_model):
 # ══════════════════════════════════════════════════════════════════════════
 # Semantic colour scheme — same thing always gets the same colour
 COLORS = {
-    "INT8 WMMA":         "#2563EB",   # blue
-    "FP16 WMMA":         "#E67E22",   # orange
+    "INT8 Fused Kernel":         "#2563EB",   # blue
+    "FP16 Fused Kernel":         "#E67E22",   # orange
     "Naive PyTorch":     "#DC2626",   # red
     "FlashAttn-2":       "#16A34A",   # green
     "cuBLAS GEMMs":      "#8B5CF6",   # purple
 }
 MARKERS = {
-    "INT8 WMMA":         "o",
-    "FP16 WMMA":         "s",
+    "INT8 Fused Kernel":         "o",
+    "FP16 Fused Kernel":         "s",
     "Naive PyTorch":     "D",
     "FlashAttn-2":       "^",
     "cuBLAS GEMMs":      "v",
@@ -238,7 +238,7 @@ def bench_mlp(ext, batch, seq_len, d_model):
         flops, peak_tops,
         mlp_hbm_fused(batch, seq_len, d_model, d_ff),
         mlp_hbm_unfused(batch, seq_len, d_model, d_ff),
-        kernel_label="FP16 WMMA",
+        kernel_label="FP16 Fused Kernel",
         ref2_label="cuBLAS GEMMs",
         ref2_is_fused=False,
     )
@@ -269,7 +269,7 @@ def bench_attention(ext, batch, seq_len, d_model):
         flops, peak_tops,
         attn_hbm_fused(batch, heads, seq_len, head_dim),
         attn_hbm_unfused(batch, heads, seq_len, head_dim),
-        kernel_label="FP16 WMMA",
+        kernel_label="FP16 Fused Kernel",
         ref2_label="FlashAttn-2",
     )
 
@@ -319,10 +319,10 @@ def bench_int8_attn(ext, batch, seq_len, d_model):
         kernel_ms, fp16_wm_ms, flash_ms,
         flops, peak_tops,
         hbm_fused_bytes, hbm_unfused_bytes,
-        kernel_label="INT8 WMMA",
-        naive_label="FP16 WMMA",
+        kernel_label="INT8 Fused Kernel",
+        naive_label="FP16 Fused Kernel",
         ref2_label="FlashAttn-2",
-        naive_is_fused=True,   # FP16 WMMA is fused attention
+        naive_is_fused=True,   # FP16 fused kernel is fused attention
         ref2_is_fused=True,    # FlashAttn-2 is fused
     )
     # Extra baseline: Naive PyTorch (cuBLAS matmul attention) — unfused
@@ -367,7 +367,7 @@ def bench_int8(ext, batch, seq_len, d_model):
         torch.mm(h, W2)
     ref2_ms = benchmark(cublas_fp16)
 
-    # 4th line: Shengjing's FP16 WMMA fused MLP
+    # 4th line: Shengjing's FP16 fused MLP
     fp16_wmma_ms = benchmark(mlp_ext.mlp_forward, x_deq, W1_deq, W2_deq)
 
     flops     = int8_mlp_flops(batch, seq_len, d_model, d_ff)
@@ -379,12 +379,12 @@ def bench_int8(ext, batch, seq_len, d_model):
         flops, peak_tops,
         mlp_hbm_fused(batch, seq_len, d_model, d_ff),
         mlp_hbm_unfused(batch, seq_len, d_model, d_ff),
-        kernel_label="INT8 WMMA",
+        kernel_label="INT8 Fused Kernel",
         ref2_label="cuBLAS GEMMs",
         ref2_is_fused=False,
     )
     row["naive_pytorch_ms"] = fp16_wmma_ms
-    row["naive_pytorch_label"] = "FP16 WMMA"
+    row["naive_pytorch_label"] = "FP16 Fused Kernel"
     return row
 
 
@@ -499,7 +499,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         all_cols.append((np_label, "naive_pytorch_ms"))
 
     # Sort by fixed order so legend is consistent across all charts
-    LEGEND_ORDER = ["INT8 WMMA", "FP16 WMMA", "Naive PyTorch",
+    LEGEND_ORDER = ["INT8 Fused Kernel", "FP16 Fused Kernel", "Naive PyTorch",
                     "FlashAttn-2", "cuBLAS GEMMs"]
     def sort_key(item):
         lbl = item[0]
@@ -630,7 +630,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     ax.set_xticks(SEQ_LENS)
     ax.xaxis.set_major_formatter(
         ticker.FuncFormatter(lambda x, _: str(int(x))))
-    ax.set_title(f"{kname} Speedup vs FP16 WMMA Baseline  (batch={BATCH}, A100)")
+    ax.set_title(f"{kname} Speedup vs FP16 Fused Kernel Baseline  (batch={BATCH}, A100)")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()

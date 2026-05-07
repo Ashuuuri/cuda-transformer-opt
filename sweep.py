@@ -348,31 +348,38 @@ def bench_int8(ext, batch, seq_len, d_model):
 
     mlp_ext = load_mlp_ext()
 
+    # INT8 fused kernel
     def run_int8():
         ext.int8_mlp_forward(x_i8, W1_i8, W2_i8, sx, sW1, sW2)
+    kernel_ms = benchmark(run_int8)
 
-    kernel_ms  = benchmark(run_int8)
-    fp16_wm_ms = benchmark(mlp_ext.mlp_forward, x_deq, W1_deq, W2_deq)
+    # Same baselines as bench_mlp for apples-to-apples comparison
+    naive_ms = benchmark(mlp_baseline, x, W1, W2)
 
-    x_2d = x_i8.view(-1, d_model)
-    def cublas_int8():
-        torch._int_mm(x_2d, W1_i8)
-    ref2_ms = benchmark(cublas_int8)
+    x_2d = x.view(-1, d_model)
+    def cublas_fp16():
+        h = torch.mm(x_2d, W1)
+        torch.mm(h, W2)
+    ref2_ms = benchmark(cublas_fp16)
+
+    # 4th line: Shengjing's FP16 WMMA fused MLP
+    fp16_wmma_ms = benchmark(mlp_ext.mlp_forward, x_deq, W1_deq, W2_deq)
 
     flops     = int8_mlp_flops(batch, seq_len, d_model, d_ff)
     peak_tops = A100_INT8_TOPS
 
-    return _make_row(
+    row = _make_row(
         batch, seq_len, d_model,
-        kernel_ms, fp16_wm_ms, ref2_ms,
+        kernel_ms, naive_ms, ref2_ms,
         flops, peak_tops,
         mlp_hbm_fused(batch, seq_len, d_model, d_ff),
         mlp_hbm_unfused(batch, seq_len, d_model, d_ff),
-        naive_label="FP16 WMMA baseline",
-        ref2_label="cuBLAS INT8",
-        naive_is_fused=True,   # FP16 WMMA is fused MLP
-        ref2_is_fused=False,   # cuBLAS INT8 is unfused
+        ref2_label="cuBLAS GEMMs",
+        ref2_is_fused=False,
     )
+    row["naive_pytorch_ms"] = fp16_wmma_ms
+    row["naive_pytorch_label"] = "FP16 WMMA"
+    return row
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -477,23 +484,25 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         (naive_label,  "naive_ms"),
         (ref2_label,   "ref2_ms"),
     ]
-    # If Naive PyTorch (cuBLAS) data is present, add as 4th line
+    # If 4th-line data is present, add it (label from row or default)
     has_naive_pytorch = "naive_pytorch_ms" in rows[0] and rows[0]["naive_pytorch_ms"] is not None
+    np_label = rows[0].get("naive_pytorch_label", "Naive PyTorch (cuBLAS)") if has_naive_pytorch else None
     if has_naive_pytorch:
-        method_cols.append(("Naive PyTorch (cuBLAS)", "naive_pytorch_ms"))
+        method_cols.append((np_label, "naive_pytorch_ms"))
     # Reuse shared colours; map labels to colour slots
     col_map = {
         kernel_label: COLORS["Fused kernel"],
         naive_label:  COLORS.get(naive_label, COLORS["Naive PyTorch"]),
         ref2_label:   COLORS["cuBLAS / Flash"],
-        "Naive PyTorch (cuBLAS)": COLORS["Naive PyTorch (cuBLAS)"],
     }
     mrk_map = {
         kernel_label: MARKERS["Fused kernel"],
         naive_label:  MARKERS.get(naive_label, MARKERS["Naive PyTorch"]),
         ref2_label:   MARKERS["cuBLAS / Flash"],
-        "Naive PyTorch (cuBLAS)": MARKERS["Naive PyTorch (cuBLAS)"],
     }
+    if has_naive_pytorch:
+        col_map[np_label] = COLORS["Naive PyTorch (cuBLAS)"]
+        mrk_map[np_label] = MARKERS["Naive PyTorch (cuBLAS)"]
 
     def group_by(rows, key):
         d = collections.defaultdict(list)
@@ -619,7 +628,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     if "ref2_bw_util_pct" in rows[0]:
         bw_methods.append((ref2_label, "ref2_bw_util_pct"))
     if has_naive_pytorch and "naive_pytorch_bw_util_pct" in rows[0]:
-        bw_methods.append(("Naive PyTorch (cuBLAS)", "naive_pytorch_bw_util_pct"))
+        bw_methods.append((np_label or "Naive PyTorch (cuBLAS)", "naive_pytorch_bw_util_pct"))
 
     n_bw = len(bw_methods)
     bw_w = min(0.30, 0.8 / n_bw)
@@ -722,8 +731,9 @@ def main():
             elapsed = time.perf_counter() - t0
             extra = ""
             if "naive_pytorch_ms" in row and row["naive_pytorch_ms"] is not None:
-                cublas_ms = row["naive_pytorch_ms"]
-                extra = f"  cuBLAS={cublas_ms:.2f}ms  vs_cuBLAS={cublas_ms/row['kernel_ms']:.2f}×"
+                _4th_ms = row["naive_pytorch_ms"]
+                _4th_tag = row.get("naive_pytorch_label", "cuBLAS")
+                extra = f"  {_4th_tag}={_4th_ms:.2f}ms  vs_{_4th_tag}={_4th_ms/row['kernel_ms']:.2f}×"
             print(f"kernel={row['kernel_ms']:.2f}ms  "
                   f"naive={row['naive_ms']:.2f}ms  "
                   f"speedup={row['speedup_vs_naive']:.2f}×"

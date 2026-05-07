@@ -518,9 +518,6 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
 
     col_map = {lbl: get_color(lbl) for lbl, _ in method_cols}
     mrk_map = {lbl: get_marker(lbl) for lbl, _ in method_cols}
-    if has_naive_pytorch:
-        col_map[np_label] = COLORS["Naive PyTorch (cuBLAS)"]
-        mrk_map[np_label] = MARKERS["Naive PyTorch (cuBLAS)"]
 
     def group_by(rows, key):
         d = collections.defaultdict(list)

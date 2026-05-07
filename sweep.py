@@ -626,7 +626,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     ax.set_xticks(SEQ_LENS)
     ax.xaxis.set_major_formatter(
         ticker.FuncFormatter(lambda x, _: str(int(x))))
-    ax.set_title(f"{kname} Speedup vs FP16 Fused Kernel Baseline  (batch={BATCH}, A100)")
+    ax.set_title(f"{kname} Speedup vs {naive_label}  (batch={BATCH}, A100)")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()

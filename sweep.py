@@ -55,17 +55,10 @@ BATCH     = 8
 HEADS     = 8
 HEAD_DIM  = 64   # d_model // heads for attention
 
-# Set by --sweep-mode flag in main()
-SWEEP_MODE = "vary_headdim"   # "vary_headdim" or "vary_heads"
-
 def attn_config(d_model):
-    """Return (heads, head_dim) based on sweep mode."""
-    if SWEEP_MODE == "vary_heads":
-        head_dim = 64
-        heads = d_model // head_dim
-    else:  # vary_headdim (default)
-        heads = 8
-        head_dim = d_model // heads
+    """Return (heads, head_dim): heads=8 fixed, head_dim varies."""
+    heads = 8
+    head_dim = d_model // heads
     return heads, head_dim
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -486,14 +479,10 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     naive_label = rows[0].get("naive_label", "Naive PyTorch")
     ref2_label  = rows[0]["ref2_label"]
     KNAME_DISPLAY = {
-        "int8_attn":                  "INT8 Attention Kernel",
-        "int8_attn_vary_headdim":     "INT8 Attention (vary head_dim)",
-        "int8_attn_vary_heads":       "INT8 Attention (vary heads)",
-        "int8":                       "INT8 MLP Kernel",
-        "attention":                  "FP16 Attention Kernel",
-        "attention_vary_headdim":     "FP16 Attention (vary head_dim)",
-        "attention_vary_heads":       "FP16 Attention (vary heads)",
-        "mlp":                        "FP16 MLP Kernel",
+        "int8_attn":   "INT8 Attention Kernel",
+        "int8":        "INT8 MLP Kernel",
+        "attention":   "FP16 Attention Kernel",
+        "mlp":         "FP16 MLP Kernel",
     }
     kname = KNAME_DISPLAY.get(kernel_name, kernel_name.upper())
     kernel_label = rows[0].get("kernel_label", "Fused kernel")
@@ -542,31 +531,6 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
 
     by_dm   = group_by(rows, "d_model")
     max_seq = max(SEQ_LENS)
-
-    # ── vary_heads mode: single scaling chart, skip the 5 standard figs ──
-    if kernel_name.endswith("_vary_heads"):
-        heads_list = sorted(set(attn_config(dm)[0] for dm in D_MODELS))
-        by_seq = group_by(rows, "seq_len")
-
-        fig, ax = plt.subplots(figsize=(6, 4))
-        for sq in SEQ_LENS:
-            sub = sorted(by_seq[sq], key=lambda r: r["d_model"])
-            hs = [attn_config(r["d_model"])[0] for r in sub]
-            ax.plot(hs, [r["kernel_ms"] for r in sub],
-                    marker="o", label=f"seq={sq}", linewidth=2, markersize=6)
-        ax.set_xlabel("Number of Heads", fontsize=12)
-        ax.set_ylabel("Latency (ms)", fontsize=12)
-        ax.set_xticks(heads_list)
-        ax.set_title(f"{kname}\n(head_dim=64, batch={BATCH}, A100)",
-                     fontsize=12)
-        ax.legend(fontsize=9)
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        p = os.path.join(figures_dir, f"{kernel_name}_scaling.png")
-        fig.savefig(p, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        print(f"[Plot] {p}")
-        return   # skip the standard 5 figures
 
     # ── Fig 1: Latency vs seq_len (one subplot per d_model) ───────────
     fig, axes = plt.subplots(1, len(D_MODELS),
@@ -756,39 +720,18 @@ def main():
         required=True,
         help="Which kernel to sweep: mlp | attention | int8 | int8_attn",
     )
-    parser.add_argument(
-        "--sweep-mode",
-        choices=["vary_headdim", "vary_heads"],
-        default="vary_headdim",
-        help="Attention sweep mode. "
-             "vary_headdim: heads=8 fixed, head_dim=d_model/8 (kernel analysis). "
-             "vary_heads: head_dim=64 fixed, heads=d_model/64 (realistic scaling). "
-             "Ignored for MLP kernels.",
-    )
     args = parser.parse_args()
-
-    # Set global sweep mode for attention bench functions
-    global SWEEP_MODE
-    SWEEP_MODE = args.sweep_mode
 
     check_cuda()
     cfg = KERNELS[args.kernel]
 
-    # Add mode suffix for attention kernels so both results coexist
-    is_attn = args.kernel in ("attention", "int8_attn")
-    suffix = f"_{args.sweep_mode}" if is_attn else ""
-
     results_dir = os.path.join(ROOT, "results")
     figures_dir = os.path.join(results_dir, "figures")
     os.makedirs(figures_dir, exist_ok=True)
-    csv_path = os.path.join(results_dir, f"{args.kernel}{suffix}_sweep.csv")
+    csv_path = os.path.join(results_dir, f"{args.kernel}_sweep.csv")
 
-    mode_desc = ""
-    if is_attn:
-        if args.sweep_mode == "vary_headdim":
-            mode_desc = "  (heads=8, head_dim=d_model/8)"
-        else:
-            mode_desc = "  (head_dim=64, heads=d_model/64)"
+    is_attn = args.kernel in ("attention", "int8_attn")
+    mode_desc = "  (heads=8, head_dim=d_model/8)" if is_attn else ""
 
     print(f"Kernel  : {args.kernel}  (owner: {cfg['owner']})")
     print(f"Grid    : seq_lens={SEQ_LENS}  d_models={D_MODELS}  batch={BATCH}{mode_desc}")
@@ -821,7 +764,7 @@ def main():
             rows.append(row)
 
     save_csv(rows, csv_path)
-    make_plots(rows, f"{args.kernel}{suffix}", figures_dir, cfg["peak_tops"])
+    make_plots(rows, args.kernel, figures_dir, cfg["peak_tops"])
     print("\nSweep complete.")
 
 

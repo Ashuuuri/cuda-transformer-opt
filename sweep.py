@@ -574,12 +574,8 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     for i, (lbl, col) in enumerate(method_cols):
         vals = [maxseq_rows[dm][col] for dm in D_MODELS]
         offs = [x + (i - (n_methods - 1) / 2) * bw for x in range(len(D_MODELS))]
-        bars = ax.bar(offs, vals, width=bw, label=lbl,
-                      color=col_map[lbl], alpha=0.85)
-        for bar, v in zip(bars, vals):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() * 1.01 + 0.2,
-                    f"{v:.2f}", ha="center", va="bottom", fontsize=7)
+        ax.bar(offs, vals, width=bw, label=lbl,
+               color=col_map[lbl], alpha=0.85)
     ax.set_xticks(list(range(len(D_MODELS))))
     ax.set_xticklabels([dm_label(dm) for dm in D_MODELS])
     ax.set_ylabel("Latency (ms)")
@@ -655,12 +651,8 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     for i, (lbl, col) in enumerate(bw_methods):
         vals = [maxseq_rows[dm][col] for dm in D_MODELS]
         offs = [x + (i - (n_bw - 1) / 2) * bw_w for x in range(len(D_MODELS))]
-        bars = ax.bar(offs, vals, width=bw_w, label=lbl,
-                      color=col_map[lbl], alpha=0.85)
-        for bar, v in zip(bars, vals):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() * 1.01 + 0.3,
-                    f"{v:.1f}%", ha="center", va="bottom", fontsize=7)
+        ax.bar(offs, vals, width=bw_w, label=lbl,
+               color=col_map[lbl], alpha=0.85)
     ax.set_xticks(list(range(len(D_MODELS))))
     ax.set_xticklabels([dm_label(dm) for dm in D_MODELS])
     ax.set_ylabel("HBM Bandwidth Utilisation (%)")

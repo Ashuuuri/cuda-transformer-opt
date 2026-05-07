@@ -224,6 +224,60 @@ Analysis:
 
 ---
 
+## 3e. Sweep: INT8 Attention after Opt #8 (double-buffer K via cp.async)
+
+Commit: `aa74136` — Double-buffer K (cp.async overlaps with compute) + V (regular load+dequant).
+Pipeline: issue cp.async K[nxt] before compute, load V[nxt] after compute completes.
+K global→smem latency hidden behind QK^T + softmax + attn×V computation.
+Baseline: Jonathan's FP16 WMMA attention kernel (`attention_ext`)
+batch=8, heads=8, head_dim = d_model/8
+
+### Results Table
+
+| d_model | seq_len | INT8 (ms) | FP16 WMMA (ms) | Speedup vs FP16 |
+|---------|---------|-----------|----------------|-----------------|
+| 512 | 512 | 0.21 | 0.24 | **1.15x** |
+| 512 | 1024 | 0.74 | 0.82 | **1.11x** |
+| 512 | 2048 | 2.09 | 2.33 | **1.11x** |
+| 512 | 4096 | 7.53 | 8.94 | **1.19x** |
+| 1024 | 512 | 0.34 | 0.39 | **1.16x** |
+| 1024 | 1024 | 1.13 | 1.27 | **1.12x** |
+| 1024 | 2048 | 4.07 | 4.69 | **1.15x** |
+| 1024 | 4096 | 15.56 | 18.09 | **1.16x** |
+| 2048 | 512 | 0.70 | 0.96 | **1.37x** |
+| 2048 | 1024 | 2.22 | 3.10 | **1.40x** |
+| 2048 | 2048 | 8.34 | 11.35 | **1.36x** |
+| 2048 | 4096 | 32.10 | 43.41 | **1.35x** |
+
+### Summary by d_model (head_dim)
+
+| head_dim | Speedup range | vs Opt #6 |
+|----------|--------------|-----------|
+| 64 (d=512) | **1.11–1.19x** | was 1.07–1.24x (similar) |
+| 128 (d=1024) | **1.12–1.16x** | was 1.21–1.24x (slightly lower) |
+| 256 (d=2048) | **1.35–1.40x** | was 1.23–1.35x (**+5-12% improvement**) |
+
+Analysis:
+- head_dim=256 benefits most: K load is 8KB/tile, QK^T WMMA has 16 k-iterations → enough compute to fully hide K load latency
+- head_dim=64/128: K load is small (2-4KB), less latency to hide → marginal benefit
+- Smem increased ~50% for double-buffering but still fits 2 blocks/SM at head_dim=256 (144KB < 164KB)
+
+### Reverted optimizations (no benefit or regression)
+
+- **Opt #7: template launch_bounds** (commit `36cbedb`, reverted `743575a`) — Per-head_dim occupancy tuning (head_dim≤64→4 blocks, ≤128→3, >128→2). No clear improvement; absolute timing differences attributed to Perlmutter node variance.
+- **Opt #8a: INT8 attn×V with V-scale folding** (commit `1c90cc1`, reverted `b8472cb`) — Fold v_scale into softmax weights, quantize to INT8, use INT8 WMMA for attn×V. Regressed at head_dim=256 (1.35x→0.82x). Root cause: TILE_KV=32 makes attn×V latency-bound not compute-bound; quantization overhead (wmax reduction + INT8 quantize + INT32 dequant) exceeds 2x TOPS savings.
+
+### vs Naive PyTorch (cuBLAS) — from sweep plots
+
+Both custom WMMA kernels (INT8 and FP16) lose to Naive PyTorch at d_model≥1024:
+- d_model=512: INT8 **wins** vs PyTorch (~2x faster at seq=4096)
+- d_model=1024: INT8 roughly **ties** with PyTorch
+- d_model=2048: INT8 **loses** to PyTorch (~3x slower at seq=4096)
+
+Root cause: online softmax forces sequential KV tile processing (128 tiles at seq=4096), while cuBLAS parallelizes the entire Q@K^T GEMM across all SMs. Fusion benefit (no intermediate HBM writes) is outweighed by parallelism loss at large sizes.
+
+---
+
 ## 5. Optimization History (Attention)
 
 All vs Jonathan's FP16 WMMA kernel.
@@ -237,12 +291,16 @@ All vs Jonathan's FP16 WMMA kernel.
 | Opt #4: 4 warps + pre-fold scale | 0.80–0.89x | 0.74–0.80x | 0.88–0.92x |
 | Opt #5: INT8 smem bank conflict fix | 0.77–0.93x | 0.90–0.99x | 1.04–1.13x |
 | **Opt #6: vectorized loads + unroll** | **1.07–1.24x** | **1.21–1.24x** | **1.23–1.35x** |
+| Opt #7: template launch_bounds | — | — | — (reverted, no improvement) |
+| Opt #8a: INT8 attn×V + V-scale fold | — | — | 0.82x (reverted, regression) |
+| **Opt #8: double-buffer cp.async** | **1.11–1.19x** | **1.12–1.16x** | **1.35–1.40x** |
 
 Key improvements:
 - Opt #3: head_dim=256 from 0.20x to 0.58x (smem 87KB → 36KB, occupancy 1 → 4 blocks/SM)
 - Opt #4: head_dim=256 from 0.58x to 0.92x (2→4 warps, 2x latency hiding)
 - Opt #5: head_dim=256 from 0.92x to 1.13x (pad INT8 stride to break bank conflicts)
 - Opt #6: all head_dims to **1.07–1.35x** (int4 vectorized loads, half2 dequant, loop unroll)
+- Opt #8: head_dim=256 to **1.35–1.40x** (cp.async K overlaps with compute)
 
 ---
 
@@ -285,4 +343,7 @@ Per-token fixes OPT-6.7B precision: 0.984 → 0.9999.
 6. Smem bank conflicts (Opt #5): padding INT8 rows pushes head_dim=256 past 1x
 7. Vectorized loads (Opt #6): int4 loads + half2 dequant → **ALL configs beat FP16 (1.07–1.35x)**
 8. INT8 advantage grows with d_model for MLP (0.58x → 0.69x) — better arithmetic intensity amortizes overhead
-9. Full optimization journey: 0.15x → **1.35x** at head_dim=256 (**9x improvement** through 6 optimization steps)
+9. Double-buffering (Opt #8): cp.async hides K load latency → head_dim=256 from 1.23–1.35x to **1.35–1.40x**
+10. V-scale folding (Opt #8a) was a dead end: TILE_KV=32 too small for INT8 attn×V to benefit from 2x TOPS
+11. vs Naive PyTorch: fused kernel wins at d_model=512 (fusion saves HBM) but loses at d_model≥1024 (sequential KV tiles < cuBLAS parallelism)
+12. Full optimization journey: 0.15x → **1.40x** at head_dim=256 (**9.3x improvement** through 8 optimization steps)

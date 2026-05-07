@@ -55,6 +55,19 @@ BATCH     = 8
 HEADS     = 8
 HEAD_DIM  = 64   # d_model // heads for attention
 
+# Set by --sweep-mode flag in main()
+SWEEP_MODE = "vary_headdim"   # "vary_headdim" or "vary_heads"
+
+def attn_config(d_model):
+    """Return (heads, head_dim) based on sweep mode."""
+    if SWEEP_MODE == "vary_heads":
+        head_dim = 64
+        heads = d_model // head_dim
+    else:  # vary_headdim (default)
+        heads = 8
+        head_dim = d_model // heads
+    return heads, head_dim
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Shared plot colours/markers  (uniform across all three kernels)
 # ══════════════════════════════════════════════════════════════════════════
@@ -243,8 +256,7 @@ def bench_mlp(ext, batch, seq_len, d_model):
 # ── Attention ─────────────────────────────────────────────────────────────
 def bench_attention(ext, batch, seq_len, d_model):
     import torch.nn.functional as F
-    heads    = HEADS
-    head_dim = d_model // heads
+    heads, head_dim = attn_config(d_model)
     device   = "cuda"
     dtype    = torch.float16
     torch.manual_seed(42)
@@ -273,8 +285,7 @@ def bench_attention(ext, batch, seq_len, d_model):
 # ── INT8 Attention ────────────────────────────────────────────────────────
 def bench_int8_attn(ext, batch, seq_len, d_model):
     import torch.nn.functional as F
-    heads    = HEADS
-    head_dim = d_model // heads
+    heads, head_dim = attn_config(d_model)
     device   = "cuda"
     dtype    = torch.float16
     torch.manual_seed(42)
@@ -470,10 +481,14 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     naive_label = rows[0].get("naive_label", "Naive PyTorch")
     ref2_label  = rows[0]["ref2_label"]
     KNAME_DISPLAY = {
-        "int8_attn": "INT8 Attention Kernel",
-        "int8":      "INT8 MLP Kernel",
-        "attention": "FP16 Attention Kernel",
-        "mlp":       "FP16 MLP Kernel",
+        "int8_attn":                  "INT8 Attention Kernel",
+        "int8_attn_vary_headdim":     "INT8 Attention (vary head_dim)",
+        "int8_attn_vary_heads":       "INT8 Attention (vary heads)",
+        "int8":                       "INT8 MLP Kernel",
+        "attention":                  "FP16 Attention Kernel",
+        "attention_vary_headdim":     "FP16 Attention (vary head_dim)",
+        "attention_vary_heads":       "FP16 Attention (vary heads)",
+        "mlp":                        "FP16 MLP Kernel",
     }
     kname = KNAME_DISPLAY.get(kernel_name, kernel_name.upper())
     kernel_label = "INT8 kernel" if kernel_name.startswith("int8") else "Fused kernel"
@@ -701,18 +716,42 @@ def main():
         required=True,
         help="Which kernel to sweep: mlp | attention | int8 | int8_attn",
     )
+    parser.add_argument(
+        "--sweep-mode",
+        choices=["vary_headdim", "vary_heads"],
+        default="vary_headdim",
+        help="Attention sweep mode. "
+             "vary_headdim: heads=8 fixed, head_dim=d_model/8 (kernel analysis). "
+             "vary_heads: head_dim=64 fixed, heads=d_model/64 (realistic scaling). "
+             "Ignored for MLP kernels.",
+    )
     args = parser.parse_args()
+
+    # Set global sweep mode for attention bench functions
+    global SWEEP_MODE
+    SWEEP_MODE = args.sweep_mode
 
     check_cuda()
     cfg = KERNELS[args.kernel]
 
+    # Add mode suffix for attention kernels so both results coexist
+    is_attn = args.kernel in ("attention", "int8_attn")
+    suffix = f"_{args.sweep_mode}" if is_attn else ""
+
     results_dir = os.path.join(ROOT, "results")
     figures_dir = os.path.join(results_dir, "figures")
     os.makedirs(figures_dir, exist_ok=True)
-    csv_path = os.path.join(results_dir, f"{args.kernel}_sweep.csv")
+    csv_path = os.path.join(results_dir, f"{args.kernel}{suffix}_sweep.csv")
+
+    mode_desc = ""
+    if is_attn:
+        if args.sweep_mode == "vary_headdim":
+            mode_desc = "  (heads=8, head_dim=d_model/8)"
+        else:
+            mode_desc = "  (head_dim=64, heads=d_model/64)"
 
     print(f"Kernel  : {args.kernel}  (owner: {cfg['owner']})")
-    print(f"Grid    : seq_lens={SEQ_LENS}  d_models={D_MODELS}  batch={BATCH}")
+    print(f"Grid    : seq_lens={SEQ_LENS}  d_models={D_MODELS}  batch={BATCH}{mode_desc}")
     print(f"Output  : {csv_path}\n")
 
     print("Compiling CUDA kernel …")
@@ -742,7 +781,7 @@ def main():
             rows.append(row)
 
     save_csv(rows, csv_path)
-    make_plots(rows, args.kernel, figures_dir, cfg["peak_tops"])
+    make_plots(rows, f"{args.kernel}{suffix}", figures_dir, cfg["peak_tops"])
     print("\nSweep complete.")
 
 

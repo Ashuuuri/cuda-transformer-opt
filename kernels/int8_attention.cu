@@ -132,10 +132,10 @@ using namespace nvcuda::wmma;
 #define ATTN_WMMA_M     16
 #define ATTN_WMMA_N     16
 #define ATTN_WMMA_K     16
-#define ATTN_TILE_Q     32
+#define ATTN_TILE_Q     64   // 4 warps × 16 rows each
 #define ATTN_TILE_KV    32
-#define ATTN_BDIM       64
-#define ATTN_SMEM_PAD    8   // matches Jonathan's SMEM_PAD
+#define ATTN_BDIM      128   // 4 warps: better latency hiding + faster KV loading
+#define ATTN_SMEM_PAD    8
 
 // Maximum head_dim supported = ATTN_WMMA_N * ATTN_MAX_SLICES = 16 * 16 = 256.
 #define ATTN_MAX_SLICES 16
@@ -193,12 +193,13 @@ void int8_wmma_attention_kernel(
     const int fcol_lo = (lane % 4) * 2;
 
     // Each thread handles 2 query rows in the fragment.
+    // Pre-fold attn_scale into Q scales: saves 1 FMUL per element in the hot loop.
     const int qi0_global = qi_base + warp_id * ATTN_WMMA_M + frow0;
     const int qi1_global = qi_base + warp_id * ATTN_WMMA_M + frow1;
     const float r_sQ0 = (qi0_global < seq_len)
-        ? __ldg(&d_scale_Q[bh * seq_len + qi0_global]) : 0.f;
+        ? __ldg(&d_scale_Q[bh * seq_len + qi0_global]) * attn_scale : 0.f;
     const float r_sQ1 = (qi1_global < seq_len)
-        ? __ldg(&d_scale_Q[bh * seq_len + qi1_global]) : 0.f;
+        ? __ldg(&d_scale_Q[bh * seq_len + qi1_global]) * attn_scale : 0.f;
 
     float rmax0 = -1e38f, rmax1 = -1e38f;
     float rsum0 = 0.f,    rsum1 = 0.f;
@@ -267,15 +268,15 @@ void int8_wmma_attention_kernel(
             float sK_c8 = s_scale_K[kc_base + fcol_lo + 8];
             float sK_c9 = s_scale_K[kc_base + fcol_lo + 9];
 
-            // scale = sQ[row] * sK[col] * attn_scale
-            sf[g][0] = (float)frag_qk[g].x[0] * r_sQ0 * sK_c0 * attn_scale;
-            sf[g][1] = (float)frag_qk[g].x[1] * r_sQ0 * sK_c1 * attn_scale;
-            sf[g][2] = (float)frag_qk[g].x[2] * r_sQ1 * sK_c0 * attn_scale;
-            sf[g][3] = (float)frag_qk[g].x[3] * r_sQ1 * sK_c1 * attn_scale;
-            sf[g][4] = (float)frag_qk[g].x[4] * r_sQ0 * sK_c8 * attn_scale;
-            sf[g][5] = (float)frag_qk[g].x[5] * r_sQ0 * sK_c9 * attn_scale;
-            sf[g][6] = (float)frag_qk[g].x[6] * r_sQ1 * sK_c8 * attn_scale;
-            sf[g][7] = (float)frag_qk[g].x[7] * r_sQ1 * sK_c9 * attn_scale;
+            // scale = (sQ * attn_scale)[row] * sK[col]  — attn_scale pre-folded into r_sQ
+            sf[g][0] = (float)frag_qk[g].x[0] * r_sQ0 * sK_c0;
+            sf[g][1] = (float)frag_qk[g].x[1] * r_sQ0 * sK_c1;
+            sf[g][2] = (float)frag_qk[g].x[2] * r_sQ1 * sK_c0;
+            sf[g][3] = (float)frag_qk[g].x[3] * r_sQ1 * sK_c1;
+            sf[g][4] = (float)frag_qk[g].x[4] * r_sQ0 * sK_c8;
+            sf[g][5] = (float)frag_qk[g].x[5] * r_sQ0 * sK_c9;
+            sf[g][6] = (float)frag_qk[g].x[6] * r_sQ1 * sK_c8;
+            sf[g][7] = (float)frag_qk[g].x[7] * r_sQ1 * sK_c9;
 
             lmax0 = fmaxf(lmax0, fmaxf(fmaxf(sf[g][0],sf[g][1]), fmaxf(sf[g][4],sf[g][5])));
             lmax1 = fmaxf(lmax1, fmaxf(fmaxf(sf[g][2],sf[g][3]), fmaxf(sf[g][6],sf[g][7])));

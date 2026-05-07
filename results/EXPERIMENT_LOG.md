@@ -2,11 +2,48 @@
 
 Hardware: NVIDIA A100-SXM4-40GB (Perlmutter, NERSC)
 PyTorch: 2.8.0+cu129
-Date: 2026-05-06
+Date: 2026-05-06 – 2026-05-07
+
+## Project Arc
+
+1. **Precision analysis** — quantize real model activations (GPT-2, OPT-6.7B) to INT8, measure cosine similarity. Identified per-tensor failure on V tensors (outlier kurtosis), fixed by per-token quantization.
+2. **INT8 Attention kernel** — 10 optimization steps, from 0.15× to 2.33× vs FP16 WMMA.
+3. **INT8 MLP kernel** — block tile 64×64 → 128×128, from 0.68× to 1.32× vs FP16 WMMA. MLP = two GEMMs; custom WMMA kernels cannot compete with cuBLAS for raw GEMM throughput.
 
 ---
 
-## 1. Correctness: Per-token INT8 Attention (Opt #3)
+## 1. Quantization Precision Analysis (Phase 0)
+
+Script: `analysis/phase0_real_activations.py`
+Models: GPT-2 (124M), OPT-6.7B
+
+### Per-tensor quantization — cosine similarity of attention output
+
+| Model | Layer | Q | K | V | Attn output |
+|-------|-------|---|---|---|-------------|
+| GPT-2 | layer_0 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+| GPT-2 | layer_5 | 1.0000 | 1.0000 | 1.0000 | 0.9999 |
+| GPT-2 | layer_11 | 1.0000 | 1.0000 | 0.9999 | 0.9998 |
+| OPT-6.7B | layer_0 | 1.0000 | 1.0000 | 0.9997 | 0.9998 |
+| OPT-6.7B | layer_4 | 1.0000 | 1.0000 | 0.9984 | 0.9949 |
+| OPT-6.7B | layer_8 | 1.0000 | 1.0000 | 0.9984 | 0.9840 ← FAIL |
+
+Root cause: V tensor outliers (kurtosis=11.8, range utilization=3.5%).
+
+### Per-token quantization — same test
+
+| Model | Worst layer cosine sim | Status |
+|-------|----------------------|--------|
+| GPT-2 | 0.9998 | PASS |
+| OPT-6.7B | 0.9999 | PASS |
+
+Per-token fixes OPT-6.7B precision: 0.984 → 0.9999.
+
+**Decision: use per-token quantization for attention Q/K/V, per-tensor for MLP weights.**
+
+---
+
+## 2. Correctness: Per-token INT8 Attention (Opt #3)
 
 Commit: `beba07a` — per-token symmetric quantization, INT8 WMMA QK^T, FP16 output.
 
@@ -417,36 +454,7 @@ Reverted optimizations (no benefit or regression):
 
 ---
 
-## 6. Phase 0: Quantization Precision Analysis
-
-Script: `analysis/phase0_real_activations.py`
-Models: GPT-2 (124M), OPT-6.7B
-
-### Per-tensor quantization — cosine similarity of attention output
-
-| Model | Layer | Q | K | V | Attn output |
-|-------|-------|---|---|---|-------------|
-| GPT-2 | layer_0 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
-| GPT-2 | layer_5 | 1.0000 | 1.0000 | 1.0000 | 0.9999 |
-| GPT-2 | layer_11 | 1.0000 | 1.0000 | 0.9999 | 0.9998 |
-| OPT-6.7B | layer_0 | 1.0000 | 1.0000 | 0.9997 | 0.9998 |
-| OPT-6.7B | layer_4 | 1.0000 | 1.0000 | 0.9984 | 0.9949 |
-| OPT-6.7B | layer_8 | 1.0000 | 1.0000 | 0.9984 | 0.9840 ← FAIL |
-
-Root cause: V tensor outliers (kurtosis=11.8, range utilization=3.5%).
-
-### Per-token quantization — same test
-
-| Model | Worst layer cosine sim | Status |
-|-------|----------------------|--------|
-| GPT-2 | 0.9998 | PASS |
-| OPT-6.7B | 0.9999 | PASS |
-
-Per-token fixes OPT-6.7B precision: 0.984 → 0.9999.
-
----
-
-## 7. Key Takeaways for Poster
+## 6. Key Takeaways for Poster
 
 1. INT8 has 2x theoretical TOPS but naive substitution makes things slower (overhead > compute savings)
 2. Removing overhead (Opt #1, #2) helps but large head_dim still bottlenecked by smem/occupancy
@@ -468,7 +476,7 @@ Per-token fixes OPT-6.7B precision: 0.984 → 0.9999.
 
 ---
 
-## 8. FP16 Attention Baseline Tuning (for fair comparison)
+## 7. FP16 Attention Baseline Tuning (for fair comparison)
 
 Commit: `825eb88` — Simplified Jonathan's FP16 WMMA attention kernel for fair INT8 vs FP16 comparison.
 Changes: TILE_Q 32→64, BDIM 64→128 (4 warps), fixed TILE_KV=32. No template dispatch.
@@ -479,7 +487,7 @@ This is the FP16 baseline used in all INT8 attention speedup numbers above.
 
 ---
 
-## 9. INT8 MLP: Block Tile 64×64 → 128×128
+## 8. INT8 MLP: Block Tile 64×64 → 128×128
 
 Commits: `fdf56fd` (128×128 upgrade), `26879b8` (smem union fix)
 
@@ -534,7 +542,7 @@ This makes the INT8 MLP chart directly comparable to Shengjing's FP16 MLP chart.
 
 ---
 
-## 10. MLP Optimization History
+## 9. MLP Optimization History
 
 | Version | d_model=512 | d_model=1024 | d_model=2048 | Notes |
 |---------|------------|-------------|-------------|-------|

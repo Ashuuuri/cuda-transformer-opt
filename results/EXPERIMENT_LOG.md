@@ -359,20 +359,20 @@ The speedup numbers above are vs Jonathan's FP16 WMMA kernel, NOT cuBLAS. The tr
 
 | d_model | seq_len | INT8 (ms) | cuBLAS naive (ms) | INT8 vs cuBLAS |
 |---------|---------|-----------|-------------------|----------------|
-| 512 | 512 | 0.12 | 0.25 | **2.11x** ✓ |
-| 512 | 1024 | 0.40 | 0.80 | **2.01x** ✓ |
-| 512 | 2048 | 1.21 | 2.85 | **2.36x** ✓ |
-| 512 | 4096 | 4.00 | 12.75 | **3.19x** ✓ |
-| 1024 | 512 | 0.21 | 0.25 | **1.17x** ✓ |
-| 1024 | 1024 | 0.62 | 0.81 | **1.30x** ✓ |
-| 1024 | 2048 | 2.24 | 3.06 | **1.37x** ✓ |
-| 1024 | 4096 | 8.17 | 13.47 | **1.65x** ✓ |
+| 512 | 512 | 0.12 | 0.25 | **2.06x** ✓ |
+| 512 | 1024 | 0.40 | 0.78 | **1.96x** ✓ |
+| 512 | 2048 | 1.08 | 2.85 | **2.64x** ✓ |
+| 512 | 4096 | 4.00 | 12.74 | **3.19x** ✓ |
+| 1024 | 512 | 0.21 | 0.24 | **1.18x** ✓ |
+| 1024 | 1024 | 0.62 | 0.81 | **1.31x** ✓ |
+| 1024 | 2048 | 2.23 | 3.08 | **1.38x** ✓ |
+| 1024 | 4096 | 8.17 | 13.52 | **1.66x** ✓ |
 | 2048 | 512 | 0.45 | 0.27 | 0.61x ✗ |
 | 2048 | 1024 | 1.36 | 0.92 | 0.68x ✗ |
-| 2048 | 2048 | 4.99 | 3.48 | 0.70x ✗ |
-| 2048 | 4096 | 18.72 | 15.34 | 0.82x ✗ |
+| 2048 | 2048 | 4.99 | 3.50 | 0.70x ✗ |
+| 2048 | 4096 | 18.72 | 15.49 | 0.83x ✗ |
 
-cuBLAS numbers from `results/attention_sweep.csv` (same hardware, different run date).
+INT8 times from Opt #10, cuBLAS from same-run sweep (2026-05-07). d_model=2048 INT8 was unchanged between Opt #10 and the Opt #11 sweep (TILE_KV=128 only affected d_model=2048 and was reverted).
 
 **d_model=512/1024: INT8 crushes cuBLAS** (1.17–3.19x). Fused kernel avoids S×S HBM write.
 **d_model=2048: cuBLAS wins** (1.22–1.65x). cuBLAS can fully parallelize large GEMMs at head_dim=256, while our kernel processes KV tiles sequentially. Gap narrows with seq_len (S×S HBM cost grows quadratically).
@@ -397,8 +397,9 @@ All vs Jonathan's FP16 WMMA kernel.
 | **Opt #8: double-buffer cp.async** | **1.11–1.19x** | **1.12–1.16x** | **1.35–1.40x** |
 | **Opt #9: TILE_KV=64 single-buf** | **1.71–1.91x** | **1.85–1.98x** | **2.11–2.33x** |
 | **Opt #10: template TILE_KV=128** | **1.94–2.25x** | **1.92–2.22x** | **2.10–2.32x** |
+| Opt #11: TILE_KV=128 at 1 blk/SM | — | — | 1.80–1.95x (reverted, regression) |
 
-All measured vs Jonathan's FP16 WMMA kernel. vs cuBLAS naive attention: d_model=512 up to 3.19x ✓, d_model=1024 up to 1.65x ✓, d_model=2048 loses 0.61–0.82x ✗.
+All measured vs Jonathan's FP16 WMMA kernel. vs cuBLAS naive attention (same-run numbers from Opt #11 sweep): d_model=512 up to 3.19x ✓, d_model=1024 up to 1.66x ✓, d_model=2048 loses 0.53–0.70x ✗.
 
 Key improvements:
 - Opt #3: head_dim=256 from 0.20x to 0.58x (smem 87KB → 36KB, occupancy 1 → 4 blocks/SM)
@@ -406,8 +407,13 @@ Key improvements:
 - Opt #5: head_dim=256 from 0.92x to 1.13x (pad INT8 stride to break bank conflicts)
 - Opt #6: all head_dims to **1.07–1.35x** (int4 vectorized loads, half2 dequant, loop unroll)
 - Opt #8: head_dim=256 to **1.35–1.40x** (cp.async K overlaps with compute)
-- Opt #9: **ALL configs 1.71–2.33x vs Naive PyTorch** (TILE_KV=64, 2x compute per tile)
+- Opt #9: **ALL configs 1.71–2.33x vs FP16 WMMA** (TILE_KV=64, 2x compute per tile)
 - Opt #10: head_dim=64/128 to **1.92–2.25x** (TILE_KV=128 template, all 12 configs ≥1.92x)
+
+Reverted optimizations (no benefit or regression):
+- Opt #7: template launch_bounds — no clear improvement
+- Opt #8a: INT8 attn×V + V-scale folding — TILE_KV=32 too small, 1.35x→0.82x
+- **Opt #11: TILE_KV=128 at 1 block/SM for head_dim=256** — register spilling (276 regs > 255 limit) + halved occupancy caused 19–27% regression. TILE_KV=128 only viable when smem ≤ 82KB (2 blocks/SM).
 
 ---
 

@@ -128,9 +128,20 @@ __global__ void gemm_int8_wmma_kernel(
     const float* __restrict__ d_scale_B
 ) {
     const float scale = __ldg(d_scale_A) * __ldg(d_scale_B);
-    __shared__ __align__(16) int8_t  sA[2][BLOCK_M * A_SMEM_STRIDE];
-    __shared__ __align__(16) int8_t  sB[2][STAGE_K * B_SMEM_STRIDE];
-    __shared__               int32_t c_smem[WARPS_PER_BLOCK * WARP_COL_TILES * WMMA_M * WMMA_N];
+
+    // sA/sB (K-loop) and c_smem (epilogue) are temporally disjoint — overlap them.
+    // K-loop: 2×(128×48) + 2×(32×144) = 21504 B
+    // Epilogue: 8×4×256×4              = 32768 B
+    // Overlapped: max(21504, 32768)    = 32768 B  < 48KB static limit
+    constexpr int SMEM_AB   = 2 * BLOCK_M * A_SMEM_STRIDE + 2 * STAGE_K * B_SMEM_STRIDE;
+    constexpr int SMEM_EPIL = WARPS_PER_BLOCK * WARP_COL_TILES * WMMA_M * WMMA_N * (int)sizeof(int32_t);
+    constexpr int SMEM_SIZE = SMEM_AB > SMEM_EPIL ? SMEM_AB : SMEM_EPIL;
+    __shared__ __align__(16) char _smem[SMEM_SIZE];
+
+    int8_t* sA[2] = {(int8_t*)_smem,
+                      (int8_t*)_smem + BLOCK_M * A_SMEM_STRIDE};
+    int8_t* sB[2] = {(int8_t*)_smem + 2 * BLOCK_M * A_SMEM_STRIDE,
+                      (int8_t*)_smem + 2 * BLOCK_M * A_SMEM_STRIDE + STAGE_K * B_SMEM_STRIDE};
 
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
@@ -194,7 +205,8 @@ __global__ void gemm_int8_wmma_kernel(
     }
 
     // Epilogue: INT32 → float → ×scale → [GELU] → FP16
-    // Process one row tile at a time — reuses c_smem across iterations
+    // sA/sB no longer needed — repurpose _smem as c_smem
+    int32_t* c_smem = reinterpret_cast<int32_t*>(_smem);
     int32_t* c_base = c_smem + warp_id * WARP_COL_TILES * WMMA_M * WMMA_N;
 
     #pragma unroll
@@ -256,9 +268,17 @@ __global__ void gemm_int8_wmma_i8_kernel(
 ) {
     const float scale     = __ldg(d_scale_A) * __ldg(d_scale_B);
     const float inv_scale = __ldg(d_inv_scale_out);
-    __shared__ __align__(16) int8_t  sA[2][BLOCK_M * A_SMEM_STRIDE];
-    __shared__ __align__(16) int8_t  sB[2][STAGE_K * B_SMEM_STRIDE];
-    __shared__               int32_t c_smem[WARPS_PER_BLOCK * WARP_COL_TILES * WMMA_M * WMMA_N];
+
+    // sA/sB (K-loop) and c_smem (epilogue) are temporally disjoint — overlap them.
+    constexpr int SMEM_AB   = 2 * BLOCK_M * A_SMEM_STRIDE + 2 * STAGE_K * B_SMEM_STRIDE;
+    constexpr int SMEM_EPIL = WARPS_PER_BLOCK * WARP_COL_TILES * WMMA_M * WMMA_N * (int)sizeof(int32_t);
+    constexpr int SMEM_SIZE = SMEM_AB > SMEM_EPIL ? SMEM_AB : SMEM_EPIL;
+    __shared__ __align__(16) char _smem[SMEM_SIZE];
+
+    int8_t* sA[2] = {(int8_t*)_smem,
+                      (int8_t*)_smem + BLOCK_M * A_SMEM_STRIDE};
+    int8_t* sB[2] = {(int8_t*)_smem + 2 * BLOCK_M * A_SMEM_STRIDE,
+                      (int8_t*)_smem + 2 * BLOCK_M * A_SMEM_STRIDE + STAGE_K * B_SMEM_STRIDE};
 
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
@@ -317,6 +337,8 @@ __global__ void gemm_int8_wmma_i8_kernel(
     }
 
     // Epilogue: INT32 → float → ×scale → [GELU] → INT8
+    // sA/sB no longer needed — repurpose _smem as c_smem
+    int32_t* c_smem = reinterpret_cast<int32_t*>(_smem);
     int32_t* c_base = c_smem + warp_id * WARP_COL_TILES * WMMA_M * WMMA_N;
 
     #pragma unroll

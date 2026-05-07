@@ -136,6 +136,7 @@ using namespace nvcuda::wmma;
 #define ATTN_TILE_KV    32
 #define ATTN_BDIM      128   // 4 warps: better latency hiding + faster KV loading
 #define ATTN_SMEM_PAD    8
+#define ATTN_I8_PAD     16  // break INT8 smem bank conflicts (stride must not be multiple of 128 bytes)
 
 // Maximum head_dim supported = ATTN_WMMA_N * ATTN_MAX_SLICES = 16 * 16 = 256.
 #define ATTN_MAX_SLICES 16
@@ -159,8 +160,10 @@ void int8_wmma_attention_kernel(
     const int lane    = tid % 32;
 
     extern __shared__ char smem_raw[];
-    // INT8 row stride: head_dim bytes (always multiple of 16 for WMMA).
-    const int ks_i8 = head_dim;
+    // INT8 row stride: pad to break bank conflicts.
+    // Without padding, head_dim=256 → stride 256 bytes → 256%128=0 → all rows hit same banks.
+    // With +16 bytes, stride=272 → 272%128=16 → rows cycle through different bank sets.
+    const int ks_i8 = head_dim + ATTN_I8_PAD;
     // FP16 strides (in half elements).
     const int vs = head_dim + ATTN_SMEM_PAD;      // V row stride
     const int ss = ATTN_TILE_KV + ATTN_SMEM_PAD;  // scores row stride
@@ -377,9 +380,11 @@ void int8_attention_forward(
     if (head_dim % ATTN_WMMA_K == 0 && seq_len % ATTN_TILE_KV == 0) {
         const int BH = batch * heads;
         dim3 grid((seq_len + ATTN_TILE_Q - 1) / ATTN_TILE_Q, BH);
-        // Smem: Q(INT8) + K(INT8) + V(FP16) + scores(FP16) + K_scales(float)
+        // Smem: Q(INT8 padded) + K(INT8 padded) + V(FP16) + scores(FP16) + K_scales(float)
+        const int ks_i8_host = head_dim + ATTN_I8_PAD;
         const size_t smem =
-            (size_t)(ATTN_TILE_Q + ATTN_TILE_KV) * head_dim * sizeof(int8_t) +
+            (size_t) ATTN_TILE_Q  * ks_i8_host * sizeof(int8_t) +
+            (size_t) ATTN_TILE_KV * ks_i8_host * sizeof(int8_t) +
             (size_t) ATTN_TILE_KV * (head_dim + ATTN_SMEM_PAD) * sizeof(half) +
             (size_t) ATTN_TILE_Q  * (ATTN_TILE_KV + ATTN_SMEM_PAD) * sizeof(half) +
             (size_t) ATTN_TILE_KV * sizeof(float);  // K_scales only

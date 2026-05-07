@@ -66,7 +66,7 @@ def attn_config(d_model):
 COLORS = {
     "INT8 Fused Kernel":         "#2563EB",   # blue
     "FP16 Fused Kernel":         "#E67E22",   # orange
-    "Naive PyTorch":     "#DC2626",   # red
+    "Naive PyTorch":     "#6B7280",   # gray
     "FlashAttn-2":       "#16A34A",   # green
     "cuBLAS GEMMs":      "#8B5CF6",   # purple
 }

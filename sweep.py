@@ -526,6 +526,14 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     col_map = {lbl: get_color(lbl) for lbl, _ in method_cols}
     mrk_map = {lbl: get_marker(lbl) for lbl, _ in method_cols}
 
+    # x-axis label helper: show heads×head_dim so reader knows what varies
+    def dm_label(dm):
+        h, hd = attn_config(dm)
+        return f"d={dm}\n{h}h×{hd}"
+    def dm_short(dm):
+        h, hd = attn_config(dm)
+        return f"d={dm} ({h}h×{hd})"
+
     def group_by(rows, key):
         d = collections.defaultdict(list)
         for r in rows:
@@ -584,7 +592,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
                     bar.get_height() * 1.01 + 0.2,
                     f"{v:.2f}", ha="center", va="bottom", fontsize=7)
     ax.set_xticks(list(range(len(D_MODELS))))
-    ax.set_xticklabels([f"d_model={dm}\nd_ff={dm*4}" for dm in D_MODELS])
+    ax.set_xticklabels([dm_label(dm) for dm in D_MODELS])
     ax.set_ylabel("Latency (ms)")
     ax.set_title(f"{kname} Latency by Hidden Size  "
                  f"(seq_len={max_seq}, batch={BATCH}, FP16, A100)")
@@ -602,7 +610,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         sub = sorted(by_dm[dm], key=lambda r: r["seq_len"])
         ax.plot([r["seq_len"] for r in sub],
                 [r["kernel_tops"] for r in sub],
-                marker="o", label=f"d_model={dm}", linewidth=2, markersize=6)
+                marker="o", label=dm_short(dm), linewidth=2, markersize=6)
     ax.axhline(peak_tops, color="gray", linestyle="--", linewidth=1.2,
                label=f"A100 peak ({peak_tops:.0f} TOPS)")
     ax.set_xlabel("Sequence length")
@@ -625,7 +633,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         sub = sorted(by_dm[dm], key=lambda r: r["seq_len"])
         ax.plot([r["seq_len"] for r in sub],
                 [r["speedup_vs_naive"] for r in sub],
-                marker="o", label=f"d_model={dm}", linewidth=2, markersize=6)
+                marker="o", label=dm_short(dm), linewidth=2, markersize=6)
     ax.axhline(1.0, color="gray", linestyle="--",
                linewidth=1.0, label="Baseline (1×)")
     ax.set_xlabel("Sequence length")
@@ -665,7 +673,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
                     bar.get_height() * 1.01 + 0.3,
                     f"{v:.1f}%", ha="center", va="bottom", fontsize=7)
     ax.set_xticks(list(range(len(D_MODELS))))
-    ax.set_xticklabels([f"d_model={dm}" for dm in D_MODELS])
+    ax.set_xticklabels([dm_label(dm) for dm in D_MODELS])
     ax.set_ylabel("HBM Bandwidth Utilisation (%)")
     ax.set_title(f"{kname} HBM Bandwidth Utilisation  "
                  f"(seq_len={max_seq}, batch={BATCH}, A100 peak=2TB/s)")

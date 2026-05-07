@@ -236,6 +236,7 @@ def bench_mlp(ext, batch, seq_len, d_model):
         mlp_hbm_fused(batch, seq_len, d_model, d_ff),
         mlp_hbm_unfused(batch, seq_len, d_model, d_ff),
         ref2_label="cuBLAS GEMMs",
+        ref2_is_fused=False,
     )
 
 
@@ -307,17 +308,23 @@ def bench_int8_attn(ext, batch, seq_len, d_model):
     flops     = attention_flops(batch, heads, seq_len, head_dim)
     peak_tops = A100_INT8_TOPS
 
+    hbm_fused_bytes   = attn_hbm_fused(batch, heads, seq_len, head_dim)
+    hbm_unfused_bytes = attn_hbm_unfused(batch, heads, seq_len, head_dim)
+
     row = _make_row(
         batch, seq_len, d_model,
         kernel_ms, fp16_wm_ms, flash_ms,
         flops, peak_tops,
-        attn_hbm_fused(batch, heads, seq_len, head_dim),
-        attn_hbm_unfused(batch, heads, seq_len, head_dim),
+        hbm_fused_bytes, hbm_unfused_bytes,
         naive_label="FP16 WMMA baseline",
         ref2_label="FlashAttn-2",
+        naive_is_fused=True,   # FP16 WMMA is fused attention
+        ref2_is_fused=True,    # FlashAttn-2 is fused
     )
-    # Extra baseline: Naive PyTorch (cuBLAS matmul attention)
+    # Extra baseline: Naive PyTorch (cuBLAS matmul attention) — unfused
     row["naive_pytorch_ms"] = naive_ms
+    achieved = hbm_unfused_bytes / (naive_ms * 1e-3) / 1e12
+    row["naive_pytorch_bw_util_pct"] = achieved / A100_HBM_BW_TBps * 100
     return row
 
 
@@ -363,6 +370,8 @@ def bench_int8(ext, batch, seq_len, d_model):
         mlp_hbm_unfused(batch, seq_len, d_model, d_ff),
         naive_label="FP16 WMMA baseline",
         ref2_label="cuBLAS INT8",
+        naive_is_fused=True,   # FP16 WMMA is fused MLP
+        ref2_is_fused=False,   # cuBLAS INT8 is unfused
     )
 
 
@@ -376,6 +385,8 @@ def _make_row(
     hbm_fused, hbm_unfused,
     ref2_label,
     naive_label="Naive PyTorch",
+    naive_is_fused=False,
+    ref2_is_fused=True,
 ):
     def to_tops(ms):
         return flops / (ms * 1e-3) / 1e12
@@ -406,7 +417,8 @@ def _make_row(
         "naive_util_pct":      naive_tops  / peak_tops * 100,
         # HBM bandwidth utilisation (analytical)
         "kernel_bw_util_pct":  bw_util(kernel_ms, hbm_fused),
-        "naive_bw_util_pct":   bw_util(naive_ms,  hbm_unfused),
+        "naive_bw_util_pct":   bw_util(naive_ms, hbm_fused if naive_is_fused else hbm_unfused),
+        "ref2_bw_util_pct":    bw_util(ref2_ms, hbm_fused if ref2_is_fused else hbm_unfused),
         # speedups
         "speedup_vs_naive":    naive_ms  / kernel_ms,
         "speedup_vs_ref2":     ref2_ms   / kernel_ms,
@@ -422,7 +434,8 @@ FIELDNAMES = [
     "naive_pytorch_ms",
     "kernel_tops", "naive_tops", "ref2_tops",
     "kernel_util_pct", "naive_util_pct",
-    "kernel_bw_util_pct", "naive_bw_util_pct",
+    "kernel_bw_util_pct", "naive_bw_util_pct", "ref2_bw_util_pct",
+    "naive_pytorch_bw_util_pct",
     "speedup_vs_naive", "speedup_vs_ref2",
 ]
 
@@ -527,17 +540,18 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
                  if r["d_model"] == dm and r["seq_len"] == max_seq)
         for dm in D_MODELS
     }
-    fig, ax = plt.subplots(figsize=(8, 4))
-    bw = 0.25
+    n_methods = len(method_cols)
+    fig, ax = plt.subplots(figsize=(max(8, 3 * len(D_MODELS) + 2), 4.5))
+    bw = min(0.25, 0.8 / n_methods)
     for i, (lbl, col) in enumerate(method_cols):
         vals = [maxseq_rows[dm][col] for dm in D_MODELS]
-        offs = [x + (i - 1) * bw for x in range(len(D_MODELS))]
+        offs = [x + (i - (n_methods - 1) / 2) * bw for x in range(len(D_MODELS))]
         bars = ax.bar(offs, vals, width=bw, label=lbl,
                       color=col_map[lbl], alpha=0.85)
         for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.02,
-                    f"{v:.2f}", ha="center", va="bottom", fontsize=8)
+                    bar.get_height() * 1.01 + 0.2,
+                    f"{v:.2f}", ha="center", va="bottom", fontsize=7)
     ax.set_xticks(list(range(len(D_MODELS))))
     ax.set_xticklabels([f"d_model={dm}\nd_ff={dm*4}" for dm in D_MODELS])
     ax.set_ylabel("Latency (ms)")
@@ -598,18 +612,27 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     print(f"[Plot] {p}")
 
     # ── Fig 5: HBM bandwidth utilisation ─────────────────────────────
-    fig, ax = plt.subplots(figsize=(8, 4))
-    bw_methods = [(kernel_label, "kernel_bw_util_pct"),
-                  (naive_label,  "naive_bw_util_pct")]
+    bw_methods = [
+        (kernel_label, "kernel_bw_util_pct"),
+        (naive_label,  "naive_bw_util_pct"),
+    ]
+    if "ref2_bw_util_pct" in rows[0]:
+        bw_methods.append((ref2_label, "ref2_bw_util_pct"))
+    if has_naive_pytorch and "naive_pytorch_bw_util_pct" in rows[0]:
+        bw_methods.append(("Naive PyTorch (cuBLAS)", "naive_pytorch_bw_util_pct"))
+
+    n_bw = len(bw_methods)
+    bw_w = min(0.30, 0.8 / n_bw)
+    fig, ax = plt.subplots(figsize=(max(8, 3 * len(D_MODELS) + 2), 4.5))
     for i, (lbl, col) in enumerate(bw_methods):
         vals = [maxseq_rows[dm][col] for dm in D_MODELS]
-        offs = [x + (i - 0.5) * 0.35 for x in range(len(D_MODELS))]
-        bars = ax.bar(offs, vals, width=0.32, label=lbl,
+        offs = [x + (i - (n_bw - 1) / 2) * bw_w for x in range(len(D_MODELS))]
+        bars = ax.bar(offs, vals, width=bw_w, label=lbl,
                       color=col_map[lbl], alpha=0.85)
         for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.3,
-                    f"{v:.1f}%", ha="center", va="bottom", fontsize=8)
+                    bar.get_height() * 1.01 + 0.3,
+                    f"{v:.1f}%", ha="center", va="bottom", fontsize=7)
     ax.set_xticks(list(range(len(D_MODELS))))
     ax.set_xticklabels([f"d_model={dm}" for dm in D_MODELS])
     ax.set_ylabel("HBM Bandwidth Utilisation (%)")

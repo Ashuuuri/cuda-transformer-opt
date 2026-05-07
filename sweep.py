@@ -71,23 +71,20 @@ def attn_config(d_model):
 # ══════════════════════════════════════════════════════════════════════════
 #  Shared plot colours/markers  (uniform across all three kernels)
 # ══════════════════════════════════════════════════════════════════════════
+# Semantic colour scheme — same thing always gets the same colour
 COLORS = {
-    "Fused kernel":      "#2563EB",
-    "Naive PyTorch":     "#DC2626",
-    "FP16 WMMA (Sherry)": "#DC2626",
-    "FP16 WMMA (Jonathan)": "#DC2626",
-    "FP16 WMMA baseline": "#DC2626",
-    "cuBLAS / Flash":    "#16A34A",
-    "Naive PyTorch (cuBLAS)": "#F59E0B",
+    "INT8 WMMA":         "#2563EB",   # blue
+    "FP16 WMMA":         "#E67E22",   # orange
+    "Naive PyTorch":     "#DC2626",   # red
+    "FlashAttn-2":       "#16A34A",   # green
+    "cuBLAS GEMMs":      "#8B5CF6",   # purple
 }
 MARKERS = {
-    "Fused kernel":      "o",
-    "Naive PyTorch":     "s",
-    "FP16 WMMA (Sherry)": "s",
-    "FP16 WMMA (Jonathan)": "s",
-    "FP16 WMMA baseline": "s",
-    "cuBLAS / Flash":    "^",
-    "Naive PyTorch (cuBLAS)": "D",
+    "INT8 WMMA":         "o",
+    "FP16 WMMA":         "s",
+    "Naive PyTorch":     "D",
+    "FlashAttn-2":       "^",
+    "cuBLAS GEMMs":      "v",
 }
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -248,6 +245,7 @@ def bench_mlp(ext, batch, seq_len, d_model):
         flops, peak_tops,
         mlp_hbm_fused(batch, seq_len, d_model, d_ff),
         mlp_hbm_unfused(batch, seq_len, d_model, d_ff),
+        kernel_label="FP16 WMMA",
         ref2_label="cuBLAS GEMMs",
         ref2_is_fused=False,
     )
@@ -278,6 +276,7 @@ def bench_attention(ext, batch, seq_len, d_model):
         flops, peak_tops,
         attn_hbm_fused(batch, heads, seq_len, head_dim),
         attn_hbm_unfused(batch, heads, seq_len, head_dim),
+        kernel_label="FP16 WMMA",
         ref2_label="FlashAttn-2",
     )
 
@@ -327,13 +326,15 @@ def bench_int8_attn(ext, batch, seq_len, d_model):
         kernel_ms, fp16_wm_ms, flash_ms,
         flops, peak_tops,
         hbm_fused_bytes, hbm_unfused_bytes,
-        naive_label="FP16 WMMA baseline",
+        kernel_label="INT8 WMMA",
+        naive_label="FP16 WMMA",
         ref2_label="FlashAttn-2",
         naive_is_fused=True,   # FP16 WMMA is fused attention
         ref2_is_fused=True,    # FlashAttn-2 is fused
     )
     # Extra baseline: Naive PyTorch (cuBLAS matmul attention) — unfused
     row["naive_pytorch_ms"] = naive_ms
+    row["naive_pytorch_label"] = "Naive PyTorch"
     achieved = hbm_unfused_bytes / (naive_ms * 1e-3) / 1e12
     row["naive_pytorch_bw_util_pct"] = achieved / A100_HBM_BW_TBps * 100
     return row
@@ -385,6 +386,7 @@ def bench_int8(ext, batch, seq_len, d_model):
         flops, peak_tops,
         mlp_hbm_fused(batch, seq_len, d_model, d_ff),
         mlp_hbm_unfused(batch, seq_len, d_model, d_ff),
+        kernel_label="INT8 WMMA",
         ref2_label="cuBLAS GEMMs",
         ref2_is_fused=False,
     )
@@ -402,6 +404,7 @@ def _make_row(
     flops, peak_tops,
     hbm_fused, hbm_unfused,
     ref2_label,
+    kernel_label="Fused kernel",
     naive_label="Naive PyTorch",
     naive_is_fused=False,
     ref2_is_fused=True,
@@ -424,6 +427,7 @@ def _make_row(
         "kernel_ms":           kernel_ms,
         "naive_ms":            naive_ms,
         "ref2_ms":             ref2_ms,
+        "kernel_label":        kernel_label,
         "naive_label":         naive_label,
         "ref2_label":          ref2_label,
         # throughput
@@ -448,8 +452,9 @@ def _make_row(
 # ══════════════════════════════════════════════════════════════════════════
 FIELDNAMES = [
     "batch", "seq_len", "d_model",
-    "kernel_ms", "naive_ms", "ref2_ms", "naive_label", "ref2_label",
-    "naive_pytorch_ms",
+    "kernel_ms", "naive_ms", "ref2_ms",
+    "kernel_label", "naive_label", "ref2_label",
+    "naive_pytorch_ms", "naive_pytorch_label",
     "kernel_tops", "naive_tops", "ref2_tops",
     "kernel_util_pct", "naive_util_pct",
     "kernel_bw_util_pct", "naive_bw_util_pct", "ref2_bw_util_pct",
@@ -491,7 +496,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         "mlp":                        "FP16 MLP Kernel",
     }
     kname = KNAME_DISPLAY.get(kernel_name, kernel_name.upper())
-    kernel_label = "INT8 kernel" if kernel_name.startswith("int8") else "Fused kernel"
+    kernel_label = rows[0].get("kernel_label", "Fused kernel")
 
     # Map our internal keys to display names for the legend
     method_cols = [
@@ -501,20 +506,18 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     ]
     # If 4th-line data is present, add it (label from row or default)
     has_naive_pytorch = "naive_pytorch_ms" in rows[0] and rows[0]["naive_pytorch_ms"] is not None
-    np_label = rows[0].get("naive_pytorch_label", "Naive PyTorch (cuBLAS)") if has_naive_pytorch else None
+    np_label = rows[0].get("naive_pytorch_label", "Naive PyTorch") if has_naive_pytorch else None
     if has_naive_pytorch:
         method_cols.append((np_label, "naive_pytorch_ms"))
-    # Reuse shared colours; map labels to colour slots
-    col_map = {
-        kernel_label: COLORS["Fused kernel"],
-        naive_label:  COLORS.get(naive_label, COLORS["Naive PyTorch"]),
-        ref2_label:   COLORS["cuBLAS / Flash"],
-    }
-    mrk_map = {
-        kernel_label: MARKERS["Fused kernel"],
-        naive_label:  MARKERS.get(naive_label, MARKERS["Naive PyTorch"]),
-        ref2_label:   MARKERS["cuBLAS / Flash"],
-    }
+
+    # Colours/markers by semantic label — fallback to grey if unknown
+    def get_color(label):
+        return COLORS.get(label, "#888888")
+    def get_marker(label):
+        return MARKERS.get(label, "x")
+
+    col_map = {lbl: get_color(lbl) for lbl, _ in method_cols}
+    mrk_map = {lbl: get_marker(lbl) for lbl, _ in method_cols}
     if has_naive_pytorch:
         col_map[np_label] = COLORS["Naive PyTorch (cuBLAS)"]
         mrk_map[np_label] = MARKERS["Naive PyTorch (cuBLAS)"]

@@ -52,12 +52,12 @@ def compute_attention_flops(batch, heads, seq_len, head_dim):
 # ── Multi-config correctness (matches INT8 test configs) ─────────────────
 ATTN_CONFIGS = [
     # (batch, heads, seq_len, head_dim, description)
-    (2, 8, 512,  64,  "head_dim=64  (TILE_KV=64, double-buf)"),
-    (2, 8, 512,  128, "head_dim=128 (TILE_KV=32, double-buf)"),
-    (2, 8, 512,  256, "head_dim=256 (TILE_KV=32, double-buf)"),
-    (2, 8, 1024, 64,  "head_dim=64  seq=1024 (TILE_KV=64)"),
-    (2, 8, 1024, 128, "head_dim=128 seq=1024 (TILE_KV=32)"),
-    (2, 8, 1024, 256, "head_dim=256 seq=1024 (TILE_KV=32)"),
+    (2, 8, 512,  64,  "head_dim=64"),
+    (2, 8, 512,  128, "head_dim=128"),
+    (2, 8, 512,  256, "head_dim=256"),
+    (2, 8, 1024, 64,  "head_dim=64  seq=1024"),
+    (2, 8, 1024, 128, "head_dim=128 seq=1024"),
+    (2, 8, 1024, 256, "head_dim=256 seq=1024"),
 ]
 
 
@@ -138,7 +138,7 @@ def main():
     K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
     V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
 
-    print("\n=== Benchmark: FP16 Attention (head_dim=64, TILE_KV=64 double-buf) ===")
+    print("\n=== Benchmark: FP16 Attention (head_dim=64) ===")
     naive_ms = benchmark(attention_baseline, Q, K, V)
     kernel_ms = benchmark(run_kernel, Q, K, V)
     flash_ms = benchmark(F.scaled_dot_product_attention, Q, K, V)
@@ -154,7 +154,7 @@ def main():
 
     # ── Benchmark: head_dim=256 (TILE_KV=64) ────────────────────────────
     head_dim_256 = 256
-    print("\n=== Benchmark: FP16 Attention (head_dim=256, TILE_KV=32 double-buf) ===")
+    print("\n=== Benchmark: FP16 Attention (head_dim=256) ===")
     torch.manual_seed(42)
     Q2 = torch.randn(batch, heads, seq_len, head_dim_256, device=device, dtype=dtype)
     K2 = torch.randn(batch, heads, seq_len, head_dim_256, device=device, dtype=dtype)

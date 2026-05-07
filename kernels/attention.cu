@@ -150,23 +150,17 @@ static void fused_attention_forward(
 
 #if ATTN_WMMA
 
-// ── WMMA Split-Q kernel — TILE_Q=64, 4 warps, cp.async double-buffer ────
-//
+// WMMA Split-Q kernel with cp.async double-buffer pipeline.
 // Each block handles 64 query rows (4 warps × 16 rows). Each warp tracks its
 // own online softmax state in registers — no cross-warp sync needed.
 // While computing tile t, tile t+1 loads asynchronously via cp.async.cg.
-// TILE_KV is templated for smem-aware dispatch.
-// Requires seq_len % TILE_KV_T == 0.
+// Requires seq_len % WMMA_TILE_KV == 0.
 //
-// Double-buffer dispatch (FP16 — K/V smem = 2× INT8):
-//   head_dim ≤  64 → TILE_KV=64   (smem ≈ 54KB, 2-3 blocks/SM)
-//   head_dim ≥ 128 → TILE_KV=32   (smem ≈ 56KB @ hd=128, ≈104KB @ hd=256)
-//
-// Smem layout (all half, rows padded by SMEM_PAD):
-//   s_Q          [WMMA_TILE_Q × (head_dim + SMEM_PAD)]
-//   s_K0 / s_K1  [TILE_KV_T  × (head_dim + SMEM_PAD)]  each (double-buffered)
-//   s_V0 / s_V1  [TILE_KV_T  × (head_dim + SMEM_PAD)]  each (double-buffered)
-//   s_scores_h   [WMMA_TILE_Q × (TILE_KV_T + SMEM_PAD)]
+// Smem layout (all half, rows padded by SMEM_PAD to reduce bank conflicts):
+//   s_Q        [WMMA_TILE_Q  × (head_dim + SMEM_PAD)]
+//   s_K0/s_K1  [WMMA_TILE_KV × (head_dim + SMEM_PAD)] each  (double-buffered)
+//   s_V0/s_V1  [WMMA_TILE_KV × (head_dim + SMEM_PAD)] each  (double-buffered)
+//   s_scores_h [WMMA_TILE_Q  × (WMMA_TILE_KV + SMEM_PAD)]
 //
 // sm_80 wmma 16x16x16 float accumulator layout, thread lane t (0..31):
 //   x[0]: (t/4,   (t%4)*2)     x[1]: (t/4,   (t%4)*2+1)
@@ -180,6 +174,7 @@ using namespace nvcuda::wmma;
 #define WMMA_N       16
 #define WMMA_K_DIM   16
 #define WMMA_TILE_Q  64
+#define WMMA_TILE_KV 32
 #define WMMA_BDIM    128
 // Pad each smem row by 8 halves (16 bytes) to reduce bank conflicts.
 #if ATTN_SWIZZLE
@@ -209,7 +204,6 @@ static __device__ __forceinline__ void cp_async_wait_all() {
     asm volatile("cp.async.wait_all;" ::: "memory");
 }
 
-template <int TILE_KV_T>
 __global__ __launch_bounds__(WMMA_BDIM, 2)
 void wmma_attention_kernel(
     const half* __restrict__ Q,
@@ -226,13 +220,13 @@ void wmma_attention_kernel(
 
     extern __shared__ char smem_raw[];
     const int qs = head_dim + SMEM_PAD;            // padded Q/K/V row stride
-    const int ss = TILE_KV_T + SMEM_PAD;           // padded scores row stride
+    const int ss = WMMA_TILE_KV + SMEM_PAD;           // padded scores row stride
     half* s_Q        = (half*) smem_raw;
     half* s_K0       = s_Q  + WMMA_TILE_Q * qs;
-    half* s_K1       = s_K0 + TILE_KV_T * qs;
-    half* s_V0       = s_K1 + TILE_KV_T * qs;
-    half* s_V1       = s_V0 + TILE_KV_T * qs;
-    half* s_scores_h = s_V1 + TILE_KV_T * qs;
+    half* s_K1       = s_K0 + WMMA_TILE_KV * qs;
+    half* s_V0       = s_K1 + WMMA_TILE_KV * qs;
+    half* s_V1       = s_V0 + WMMA_TILE_KV * qs;
+    half* s_scores_h = s_V1 + WMMA_TILE_KV * qs;
 
     // ── Load Q tile into smem ────────────────────────────────────────────
     for (int idx = tid; idx < WMMA_TILE_Q * head_dim; idx += WMMA_BDIM) {
@@ -254,7 +248,7 @@ void wmma_attention_kernel(
     float rsum0 = 0.f, rsum1 = 0.f;
 
     const int n_slices = head_dim / WMMA_N;
-    constexpr int n_kv_groups = TILE_KV_T / WMMA_N;
+    const int n_kv_groups = WMMA_TILE_KV / WMMA_N;
 
     // Output accumulators — max 16 slices for head_dim up to 256
     fragment<accumulator, WMMA_M, WMMA_N, WMMA_K_DIM, float> frag_out[16];
@@ -262,12 +256,12 @@ void wmma_attention_kernel(
 
     __syncthreads();
 
-    const int num_tiles = seq_len / TILE_KV_T;
+    const int num_tiles = seq_len / WMMA_TILE_KV;
 
     // ── Kick off tile 0 load before entering the loop ────────────────────
     {
         const size_t base = ((size_t)bh * seq_len) * head_dim;
-        for (int idx = tid; idx < TILE_KV_T * (head_dim / 8); idx += WMMA_BDIM) {
+        for (int idx = tid; idx < WMMA_TILE_KV * (head_dim / 8); idx += WMMA_BDIM) {
             const int row = idx / (head_dim / 8);
             const int col = (idx % (head_dim / 8)) * 8;
             cp_async16(s_K0 + row * qs + col, K + base + row * head_dim + col);
@@ -284,8 +278,8 @@ void wmma_attention_kernel(
 
         // ── Prefetch tile t+1 while waiting for tile t ───────────────────
         if (t + 1 < num_tiles) {
-            const size_t base = ((size_t)bh * seq_len + (t + 1) * TILE_KV_T) * head_dim;
-            for (int idx = tid; idx < TILE_KV_T * (head_dim / 8); idx += WMMA_BDIM) {
+            const size_t base = ((size_t)bh * seq_len + (t + 1) * WMMA_TILE_KV) * head_dim;
+            for (int idx = tid; idx < WMMA_TILE_KV * (head_dim / 8); idx += WMMA_BDIM) {
                 const int row = idx / (head_dim / 8);
                 const int col = (idx % (head_dim / 8)) * 8;
                 cp_async16(s_K_nxt + row * qs + col, K + base + row * head_dim + col);
@@ -388,7 +382,7 @@ void wmma_attention_kernel(
         __syncwarp();
         for (int s = 0; s < n_slices; ++s) {
             const int d_base = s * WMMA_N;
-            for (int k = 0; k < TILE_KV_T; k += WMMA_K_DIM) {
+            for (int k = 0; k < WMMA_TILE_KV; k += WMMA_K_DIM) {
                 fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K_DIM, half, row_major> frag_w;
                 fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K_DIM, half, row_major> frag_Vs;
                 load_matrix_sync(frag_w,  s_scores_h + warp_id * WMMA_M * ss + k, ss);
@@ -436,34 +430,16 @@ static void wmma_attention_forward(
     const int BH = batch * heads;
     dim3 grid((seq_len + WMMA_TILE_Q - 1) / WMMA_TILE_Q, BH);
 
-    // Double-buffer smem: s_Q + 2×s_K + 2×s_V + s_scores_h  (all half)
-    auto calc_smem = [&](int tile_kv) -> size_t {
-        return ((size_t)(WMMA_TILE_Q + 4 * tile_kv) * (head_dim + SMEM_PAD)
-              + (size_t) WMMA_TILE_Q * (tile_kv + SMEM_PAD)) * sizeof(half);
-    };
+    // s_Q + 2*s_K + 2*s_V + s_scores_h (all rows padded by SMEM_PAD)
+    const size_t smem =
+        ((size_t)(WMMA_TILE_Q + 4 * WMMA_TILE_KV) * (head_dim + SMEM_PAD) +
+         (size_t) WMMA_TILE_Q * (WMMA_TILE_KV + SMEM_PAD)) * sizeof(half);
 
-    // TILE_KV=64 if double-buffer smem ≤ 82KB (2 blocks/SM on A100),
-    // otherwise TILE_KV=32.
-    #define LAUNCH_WMMA_ATTN(TILE_KV_VAL) do {                                \
-        const size_t smem = calc_smem(TILE_KV_VAL);                           \
-        cudaFuncSetAttribute(wmma_attention_kernel<TILE_KV_VAL>,              \
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,      \
-                             (int)smem);                                       \
-        wmma_attention_kernel<TILE_KV_VAL><<<grid, WMMA_BDIM, smem>>>(        \
-            Q, K, V, out, seq_len, head_dim, scale);                          \
-    } while (0)
-
-    const size_t smem64 = calc_smem(64);
-    if (smem64 <= 82 * 1024 && seq_len % 64 == 0) {
-        LAUNCH_WMMA_ATTN(64);
-    } else if (seq_len % 32 == 0) {
-        LAUNCH_WMMA_ATTN(32);
-    } else {
-        // seq_len not a multiple of 32 — fall back to scalar kernel
-        fused_attention_forward(Q, K, V, out, batch, heads, seq_len, head_dim);
-    }
-
-    #undef LAUNCH_WMMA_ATTN
+    cudaFuncSetAttribute(wmma_attention_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)smem);
+    wmma_attention_kernel<<<grid, WMMA_BDIM, smem>>>(
+        Q, K, V, out, seq_len, head_dim, scale);
 }
 
 #endif  // ATTN_WMMA

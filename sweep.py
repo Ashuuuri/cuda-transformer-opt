@@ -498,17 +498,24 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     kname = KNAME_DISPLAY.get(kernel_name, kernel_name.upper())
     kernel_label = rows[0].get("kernel_label", "Fused kernel")
 
-    # Map our internal keys to display names for the legend
-    method_cols = [
+    # Collect all available lines
+    all_cols = [
         (kernel_label, "kernel_ms"),
         (naive_label,  "naive_ms"),
         (ref2_label,   "ref2_ms"),
     ]
-    # If 4th-line data is present, add it (label from row or default)
     has_naive_pytorch = "naive_pytorch_ms" in rows[0] and rows[0]["naive_pytorch_ms"] is not None
     np_label = rows[0].get("naive_pytorch_label", "Naive PyTorch") if has_naive_pytorch else None
     if has_naive_pytorch:
-        method_cols.append((np_label, "naive_pytorch_ms"))
+        all_cols.append((np_label, "naive_pytorch_ms"))
+
+    # Sort by fixed order so legend is consistent across all charts
+    LEGEND_ORDER = ["INT8 WMMA", "FP16 WMMA", "Naive PyTorch",
+                    "FlashAttn-2", "cuBLAS GEMMs"]
+    def sort_key(item):
+        lbl = item[0]
+        return LEGEND_ORDER.index(lbl) if lbl in LEGEND_ORDER else 99
+    method_cols = sorted(all_cols, key=sort_key)
 
     # Colours/markers by semantic label — fallback to grey if unknown
     def get_color(label):

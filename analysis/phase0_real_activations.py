@@ -46,8 +46,8 @@ MODELS = {
         "hf_name": "facebook/opt-6.7b",
         "desc": "OPT-6.7B (32 layers, 32 heads, d=4096, head_dim=128)",
         "layers": [0, 8, 16, 31],
-        "dtype": torch.float16,  # load in FP16 to fit in 40GB
-        "device": "cuda",        # needs GPU
+        "dtype": torch.float16,  # load in FP16 to save memory
+        "device": "cpu",         # CPU is fine, only one forward pass needed
     },
 }
 

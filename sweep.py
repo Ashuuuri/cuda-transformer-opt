@@ -543,6 +543,31 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     by_dm   = group_by(rows, "d_model")
     max_seq = max(SEQ_LENS)
 
+    # ── vary_heads mode: single scaling chart, skip the 5 standard figs ──
+    if kernel_name.endswith("_vary_heads"):
+        heads_list = sorted(set(attn_config(dm)[0] for dm in D_MODELS))
+        by_seq = group_by(rows, "seq_len")
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        for sq in SEQ_LENS:
+            sub = sorted(by_seq[sq], key=lambda r: r["d_model"])
+            hs = [attn_config(r["d_model"])[0] for r in sub]
+            ax.plot(hs, [r["kernel_ms"] for r in sub],
+                    marker="o", label=f"seq={sq}", linewidth=2, markersize=6)
+        ax.set_xlabel("Number of Heads", fontsize=12)
+        ax.set_ylabel("Latency (ms)", fontsize=12)
+        ax.set_xticks(heads_list)
+        ax.set_title(f"{kname}\n(head_dim=64, batch={BATCH}, A100)",
+                     fontsize=12)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        p = os.path.join(figures_dir, f"{kernel_name}_scaling.png")
+        fig.savefig(p, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[Plot] {p}")
+        return   # skip the standard 5 figures
+
     # ── Fig 1: Latency vs seq_len (one subplot per d_model) ───────────
     fig, axes = plt.subplots(1, len(D_MODELS),
                              figsize=(5 * len(D_MODELS), 4), sharey=False)

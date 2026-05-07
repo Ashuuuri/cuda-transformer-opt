@@ -65,6 +65,7 @@ COLORS = {
     "FP16 WMMA (Jonathan)": "#DC2626",
     "FP16 WMMA baseline": "#DC2626",
     "cuBLAS / Flash":    "#16A34A",
+    "Naive PyTorch (cuBLAS)": "#F59E0B",
 }
 MARKERS = {
     "Fused kernel":      "o",
@@ -73,6 +74,7 @@ MARKERS = {
     "FP16 WMMA (Jonathan)": "s",
     "FP16 WMMA baseline": "s",
     "cuBLAS / Flash":    "^",
+    "Naive PyTorch (cuBLAS)": "D",
 }
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -299,12 +301,13 @@ def bench_int8_attn(ext, batch, seq_len, d_model):
 
     kernel_ms  = benchmark(run_int8)
     fp16_wm_ms = benchmark(attn_ext.attention_forward, Q_deq, K_deq, V_deq)
+    naive_ms   = benchmark(attention_baseline, Q, K, V)
     flash_ms   = benchmark(F.scaled_dot_product_attention, Q_deq, K_deq, V_deq)
 
     flops     = attention_flops(batch, heads, seq_len, head_dim)
     peak_tops = A100_INT8_TOPS
 
-    return _make_row(
+    row = _make_row(
         batch, seq_len, d_model,
         kernel_ms, fp16_wm_ms, flash_ms,
         flops, peak_tops,
@@ -313,6 +316,9 @@ def bench_int8_attn(ext, batch, seq_len, d_model):
         naive_label="FP16 WMMA baseline",
         ref2_label="FlashAttn-2",
     )
+    # Extra baseline: Naive PyTorch (cuBLAS matmul attention)
+    row["naive_pytorch_ms"] = naive_ms
+    return row
 
 
 # ── INT8 MLP ──────────────────────────────────────────────────────────────
@@ -413,6 +419,7 @@ def _make_row(
 FIELDNAMES = [
     "batch", "seq_len", "d_model",
     "kernel_ms", "naive_ms", "ref2_ms", "naive_label", "ref2_label",
+    "naive_pytorch_ms",
     "kernel_tops", "naive_tops", "ref2_tops",
     "kernel_util_pct", "naive_util_pct",
     "kernel_bw_util_pct", "naive_bw_util_pct",
@@ -421,7 +428,7 @@ FIELDNAMES = [
 
 def save_csv(rows, path):
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
     print(f"\n[CSV] {len(rows)} rows → {path}")
@@ -457,16 +464,22 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         (naive_label,  "naive_ms"),
         (ref2_label,   "ref2_ms"),
     ]
+    # If Naive PyTorch (cuBLAS) data is present, add as 4th line
+    has_naive_pytorch = "naive_pytorch_ms" in rows[0] and rows[0]["naive_pytorch_ms"] is not None
+    if has_naive_pytorch:
+        method_cols.append(("Naive PyTorch (cuBLAS)", "naive_pytorch_ms"))
     # Reuse shared colours; map labels to colour slots
     col_map = {
         kernel_label: COLORS["Fused kernel"],
         naive_label:  COLORS.get(naive_label, COLORS["Naive PyTorch"]),
         ref2_label:   COLORS["cuBLAS / Flash"],
+        "Naive PyTorch (cuBLAS)": COLORS["Naive PyTorch (cuBLAS)"],
     }
     mrk_map = {
         kernel_label: MARKERS["Fused kernel"],
         naive_label:  MARKERS.get(naive_label, MARKERS["Naive PyTorch"]),
         ref2_label:   MARKERS["cuBLAS / Flash"],
+        "Naive PyTorch (cuBLAS)": MARKERS["Naive PyTorch (cuBLAS)"],
     }
 
     def group_by(rows, key):

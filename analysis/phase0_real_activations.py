@@ -242,6 +242,25 @@ def quantize_per_tensor(t):
     return t_int8, scale
 
 
+def quantize_per_token(t):
+    """Per-token symmetric INT8 quantization.
+
+    For tensor of shape [batch, heads, seq, head_dim], each token (last-dim vector)
+    gets its own scale. This avoids one outlier token ruining precision for all others.
+
+    Returns:
+        t_int8: same shape, dtype=int8
+        scales: shape [batch, heads, seq, 1]
+    """
+    t_f = t.float()
+    # Scale per token: max along head_dim axis
+    abs_max = t_f.abs().amax(dim=-1, keepdim=True)  # [batch, heads, seq, 1]
+    abs_max = abs_max.clamp(min=1e-8)  # avoid division by zero
+    scales = abs_max / 127.0
+    t_int8 = (t_f / scales).round().clamp(-128, 127).to(torch.int8)
+    return t_int8, scales
+
+
 def dequantize(t_int8, scale):
     return t_int8.float() * scale
 
@@ -361,89 +380,157 @@ def analyze_attention_propagation(activations, model_key):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Step 0-4b: Per-token quantization (the fix)
+# ══════════════════════════════════════════════════════════════════════════
+
+def analyze_per_token_attention(activations, model_key):
+    """Same as Step 0-4, but using per-token quantization instead of per-tensor.
+
+    Per-token means each token (row) in Q/K/V gets its own scale factor.
+    This prevents one outlier token from destroying precision for all others.
+
+    In the INT8 QK^T computation:
+      score[i][j] = (Q_int8[i] @ K_int8[j]) * scale_Q[i] * scale_K[j] * attn_scale
+
+    Each element of QK^T gets a different combined scale (product of row i and col j scales).
+    """
+    report(f"\n  --- Per-token quantization: error propagation ({model_key}) ---")
+    report(f"  Path: Q,K,V -> INT8(per-token) -> QK^T(INT32) -> float -> softmax -> xV -> out")
+    report(f"  Each token has its own scale (no single outlier can ruin global precision)\n")
+
+    report(f"  {'Layer':<12} {'QKT CS':>8} {'Softmax CS':>10} "
+           f"{'Output CS':>10} {'Out SNR(dB)':>11} {'OK':>4}")
+    report(f"  {'-'*12} {'-'*8} {'-'*10} {'-'*10} {'-'*11} {'-'*4}")
+
+    results = {}
+
+    for layer_name, data in activations.items():
+        Q = data["Q"].float()
+        K = data["K"].float()
+        V = data["V"].float()
+        head_dim = Q.shape[-1]
+        attn_scale = head_dim ** -0.5
+
+        # FP32 ground truth
+        scores_fp = torch.matmul(Q, K.transpose(-2, -1)) * attn_scale
+        attn_fp = F.softmax(scores_fp, dim=-1)
+        out_fp = torch.matmul(attn_fp, V)
+
+        # Per-token INT8 path
+        Q_i8, sQ = quantize_per_token(Q)  # sQ: [batch, heads, seq, 1]
+        K_i8, sK = quantize_per_token(K)  # sK: [batch, heads, seq, 1]
+        V_i8, sV = quantize_per_token(V)  # sV: [batch, heads, seq, 1]
+
+        # INT8 QK^T with per-token scales:
+        # result[b,h,i,j] = sum_d(Q_i8[b,h,i,d] * K_i8[b,h,j,d]) * sQ[b,h,i] * sK[b,h,j] * attn_scale
+        qk_int32 = torch.matmul(Q_i8.int(), K_i8.int().transpose(-2, -1))
+        # sQ is [b,h,seq,1], sK is [b,h,seq,1] -> sK^T is [b,h,1,seq]
+        # Broadcasting: [b,h,seq,1] * [b,h,1,seq] -> [b,h,seq,seq]
+        scale_matrix = sQ * sK.transpose(-2, -1) * attn_scale
+        scores_int8 = qk_int32.float() * scale_matrix
+
+        # Softmax in FP32
+        attn_int8 = F.softmax(scores_int8, dim=-1)
+
+        # attn x V(dequantized): V_deq = V_i8 * sV (per-token broadcast)
+        V_deq = V_i8.float() * sV
+        out_int8 = torch.matmul(attn_int8, V_deq)
+
+        # Metrics
+        cs_qkt = cosine_sim(scores_fp, scores_int8)
+        cs_softmax = cosine_sim(attn_fp, attn_int8)
+        cs_output = cosine_sim(out_fp, out_int8)
+        out_snr = (10 * torch.log10(
+            out_fp.pow(2).mean() / (out_fp - out_int8).pow(2).mean().clamp(min=1e-20)
+        )).item()
+
+        verdict = "Y" if cs_output > 0.999 else "~" if cs_output > 0.99 else "N"
+
+        report(f"  {layer_name:<12} {cs_qkt:>7.5f}  {cs_softmax:>9.5f}  "
+               f"{cs_output:>9.5f}  {out_snr:>9.1f}dB  {verdict}")
+
+        results[layer_name] = {
+            "cs_qkt": cs_qkt, "cs_softmax": cs_softmax,
+            "cs_output": cs_output, "out_snr_db": out_snr,
+        }
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Side-by-side comparison
 # ══════════════════════════════════════════════════════════════════════════
 
-def compare_models(all_results):
-    """Print side-by-side comparison of attention output cosine similarity."""
+def compare_models(all_results, all_pertoken_results):
+    """Print side-by-side comparison: per-tensor vs per-token, small vs large."""
     report("\n" + "=" * 70)
-    report("  COMPARISON: Small model vs Large model")
+    report("  COMPARISON: per-tensor vs per-token quantization")
     report("=" * 70)
 
     report(f"\n  Attention output cosine similarity (the key metric):\n")
-    report(f"  {'Model':<20} {'Worst CS':>10} {'Average CS':>10} {'Verdict':>8}")
-    report(f"  {'-'*20} {'-'*10} {'-'*10} {'-'*8}")
+    report(f"  {'Model':<16} {'Method':<12} {'Worst CS':>10} {'Avg CS':>10} {'Verdict':>8}")
+    report(f"  {'-'*16} {'-'*12} {'-'*10} {'-'*10} {'-'*8}")
 
-    for model_key, attn_results in all_results.items():
-        all_cs = [r["cs_output"] for r in attn_results.values()]
-        worst = min(all_cs)
-        avg = sum(all_cs) / len(all_cs)
-        if worst > 0.999:
-            verdict = "PASS"
-        elif worst > 0.99:
-            verdict = "MARGINAL"
-        else:
-            verdict = "FAIL"
-        report(f"  {model_key:<20} {worst:>9.6f}  {avg:>9.6f}  {verdict:>8}")
+    for model_key in all_results.keys():
+        # Per-tensor
+        cs_list = [r["cs_output"] for r in all_results[model_key].values()]
+        worst = min(cs_list)
+        avg = sum(cs_list) / len(cs_list)
+        verdict = "PASS" if worst > 0.999 else "MARGINAL" if worst > 0.99 else "FAIL"
+        report(f"  {model_key:<16} {'per-tensor':<12} {worst:>9.6f}  {avg:>9.6f}  {verdict:>8}")
+
+        # Per-token
+        if model_key in all_pertoken_results:
+            cs_list_pt = [r["cs_output"] for r in all_pertoken_results[model_key].values()]
+            worst_pt = min(cs_list_pt)
+            avg_pt = sum(cs_list_pt) / len(cs_list_pt)
+            verdict_pt = "PASS" if worst_pt > 0.999 else "MARGINAL" if worst_pt > 0.99 else "FAIL"
+            report(f"  {'':<16} {'per-token':<12} {worst_pt:>9.6f}  {avg_pt:>9.6f}  {verdict_pt:>8}")
 
     report(f"\n  Interpretation:")
-    report(f"    PASS:     per-tensor INT8 is sufficient, proceed with kernel optimization")
-    report(f"    MARGINAL: works but precision loss is noticeable, document in poster")
-    report(f"    FAIL:     need per-token quantization or K-smoothing")
-
-    # Check if outlier problem appears
-    model_keys = list(all_results.keys())
-    if len(model_keys) >= 2:
-        cs_small = min(r["cs_output"] for r in all_results[model_keys[0]].values())
-        cs_large = min(r["cs_output"] for r in all_results[model_keys[1]].values())
-        gap = cs_small - cs_large
-        report(f"\n  Precision gap (small - large): {gap:+.6f}")
-        if gap > 0.01:
-            report(f"  -> Large model is significantly harder to quantize (outlier effect)")
-            report(f"  -> This confirms LLM.int8() findings: outliers emerge with scale")
-        elif gap > 0.001:
-            report(f"  -> Slight degradation at larger scale, but still manageable")
-        else:
-            report(f"  -> No significant difference: per-tensor INT8 works at both scales")
+    report(f"    per-tensor: one scale for entire Q/K/V tensor (current kernel)")
+    report(f"    per-token:  one scale per token row (proposed improvement)")
+    report(f"    PASS = cosine sim > 0.999, MARGINAL = > 0.99, FAIL = < 0.99")
 
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Conclusion
 # ══════════════════════════════════════════════════════════════════════════
 
-def write_conclusion(all_results):
+def write_conclusion(all_results, all_pertoken_results):
     report("\n" + "=" * 70)
     report("  CONCLUSION")
     report("=" * 70)
 
-    # Collect all cosine similarities across all models
-    all_cs = []
+    # Per-tensor results
+    tensor_cs = []
     for attn_results in all_results.values():
-        all_cs.extend(r["cs_output"] for r in attn_results.values())
+        tensor_cs.extend(r["cs_output"] for r in attn_results.values())
+    tensor_worst = min(tensor_cs)
 
-    worst = min(all_cs)
-    avg = sum(all_cs) / len(all_cs)
+    # Per-token results
+    token_cs = []
+    for attn_results in all_pertoken_results.values():
+        token_cs.extend(r["cs_output"] for r in attn_results.values())
+    token_worst = min(token_cs) if token_cs else 0.0
 
-    report(f"\n  Overall attention output cosine similarity:")
-    report(f"    Worst across all models/layers: {worst:.6f}")
-    report(f"    Average:                        {avg:.6f}")
+    report(f"\n  Per-tensor quantization:")
+    report(f"    Worst cosine sim: {tensor_worst:.6f}  {'PASS' if tensor_worst > 0.999 else 'FAIL'}")
+    report(f"\n  Per-token quantization:")
+    report(f"    Worst cosine sim: {token_worst:.6f}  {'PASS' if token_worst > 0.999 else 'FAIL'}")
 
-    if worst > 0.999:
-        report(f"\n  PASS: Per-tensor INT8 quantization is precise enough.")
-        report(f"  -> Our INT8 kernel's quantization scheme is validated.")
-        report(f"  -> Proceed to Phase 1 (correctness) and Phase 2 (performance).")
-        report(f"  -> Poster claim: 'INT8 quantization error is negligible for attention'")
-    elif worst > 0.99:
-        report(f"\n  MARGINAL: Noticeable precision loss but within usable range.")
-        report(f"  -> Report exact numbers. Note which layers/models degrade.")
-        report(f"  -> Consider: per-token quant or K-smoothing (ref: SageAttention)")
-        report(f"  -> Poster: 'INT8 works for small/medium models; larger models")
-        report(f"     benefit from per-token quantization'")
+    if tensor_worst < 0.999 and token_worst > 0.999:
+        report(f"\n  FINDING: Per-tensor fails on large models, per-token fixes it.")
+        report(f"  -> Per-token quantization eliminates the outlier problem.")
+        report(f"  -> Kernel change needed: scale becomes [batch*heads*seq] array")
+        report(f"     instead of single float.")
+        report(f"  -> QK^T element [i][j] scaled by: scale_Q[i] * scale_K[j] * attn_scale")
+        report(f"  -> This is what SageAttention does (ICLR 2025).")
+    elif tensor_worst > 0.999:
+        report(f"\n  Per-tensor is already sufficient for all tested models.")
+        report(f"  -> No need for per-token in this regime.")
     else:
-        report(f"\n  FAIL: Per-tensor INT8 precision is insufficient for large models.")
-        report(f"  -> Per-tensor quant breaks down due to outlier features.")
-        report(f"  -> Must implement per-token quantization for real-world use.")
-        report(f"  -> Poster: document this as a finding (matches LLM.int8() results)")
+        report(f"\n  Both methods struggle. Consider per-channel or mixed-precision.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -475,6 +562,7 @@ def main():
     all_dist_stats = {}
     all_quant_results = {}
     all_attn_results = {}
+    all_pertoken_results = {}
 
     for model_key in model_keys:
         report("\n" + "=" * 70)
@@ -485,12 +573,11 @@ def main():
         all_dist_stats[model_key] = analyze_distributions(activations, model_key)
         all_quant_results[model_key] = analyze_quantization(activations, model_key)
         all_attn_results[model_key] = analyze_attention_propagation(activations, model_key)
+        all_pertoken_results[model_key] = analyze_per_token_attention(activations, model_key)
 
-    # Side-by-side comparison (if multiple models)
-    if len(model_keys) > 1:
-        compare_models(all_attn_results)
-
-    write_conclusion(all_attn_results)
+    # Side-by-side comparison
+    compare_models(all_attn_results, all_pertoken_results)
+    write_conclusion(all_attn_results, all_pertoken_results)
 
     # Grading reference
     report(f"\n  --- Grading reference ---")

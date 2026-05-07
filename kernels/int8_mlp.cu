@@ -1,15 +1,14 @@
 // int8_mlp.cu — INT8 quantized two-layer MLP (Linear → GELU → Linear).
 // Owner: Heling
 //
-// Architecture mirrors Sherry's FP16 mlp.cu:
-//   64×64 block tile, 8 warps, 16×16×16 WMMA, cp.async double-buffer (STAGE_K=32).
-//   Fragment types changed to int8_t/int32_t; epilogue dequantizes INT32→FP16.
+// Architecture:
+//   128×128 block tile, 8 warps, 16×16×16 WMMA, cp.async double-buffer (STAGE_K=32).
+//   Each warp computes a 32×64 output sub-tile (2 row tiles × 4 col tiles).
+//   Arithmetic intensity: 2×128×128 / ((128+128)×1) = 128 ops/byte (was 64).
 //
 //   Forward pass:
-//     GEMM1: int8 x × int8 W1  →  INT32 acc × (scale_x·scale_W1) → GELU → FP16 hidden
-//     Quant: FP16 hidden → INT8 hidden  (dynamic per-tensor scale_hidden)
-//     GEMM2: int8 hidden × int8 W2  →  INT32 acc × (scale_hidden·scale_W2) → FP16
-//     Quant: FP16 out → INT8 out  (dynamic per-tensor scale_out)
+//     GEMM1: int8 x × int8 W1  →  INT32 acc × (scale_x·scale_W1) → GELU → INT8 hidden
+//     GEMM2: int8 hidden × int8 W2  →  INT32 acc × (scale_hidden·scale_W2) → INT8 out
 //
 // Ablation flags:
 //   INT8_MLP_STAGE_K=N   change K-stage depth (default 32)
@@ -22,31 +21,32 @@
 
 using namespace nvcuda;
 
-// ── Tile / block shape (mirrors Sherry's mlp.cu) ───────────────────────
+// ── Tile / block shape ─────────────────────────────────────────────────
 #define WMMA_M  16
 #define WMMA_N  16
 #define WMMA_K  16
 #ifndef INT8_MLP_STAGE_K
 #define INT8_MLP_STAGE_K 32
 #endif
-#define STAGE_K         INT8_MLP_STAGE_K
-#define BLOCK_M         64    // 4 row-tiles × 16
-#define BLOCK_N         64    // 4 col-tiles × 16
-#define WARP_COL_TILES   2
-#define WARP_COL_GROUPS  2    // BLOCK_N/WMMA_N / WARP_COL_TILES = 4/2
-#define WARPS_PER_BLOCK  8    // BLOCK_M/WMMA_M × WARP_COL_GROUPS = 4×2
-#define THREADS_PER_BLOCK (WARPS_PER_BLOCK * 32)  // 256
-#define SCALAR_TILE     16    // scalar fallback tile size
+#define STAGE_K          INT8_MLP_STAGE_K
+#define BLOCK_M          128                                    // was 64
+#define BLOCK_N          128                                    // was 64
+#define WARP_ROW_TILES   2                                      // each warp: 2 row tiles (32 rows)
+#define WARP_COL_TILES   4                                      // each warp: 4 col tiles (64 cols)
+#define WARP_ROW_GROUPS  (BLOCK_M / WMMA_M / WARP_ROW_TILES)   // 4
+#define WARP_COL_GROUPS  (BLOCK_N / WMMA_N / WARP_COL_TILES)   // 2
+#define WARPS_PER_BLOCK  (WARP_ROW_GROUPS * WARP_COL_GROUPS)   // 8
+#define THREADS_PER_BLOCK (WARPS_PER_BLOCK * 32)                // 256
+#define SCALAR_TILE      16
 
-// INT8 smem padding: 16 bytes per row — same byte-level protection as
-// Sherry's 8-half (16-byte) skew, expressed in int8 elements.
-#define SMEM_SKEW       16
-#define A_SMEM_STRIDE   (STAGE_K + SMEM_SKEW)   // 48
-#define B_SMEM_STRIDE   (BLOCK_N  + SMEM_SKEW)   // 80
+// INT8 smem padding: 16 bytes per row
+#define SMEM_SKEW        16
+#define A_SMEM_STRIDE    (STAGE_K + SMEM_SKEW)                  // 48
+#define B_SMEM_STRIDE    (BLOCK_N + SMEM_SKEW)                  // 144
 
-// INT8: 16 bytes per cp.async = 16 elements (vs 8 for FP16).
-#define A_COPIES_PER_ROW  (STAGE_K / 16)   // 2
-#define B_COPIES_PER_ROW  (BLOCK_N  / 16)  // 4
+// cp.async: 16 bytes per copy = 16 INT8 elements
+#define A_COPIES_PER_ROW (STAGE_K / 16)                         // 2
+#define B_COPIES_PER_ROW (BLOCK_N / 16)                         // 8
 
 // ── Scalar fallback ────────────────────────────────────────────────────
 // Accumulates INT8 products as float, writes FP16 output.
@@ -95,9 +95,9 @@ __device__ __forceinline__ void load_int8_tile_async(
     int8_t* sA, int8_t* sB,
     int block_m, int block_n, int k0, int K, int N
 ) {
-    const int A_COPIES = BLOCK_M * A_COPIES_PER_ROW;    // 128
-    const int B_COPIES = STAGE_K * B_COPIES_PER_ROW;    // 128
-    const int TOTAL    = A_COPIES + B_COPIES;
+    const int A_COPIES = BLOCK_M * A_COPIES_PER_ROW;    // 256
+    const int B_COPIES = STAGE_K * B_COPIES_PER_ROW;    // 256
+    const int TOTAL    = A_COPIES + B_COPIES;            // 512
 
     for (int c = threadIdx.x; c < TOTAL; c += THREADS_PER_BLOCK) {
         if (c < A_COPIES) {
@@ -115,7 +115,7 @@ __device__ __forceinline__ void load_int8_tile_async(
     }
 }
 
-// ── INT8 WMMA GEMM kernel ───────────────────────────────────────────────
+// ── INT8 WMMA GEMM → FP16 output ───────────────────────────────────────
 // C (FP16) = dequant( A (INT8) × B (INT8) )
 //   real[i,j] = int32_acc[i,j] * scale_A * scale_B   [+ GELU]
 template <bool apply_gelu>
@@ -134,21 +134,24 @@ __global__ void gemm_int8_wmma_kernel(
 
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
-    const int warp_m  = warp_id / WARP_COL_GROUPS;
-    const int warp_ng = warp_id % WARP_COL_GROUPS;
+    const int warp_m  = warp_id / WARP_COL_GROUPS;   // 0..3
+    const int warp_ng = warp_id % WARP_COL_GROUPS;   // 0..1
 
     const int block_m = blockIdx.y * BLOCK_M;
     const int block_n = blockIdx.x * BLOCK_N;
-    const int tile_m  = block_m + warp_m * WMMA_M;
-    const int tile_n0 = block_n + warp_ng * WARP_COL_TILES * WMMA_N;
-    const int tile_n1 = tile_n0 + WMMA_N;
 
-    wmma::fragment<wmma::matrix_a,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> b_frag0, b_frag1;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int32_t> acc0, acc1;
-    wmma::fill_fragment(acc0, (int32_t)0);
-    wmma::fill_fragment(acc1, (int32_t)0);
+    // Fragments: 2 row tiles × 4 col tiles per warp = 8 MMAs per K-step
+    wmma::fragment<wmma::matrix_a,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> a_frag[WARP_ROW_TILES];
+    wmma::fragment<wmma::matrix_b,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> b_frag[WARP_COL_TILES];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int32_t> acc[WARP_ROW_TILES][WARP_COL_TILES];
 
+    #pragma unroll
+    for (int rt = 0; rt < WARP_ROW_TILES; rt++)
+        #pragma unroll
+        for (int ct = 0; ct < WARP_COL_TILES; ct++)
+            wmma::fill_fragment(acc[rt][ct], (int32_t)0);
+
+    // Double-buffered K-loop
     int stage = 0;
     load_int8_tile_async(A, B, sA[0], sB[0], block_m, block_n, 0, K, N);
     i8_cp_async_commit();
@@ -167,14 +170,23 @@ __global__ void gemm_int8_wmma_kernel(
 
         #pragma unroll
         for (int kk = 0; kk < STAGE_K; kk += WMMA_K) {
-            const int8_t* a_ptr  = sA[stage] + warp_m * WMMA_M * A_SMEM_STRIDE + kk;
-            const int8_t* b_ptr0 = sB[stage] + kk * B_SMEM_STRIDE + warp_ng * WARP_COL_TILES * WMMA_N;
-            const int8_t* b_ptr1 = b_ptr0 + WMMA_N;
-            wmma::load_matrix_sync(a_frag,  a_ptr,  A_SMEM_STRIDE);
-            wmma::load_matrix_sync(b_frag0, b_ptr0, B_SMEM_STRIDE);
-            wmma::load_matrix_sync(b_frag1, b_ptr1, B_SMEM_STRIDE);
-            wmma::mma_sync(acc0, a_frag, b_frag0, acc0);
-            wmma::mma_sync(acc1, a_frag, b_frag1, acc1);
+            #pragma unroll
+            for (int rt = 0; rt < WARP_ROW_TILES; rt++) {
+                const int8_t* a_ptr = sA[stage]
+                    + (warp_m * WARP_ROW_TILES + rt) * WMMA_M * A_SMEM_STRIDE + kk;
+                wmma::load_matrix_sync(a_frag[rt], a_ptr, A_SMEM_STRIDE);
+            }
+            #pragma unroll
+            for (int ct = 0; ct < WARP_COL_TILES; ct++) {
+                const int8_t* b_ptr = sB[stage]
+                    + kk * B_SMEM_STRIDE + (warp_ng * WARP_COL_TILES + ct) * WMMA_N;
+                wmma::load_matrix_sync(b_frag[ct], b_ptr, B_SMEM_STRIDE);
+            }
+            #pragma unroll
+            for (int rt = 0; rt < WARP_ROW_TILES; rt++)
+                #pragma unroll
+                for (int ct = 0; ct < WARP_COL_TILES; ct++)
+                    wmma::mma_sync(acc[rt][ct], a_frag[rt], b_frag[ct], acc[rt][ct]);
         }
 
         __syncthreads();
@@ -182,20 +194,32 @@ __global__ void gemm_int8_wmma_kernel(
     }
 
     // Epilogue: INT32 → float → ×scale → [GELU] → FP16
-    int32_t* c0 = c_smem + warp_id * WARP_COL_TILES * WMMA_M * WMMA_N;
-    int32_t* c1 = c0 + WMMA_M * WMMA_N;
-    wmma::store_matrix_sync(c0, acc0, WMMA_N, wmma::mem_row_major);
-    wmma::store_matrix_sync(c1, acc1, WMMA_N, wmma::mem_row_major);
-    __syncwarp();
+    // Process one row tile at a time — reuses c_smem across iterations
+    int32_t* c_base = c_smem + warp_id * WARP_COL_TILES * WMMA_M * WMMA_N;
 
     #pragma unroll
-    for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
-        const int r = i / WMMA_N, c = i % WMMA_N;
-        float v0 = (float)c0[i] * scale;
-        float v1 = (float)c1[i] * scale;
-        if (apply_gelu) { v0 = int8_gelu(v0); v1 = int8_gelu(v1); }
-        C[(tile_m + r) * N + (tile_n0 + c)] = __float2half_rn(v0);
-        C[(tile_m + r) * N + (tile_n1 + c)] = __float2half_rn(v1);
+    for (int rt = 0; rt < WARP_ROW_TILES; rt++) {
+        #pragma unroll
+        for (int ct = 0; ct < WARP_COL_TILES; ct++)
+            wmma::store_matrix_sync(c_base + ct * WMMA_M * WMMA_N,
+                                    acc[rt][ct], WMMA_N, wmma::mem_row_major);
+        __syncwarp();
+
+        const int row_base = block_m + (warp_m * WARP_ROW_TILES + rt) * WMMA_M;
+        const int col_base = block_n + warp_ng * WARP_COL_TILES * WMMA_N;
+
+        #pragma unroll
+        for (int ct = 0; ct < WARP_COL_TILES; ct++) {
+            int32_t* cp = c_base + ct * WMMA_M * WMMA_N;
+            const int tile_col = col_base + ct * WMMA_N;
+            #pragma unroll
+            for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
+                const int r = i / WMMA_N, c = i % WMMA_N;
+                float v = (float)cp[i] * scale;
+                if (apply_gelu) v = int8_gelu(v);
+                C[(row_base + r) * N + (tile_col + c)] = __float2half_rn(v);
+            }
+        }
     }
 }
 
@@ -243,15 +267,16 @@ __global__ void gemm_int8_wmma_i8_kernel(
 
     const int block_m = blockIdx.y * BLOCK_M;
     const int block_n = blockIdx.x * BLOCK_N;
-    const int tile_m  = block_m + warp_m * WMMA_M;
-    const int tile_n0 = block_n + warp_ng * WARP_COL_TILES * WMMA_N;
-    const int tile_n1 = tile_n0 + WMMA_N;
 
-    wmma::fragment<wmma::matrix_a,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> b_frag0, b_frag1;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int32_t> acc0, acc1;
-    wmma::fill_fragment(acc0, (int32_t)0);
-    wmma::fill_fragment(acc1, (int32_t)0);
+    wmma::fragment<wmma::matrix_a,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> a_frag[WARP_ROW_TILES];
+    wmma::fragment<wmma::matrix_b,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> b_frag[WARP_COL_TILES];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int32_t> acc[WARP_ROW_TILES][WARP_COL_TILES];
+
+    #pragma unroll
+    for (int rt = 0; rt < WARP_ROW_TILES; rt++)
+        #pragma unroll
+        for (int ct = 0; ct < WARP_COL_TILES; ct++)
+            wmma::fill_fragment(acc[rt][ct], (int32_t)0);
 
     int stage = 0;
     load_int8_tile_async(A, B, sA[0], sB[0], block_m, block_n, 0, K, N);
@@ -269,34 +294,54 @@ __global__ void gemm_int8_wmma_i8_kernel(
         }
         #pragma unroll
         for (int kk = 0; kk < STAGE_K; kk += WMMA_K) {
-            const int8_t* a_ptr  = sA[stage] + warp_m * WMMA_M * A_SMEM_STRIDE + kk;
-            const int8_t* b_ptr0 = sB[stage] + kk * B_SMEM_STRIDE + warp_ng * WARP_COL_TILES * WMMA_N;
-            const int8_t* b_ptr1 = b_ptr0 + WMMA_N;
-            wmma::load_matrix_sync(a_frag,  a_ptr,  A_SMEM_STRIDE);
-            wmma::load_matrix_sync(b_frag0, b_ptr0, B_SMEM_STRIDE);
-            wmma::load_matrix_sync(b_frag1, b_ptr1, B_SMEM_STRIDE);
-            wmma::mma_sync(acc0, a_frag, b_frag0, acc0);
-            wmma::mma_sync(acc1, a_frag, b_frag1, acc1);
+            #pragma unroll
+            for (int rt = 0; rt < WARP_ROW_TILES; rt++) {
+                const int8_t* a_ptr = sA[stage]
+                    + (warp_m * WARP_ROW_TILES + rt) * WMMA_M * A_SMEM_STRIDE + kk;
+                wmma::load_matrix_sync(a_frag[rt], a_ptr, A_SMEM_STRIDE);
+            }
+            #pragma unroll
+            for (int ct = 0; ct < WARP_COL_TILES; ct++) {
+                const int8_t* b_ptr = sB[stage]
+                    + kk * B_SMEM_STRIDE + (warp_ng * WARP_COL_TILES + ct) * WMMA_N;
+                wmma::load_matrix_sync(b_frag[ct], b_ptr, B_SMEM_STRIDE);
+            }
+            #pragma unroll
+            for (int rt = 0; rt < WARP_ROW_TILES; rt++)
+                #pragma unroll
+                for (int ct = 0; ct < WARP_COL_TILES; ct++)
+                    wmma::mma_sync(acc[rt][ct], a_frag[rt], b_frag[ct], acc[rt][ct]);
         }
         __syncthreads();
         stage = next_s;
     }
 
     // Epilogue: INT32 → float → ×scale → [GELU] → INT8
-    int32_t* c0 = c_smem + warp_id * WARP_COL_TILES * WMMA_M * WMMA_N;
-    int32_t* c1 = c0 + WMMA_M * WMMA_N;
-    wmma::store_matrix_sync(c0, acc0, WMMA_N, wmma::mem_row_major);
-    wmma::store_matrix_sync(c1, acc1, WMMA_N, wmma::mem_row_major);
-    __syncwarp();
+    int32_t* c_base = c_smem + warp_id * WARP_COL_TILES * WMMA_M * WMMA_N;
 
     #pragma unroll
-    for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
-        const int r = i / WMMA_N, c = i % WMMA_N;
-        float v0 = (float)c0[i] * scale;
-        float v1 = (float)c1[i] * scale;
-        if (apply_gelu) { v0 = int8_gelu(v0); v1 = int8_gelu(v1); }
-        C[(tile_m + r) * N + (tile_n0 + c)] = f32_to_i8(v0, inv_scale);
-        C[(tile_m + r) * N + (tile_n1 + c)] = f32_to_i8(v1, inv_scale);
+    for (int rt = 0; rt < WARP_ROW_TILES; rt++) {
+        #pragma unroll
+        for (int ct = 0; ct < WARP_COL_TILES; ct++)
+            wmma::store_matrix_sync(c_base + ct * WMMA_M * WMMA_N,
+                                    acc[rt][ct], WMMA_N, wmma::mem_row_major);
+        __syncwarp();
+
+        const int row_base = block_m + (warp_m * WARP_ROW_TILES + rt) * WMMA_M;
+        const int col_base = block_n + warp_ng * WARP_COL_TILES * WMMA_N;
+
+        #pragma unroll
+        for (int ct = 0; ct < WARP_COL_TILES; ct++) {
+            int32_t* cp = c_base + ct * WMMA_M * WMMA_N;
+            const int tile_col = col_base + ct * WMMA_N;
+            #pragma unroll
+            for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
+                const int r = i / WMMA_N, c = i % WMMA_N;
+                float v = (float)cp[i] * scale;
+                if (apply_gelu) v = int8_gelu(v);
+                C[(row_base + r) * N + (tile_col + c)] = f32_to_i8(v, inv_scale);
+            }
+        }
     }
 }
 

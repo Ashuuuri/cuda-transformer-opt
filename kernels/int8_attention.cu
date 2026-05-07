@@ -177,13 +177,21 @@ void int8_wmma_attention_kernel(
     // Per-token K scales for current KV tile (needed for per-element QK^T scaling)
     float*  s_scale_K = (float*)(s_scores + ATTN_TILE_Q * ss);
 
-    // Load Q tile as INT8.
-    for (int idx = tid; idx < ATTN_TILE_Q * head_dim; idx += ATTN_BDIM) {
-        const int row = idx / head_dim, col = idx % head_dim;
-        const int qi  = qi_base + row;
-        s_Q_i8[row * ks_i8 + col] = (qi < seq_len)
-            ? Q[((size_t)bh * seq_len + qi) * head_dim + col]
-            : (int8_t)0;
+    // Load Q tile as INT8 (vectorized 16-byte loads).
+    // head_dim is always a multiple of 16, so we can use int4 (128-bit) loads.
+    {
+        const int q_vecs = ATTN_TILE_Q * head_dim / 16;  // total 16-byte chunks
+        const int4 zero4 = make_int4(0, 0, 0, 0);
+        for (int vi = tid; vi < q_vecs; vi += ATTN_BDIM) {
+            const int byte_off = vi * 16;
+            const int row = byte_off / head_dim;
+            const int col = byte_off % head_dim;
+            const int qi  = qi_base + row;
+            int4 val = (qi < seq_len)
+                ? *reinterpret_cast<const int4*>(&Q[((size_t)bh * seq_len + qi) * head_dim + col])
+                : zero4;
+            *reinterpret_cast<int4*>(&s_Q_i8[row * ks_i8 + col]) = val;
+        }
     }
 
     // Load per-token Q scales for the rows this warp handles.
@@ -221,15 +229,30 @@ void int8_wmma_attention_kernel(
         const int kv_tile_start = t * ATTN_TILE_KV;
         const size_t kv_base = ((size_t)bh * seq_len + kv_tile_start) * head_dim;
 
-        // Load K (INT8) + V (dequant to FP16 with per-row scale) in one pass.
-        // V scales read via __ldg (L1 cached, only TILE_KV unique values).
+        // Load K (INT8) + V (dequant to FP16) — vectorized 16-byte loads.
         const size_t scale_base = (size_t)bh * seq_len + kv_tile_start;
-        for (int idx = tid; idx < ATTN_TILE_KV * head_dim; idx += ATTN_BDIM) {
-            const int row = idx / head_dim, col = idx % head_dim;
-            const size_t off = kv_base + row * head_dim + col;
-            s_K_i8[row * ks_i8 + col] = K[off];
-            float sv = __ldg(&d_scale_V[scale_base + row]);
-            s_V_fp16[row * vs + col] = __float2half((float)V[off] * sv);
+        {
+            const int kv_vecs = ATTN_TILE_KV * head_dim / 16;
+            for (int vi = tid; vi < kv_vecs; vi += ATTN_BDIM) {
+                const int byte_off = vi * 16;
+                const int row = byte_off / head_dim;
+                const int col = byte_off % head_dim;
+                const size_t goff = kv_base + row * head_dim + col;
+                // K: 16-byte vectorized load + store to padded smem
+                *reinterpret_cast<int4*>(&s_K_i8[row * ks_i8 + col]) =
+                    *reinterpret_cast<const int4*>(&K[goff]);
+                // V: 16-byte vectorized load, per-row dequant, write FP16
+                int4 v_vec = *reinterpret_cast<const int4*>(&V[goff]);
+                const float sv = __ldg(&d_scale_V[scale_base + row]);
+                const int8_t* vb = reinterpret_cast<const int8_t*>(&v_vec);
+                half* vdst = &s_V_fp16[row * vs + col];
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    reinterpret_cast<half2*>(vdst)[i] = __halves2half2(
+                        __float2half((float)vb[2*i]     * sv),
+                        __float2half((float)vb[2*i + 1] * sv));
+                }
+            }
         }
         // Load per-token K scales to smem (needed for per-element QK^T scaling)
         for (int idx = tid; idx < ATTN_TILE_KV; idx += ATTN_BDIM) {
@@ -240,8 +263,10 @@ void int8_wmma_attention_kernel(
         // QK^T via INT8 WMMA -> INT32 accumulator.
         fragment<accumulator, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int32_t>
             frag_qk[ATTN_TILE_KV / ATTN_WMMA_N];
+        #pragma unroll
         for (int g = 0; g < n_kv_groups; ++g) {
             fill_fragment(frag_qk[g], (int32_t)0);
+            #pragma unroll 4
             for (int k = 0; k < head_dim; k += ATTN_WMMA_K) {
                 fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, row_major> fq;
                 fragment<matrix_b, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, col_major> fk;
@@ -329,6 +354,7 @@ void int8_wmma_attention_kernel(
         __syncwarp();
         for (int s = 0; s < n_slices; ++s) {
             const int d_base = s * ATTN_WMMA_N;
+            #pragma unroll
             for (int k = 0; k < ATTN_TILE_KV; k += ATTN_WMMA_K) {
                 fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, half, row_major> fw;
                 fragment<matrix_b, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, half, row_major> fv;

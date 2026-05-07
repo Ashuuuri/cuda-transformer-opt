@@ -165,19 +165,14 @@ void int8_wmma_attention_kernel(
     const int vs = head_dim + ATTN_SMEM_PAD;      // V row stride
     const int ss = ATTN_TILE_KV + ATTN_SMEM_PAD;  // scores row stride
 
-    // Smem layout (double-buffered K, V, K_scales):
-    //   [Q INT8] [K0 INT8][K1 INT8] [V0 FP16][V1 FP16] [scores FP16] [Ksc0 float][Ksc1 float]
-    int8_t* s_Q_i8  = (int8_t*) smem_raw;
-    int8_t* s_K_i8[2];
-    s_K_i8[0] = s_Q_i8 + ATTN_TILE_Q * ks_i8;
-    s_K_i8[1] = s_K_i8[0] + ATTN_TILE_KV * ks_i8;
-    half* s_V_fp16[2];
-    s_V_fp16[0] = (half*)(s_K_i8[1] + ATTN_TILE_KV * ks_i8);
-    s_V_fp16[1] = s_V_fp16[0] + ATTN_TILE_KV * vs;
-    half* s_scores = s_V_fp16[1] + ATTN_TILE_KV * vs;
-    float* s_scale_K[2];
-    s_scale_K[0] = (float*)(s_scores + ATTN_TILE_Q * ss);
-    s_scale_K[1] = s_scale_K[0] + ATTN_TILE_KV;
+    // Smem layout: [Q INT8][K INT8][V FP16][scores FP16][K_scales float]
+    // V scales are read directly from global via __ldg (L1 cached, only TILE_KV unique values).
+    int8_t* s_Q_i8   = (int8_t*) smem_raw;
+    int8_t* s_K_i8   = s_Q_i8 + ATTN_TILE_Q  * ks_i8;
+    half*   s_V_fp16 = (half*)(s_K_i8 + ATTN_TILE_KV * ks_i8);
+    half*   s_scores = s_V_fp16 + ATTN_TILE_KV * vs;
+    // Per-token K scales for current KV tile (needed for per-element QK^T scaling)
+    float*  s_scale_K = (float*)(s_scores + ATTN_TILE_Q * ss);
 
     // Load Q tile as INT8.
     for (int idx = tid; idx < ATTN_TILE_Q * head_dim; idx += ATTN_BDIM) {
@@ -215,46 +210,29 @@ void int8_wmma_attention_kernel(
     fragment<accumulator, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, float> frag_out[ATTN_MAX_SLICES];
     for (int s = 0; s < n_slices; ++s) fill_fragment(frag_out[s], 0.f);
 
-    // ── Double-buffered KV tile loop ──────────────────────────────────
-    // Pre-load tile 0 into buffer 0.
-    {
-        const size_t kv_base = ((size_t)bh * seq_len) * head_dim;
-        const size_t sc_base = (size_t)bh * seq_len;
-        for (int idx = tid; idx < ATTN_TILE_KV * head_dim; idx += ATTN_BDIM) {
-            const int row = idx / head_dim, col = idx % head_dim;
-            const size_t off = kv_base + row * head_dim + col;
-            s_K_i8[0][row * ks_i8 + col] = K[off];
-            float sv = __ldg(&d_scale_V[sc_base + row]);
-            s_V_fp16[0][row * vs + col] = __float2half((float)V[off] * sv);
-        }
-        for (int idx = tid; idx < ATTN_TILE_KV; idx += ATTN_BDIM)
-            s_scale_K[0][idx] = __ldg(&d_scale_K[sc_base + idx]);
-    }
     __syncthreads();
 
     const int num_tiles = seq_len / ATTN_TILE_KV;
 
     for (int t = 0; t < num_tiles; ++t) {
-        const int cur = t & 1;
-        const int nxt = 1 - cur;
+        const int kv_tile_start = t * ATTN_TILE_KV;
+        const size_t kv_base = ((size_t)bh * seq_len + kv_tile_start) * head_dim;
 
-        // ── Prefetch next tile into buf[nxt] (overlaps with compute below) ──
-        if (t + 1 < num_tiles) {
-            const int nxt_start = (t + 1) * ATTN_TILE_KV;
-            const size_t nxt_kv = ((size_t)bh * seq_len + nxt_start) * head_dim;
-            const size_t nxt_sc = (size_t)bh * seq_len + nxt_start;
-            for (int idx = tid; idx < ATTN_TILE_KV * head_dim; idx += ATTN_BDIM) {
-                const int row = idx / head_dim, col = idx % head_dim;
-                const size_t off = nxt_kv + row * head_dim + col;
-                s_K_i8[nxt][row * ks_i8 + col] = K[off];
-                float sv = __ldg(&d_scale_V[nxt_sc + row]);
-                s_V_fp16[nxt][row * vs + col] = __float2half((float)V[off] * sv);
-            }
-            for (int idx = tid; idx < ATTN_TILE_KV; idx += ATTN_BDIM)
-                s_scale_K[nxt][idx] = __ldg(&d_scale_K[nxt_sc + idx]);
+        // Load K (INT8) + V (dequant to FP16 with per-row scale) in one pass.
+        // V scales read via __ldg (L1 cached, only TILE_KV unique values).
+        const size_t scale_base = (size_t)bh * seq_len + kv_tile_start;
+        for (int idx = tid; idx < ATTN_TILE_KV * head_dim; idx += ATTN_BDIM) {
+            const int row = idx / head_dim, col = idx % head_dim;
+            const size_t off = kv_base + row * head_dim + col;
+            s_K_i8[row * ks_i8 + col] = K[off];
+            float sv = __ldg(&d_scale_V[scale_base + row]);
+            s_V_fp16[row * vs + col] = __float2half((float)V[off] * sv);
         }
-
-        // ── Compute with buf[cur] ──────────────────────────────────────
+        // Load per-token K scales to smem (needed for per-element QK^T scaling)
+        for (int idx = tid; idx < ATTN_TILE_KV; idx += ATTN_BDIM) {
+            s_scale_K[idx] = __ldg(&d_scale_K[scale_base + idx]);
+        }
+        __syncthreads();
 
         // QK^T via INT8 WMMA -> INT32 accumulator.
         fragment<accumulator, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int32_t>
@@ -265,21 +243,32 @@ void int8_wmma_attention_kernel(
                 fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, row_major> fq;
                 fragment<matrix_b, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, col_major> fk;
                 load_matrix_sync(fq, s_Q_i8 + warp_id * ATTN_WMMA_M * ks_i8 + k, ks_i8);
-                load_matrix_sync(fk, s_K_i8[cur] + g * ATTN_WMMA_N * ks_i8 + k,  ks_i8);
+                load_matrix_sync(fk, s_K_i8 + g * ATTN_WMMA_N * ks_i8 + k,       ks_i8);
                 mma_sync(frag_qk[g], fq, fk, frag_qk[g]);
             }
         }
 
-        // Per-element scaling: (sQ * attn_scale)[row] * sK[col]
+        // Cast INT32 accumulators to float with per-element scaling.
+        // Element mapping (m16n16k16 accumulator on sm_80):
+        //   x[0]: row=frow0, col=g*16+fcol_lo
+        //   x[1]: row=frow0, col=g*16+fcol_lo+1
+        //   x[2]: row=frow1, col=g*16+fcol_lo
+        //   x[3]: row=frow1, col=g*16+fcol_lo+1
+        //   x[4]: row=frow0, col=g*16+fcol_lo+8
+        //   x[5]: row=frow0, col=g*16+fcol_lo+9
+        //   x[6]: row=frow1, col=g*16+fcol_lo+8
+        //   x[7]: row=frow1, col=g*16+fcol_lo+9
         float sf[ATTN_TILE_KV / ATTN_WMMA_N][8];
         float lmax0 = -1e38f, lmax1 = -1e38f;
         for (int g = 0; g < n_kv_groups; ++g) {
+            // Per-token K scales for the columns this thread touches
             const int kc_base = g * ATTN_WMMA_N;
-            float sK_c0 = s_scale_K[cur][kc_base + fcol_lo];
-            float sK_c1 = s_scale_K[cur][kc_base + fcol_lo + 1];
-            float sK_c8 = s_scale_K[cur][kc_base + fcol_lo + 8];
-            float sK_c9 = s_scale_K[cur][kc_base + fcol_lo + 9];
+            float sK_c0 = s_scale_K[kc_base + fcol_lo];
+            float sK_c1 = s_scale_K[kc_base + fcol_lo + 1];
+            float sK_c8 = s_scale_K[kc_base + fcol_lo + 8];
+            float sK_c9 = s_scale_K[kc_base + fcol_lo + 9];
 
+            // scale = (sQ * attn_scale)[row] * sK[col]  — attn_scale pre-folded into r_sQ
             sf[g][0] = (float)frag_qk[g].x[0] * r_sQ0 * sK_c0;
             sf[g][1] = (float)frag_qk[g].x[1] * r_sQ0 * sK_c1;
             sf[g][2] = (float)frag_qk[g].x[2] * r_sQ1 * sK_c0;
@@ -292,6 +281,7 @@ void int8_wmma_attention_kernel(
             lmax0 = fmaxf(lmax0, fmaxf(fmaxf(sf[g][0],sf[g][1]), fmaxf(sf[g][4],sf[g][5])));
             lmax1 = fmaxf(lmax1, fmaxf(fmaxf(sf[g][2],sf[g][3]), fmaxf(sf[g][6],sf[g][7])));
         }
+        // Reduce max across threads sharing the same row (lanes with same lane/4).
         lmax0 = fmaxf(lmax0, __shfl_xor_sync(0xffffffff, lmax0, 1));
         lmax0 = fmaxf(lmax0, __shfl_xor_sync(0xffffffff, lmax0, 2));
         lmax1 = fmaxf(lmax1, __shfl_xor_sync(0xffffffff, lmax1, 1));
@@ -332,7 +322,7 @@ void int8_wmma_attention_kernel(
         lsum1 += __shfl_xor_sync(0xffffffff, lsum1, 2);
         rsum0 += lsum0;  rsum1 += lsum1;
 
-        // attn x V via FP16 WMMA.
+        // attn x V via FP16 WMMA (s_V_fp16 already dequantized per-row).
         __syncwarp();
         for (int s = 0; s < n_slices; ++s) {
             const int d_base = s * ATTN_WMMA_N;
@@ -340,12 +330,11 @@ void int8_wmma_attention_kernel(
                 fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, half, row_major> fw;
                 fragment<matrix_b, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, half, row_major> fv;
                 load_matrix_sync(fw, s_scores + warp_id * ATTN_WMMA_M * ss + k, ss);
-                load_matrix_sync(fv, s_V_fp16[cur] + k * vs + d_base,           vs);
+                load_matrix_sync(fv, s_V_fp16 + k * vs + d_base,                vs);
                 mma_sync(frag_out[s], fw, fv, frag_out[s]);
             }
         }
-
-        __syncthreads();  // buf[nxt] loads done + buf[cur] compute done
+        __syncthreads();
     }
 
     // Normalize and write FP16 output.
@@ -388,13 +377,12 @@ void int8_attention_forward(
     if (head_dim % ATTN_WMMA_K == 0 && seq_len % ATTN_TILE_KV == 0) {
         const int BH = batch * heads;
         dim3 grid((seq_len + ATTN_TILE_Q - 1) / ATTN_TILE_Q, BH);
-        // Smem: Q(INT8) + K×2(INT8) + V×2(FP16) + scores(FP16) + K_scales×2(float)
+        // Smem: Q(INT8) + K(INT8) + V(FP16) + scores(FP16) + K_scales(float)
         const size_t smem =
-            (size_t) ATTN_TILE_Q  * head_dim * sizeof(int8_t) +                        // Q (single)
-            (size_t) 2 * ATTN_TILE_KV * head_dim * sizeof(int8_t) +                    // K (double)
-            (size_t) 2 * ATTN_TILE_KV * (head_dim + ATTN_SMEM_PAD) * sizeof(half) +   // V (double)
-            (size_t) ATTN_TILE_Q  * (ATTN_TILE_KV + ATTN_SMEM_PAD) * sizeof(half) +   // scores (single)
-            (size_t) 2 * ATTN_TILE_KV * sizeof(float);                                 // K_scales (double)
+            (size_t)(ATTN_TILE_Q + ATTN_TILE_KV) * head_dim * sizeof(int8_t) +
+            (size_t) ATTN_TILE_KV * (head_dim + ATTN_SMEM_PAD) * sizeof(half) +
+            (size_t) ATTN_TILE_Q  * (ATTN_TILE_KV + ATTN_SMEM_PAD) * sizeof(half) +
+            (size_t) ATTN_TILE_KV * sizeof(float);  // K_scales only
         cudaFuncSetAttribute(int8_wmma_attention_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         int8_wmma_attention_kernel<<<grid, ATTN_BDIM, smem>>>(

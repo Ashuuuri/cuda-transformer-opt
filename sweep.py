@@ -176,10 +176,27 @@ def attn_hbm_unfused(batch, heads, seq_len, head_dim):
 #  INT8 quantisation helper
 # ══════════════════════════════════════════════════════════════════════════
 def quantize_to_int8(t):
+    """Per-tensor symmetric quantization."""
     t_f   = t.float()
     scale = t_f.abs().max() / 127.0
     t_i8  = (t_f / scale).round().clamp(-128, 127).to(torch.int8)
     return t_i8, scale
+
+
+def quantize_per_token(t):
+    """Per-token symmetric quantization for attention Q/K/V.
+
+    Input:  (batch, heads, seq_len, head_dim)
+    Returns:
+        t_int8: (batch, heads, seq_len, head_dim) torch.int8
+        scales: (batch, heads, seq_len) torch.float32
+    """
+    t_f = t.float()
+    abs_max = t_f.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    scales = abs_max / 127.0
+    t_i8 = (t_f / scales).round().clamp(-128, 127).to(torch.int8)
+    scales = scales.squeeze(-1)
+    return t_i8, scales
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -263,17 +280,22 @@ def bench_int8_attn(ext, batch, seq_len, d_model):
     K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
     V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
 
-    Q_i8, sQ = quantize_to_int8(Q)
-    K_i8, sK = quantize_to_int8(K)
-    V_i8, sV = quantize_to_int8(V)
-    Q_deq = Q_i8.float().mul(sQ).half()
-    K_deq = K_i8.float().mul(sK).half()
-    V_deq = V_i8.float().mul(sV).half()
+    # Per-token quantization for attention
+    Q_i8, sQ = quantize_per_token(Q)
+    K_i8, sK = quantize_per_token(K)
+    V_i8, sV = quantize_per_token(V)
+    Q_deq = (Q_i8.float() * sQ.unsqueeze(-1)).half()
+    K_deq = (K_i8.float() * sK.unsqueeze(-1)).half()
+    V_deq = (V_i8.float() * sV.unsqueeze(-1)).half()
 
     attn_ext = load_attention_ext()
 
+    sQ_c = sQ.contiguous().cuda()
+    sK_c = sK.contiguous().cuda()
+    sV_c = sV.contiguous().cuda()
+
     def run_int8():
-        ext.int8_attention_forward(Q_i8, K_i8, V_i8, float(sQ), float(sK), float(sV))
+        ext.int8_attention_forward(Q_i8, K_i8, V_i8, sQ_c, sK_c, sV_c)
 
     kernel_ms  = benchmark(run_int8)
     fp16_wm_ms = benchmark(attn_ext.attention_forward, Q_deq, K_deq, V_deq)

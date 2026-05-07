@@ -141,12 +141,7 @@ using namespace nvcuda::wmma;
 // Maximum head_dim supported = ATTN_WMMA_N * ATTN_MAX_SLICES = 16 * 16 = 256.
 #define ATTN_MAX_SLICES 16
 
-// Template on MIN_BLOCKS for __launch_bounds__:
-//   head_dim ≤ 64  → 4 blocks/SM (low register pressure, ~150 regs/thread)
-//   head_dim ≤ 128 → 3 blocks/SM (~180 regs/thread)
-//   head_dim > 128 → 2 blocks/SM (high register pressure, ~220 regs/thread)
-template<int MIN_BLOCKS>
-__global__ __launch_bounds__(ATTN_BDIM, MIN_BLOCKS)
+__global__ __launch_bounds__(ATTN_BDIM, 2)
 void int8_wmma_attention_kernel(
     const int8_t* __restrict__ Q,
     const int8_t* __restrict__ K,
@@ -419,30 +414,11 @@ void int8_attention_forward(
             (size_t) ATTN_TILE_KV * (head_dim + ATTN_SMEM_PAD) * sizeof(half) +
             (size_t) ATTN_TILE_Q  * (ATTN_TILE_KV + ATTN_SMEM_PAD) * sizeof(half) +
             (size_t) ATTN_TILE_KV * sizeof(float);  // K_scales only
-        // Select kernel variant by head_dim: higher occupancy for smaller head_dim.
-        // A100: 65536 regs/SM, 164 KB smem/SM.
-        //   head_dim ≤ 64:  smem ~18KB → 4 blocks fit, regs ~150 → OK at 128 regs/thread
-        //   head_dim ≤ 128: smem ~34KB → 3 blocks fit, regs ~180 → OK at 170 regs/thread
-        //   head_dim > 128: smem ~48KB → 2 blocks max, regs ~220
-        if (head_dim <= 64) {
-            cudaFuncSetAttribute(int8_wmma_attention_kernel<4>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-            int8_wmma_attention_kernel<4><<<grid, ATTN_BDIM, smem>>>(
-                Q, K, V, out, scale_Q, scale_K, scale_V,
-                seq_len, head_dim, attn_scale);
-        } else if (head_dim <= 128) {
-            cudaFuncSetAttribute(int8_wmma_attention_kernel<3>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-            int8_wmma_attention_kernel<3><<<grid, ATTN_BDIM, smem>>>(
-                Q, K, V, out, scale_Q, scale_K, scale_V,
-                seq_len, head_dim, attn_scale);
-        } else {
-            cudaFuncSetAttribute(int8_wmma_attention_kernel<2>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-            int8_wmma_attention_kernel<2><<<grid, ATTN_BDIM, smem>>>(
-                Q, K, V, out, scale_Q, scale_K, scale_V,
-                seq_len, head_dim, attn_scale);
-        }
+        cudaFuncSetAttribute(int8_wmma_attention_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        int8_wmma_attention_kernel<<<grid, ATTN_BDIM, smem>>>(
+            Q, K, V, out, scale_Q, scale_K, scale_V,
+            seq_len, head_dim, attn_scale);
         return;
     }
 #endif

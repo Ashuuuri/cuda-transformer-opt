@@ -697,9 +697,14 @@ def main():
             t0  = time.perf_counter()
             row = cfg["bench_fn"](ext, BATCH, seq_len, d_model)
             elapsed = time.perf_counter() - t0
+            extra = ""
+            if "naive_pytorch_ms" in row and row["naive_pytorch_ms"] is not None:
+                cublas_ms = row["naive_pytorch_ms"]
+                extra = f"  cuBLAS={cublas_ms:.2f}ms  vs_cuBLAS={cublas_ms/row['kernel_ms']:.2f}×"
             print(f"kernel={row['kernel_ms']:.2f}ms  "
                   f"naive={row['naive_ms']:.2f}ms  "
-                  f"speedup={row['speedup_vs_naive']:.2f}×  "
+                  f"speedup={row['speedup_vs_naive']:.2f}×"
+                  f"{extra}  "
                   f"({elapsed:.1f}s)")
             rows.append(row)
 

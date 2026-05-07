@@ -272,15 +272,15 @@ Analysis:
 ## 3f. Sweep: INT8 Attention after Opt #9 (TILE_KV=64 single-buffer)
 
 Commit: `6bda4f4` — TILE_KV 32→64 with single-buffer smem. Reverted double-buffer (doesn't fit 2 blocks/SM at head_dim=256 with TILE_KV=64). Simple load→sync→compute→sync loop.
-Baseline: Naive PyTorch (cuBLAS) `torch.nn.functional.scaled_dot_product_attention`
+Baseline: Jonathan's FP16 WMMA attention kernel (`attention_ext`)
 batch=8, heads=8, head_dim = d_model/8
 
-### Results Table (vs Naive PyTorch)
+### Results Table (vs FP16 WMMA)
 
-| d_model | seq_len | INT8 (ms) | Naive PyTorch (ms) | Speedup vs PyTorch |
-|---------|---------|-----------|-------------------|-------------------|
+| d_model | seq_len | INT8 (ms) | FP16 WMMA (ms) | Speedup vs FP16 WMMA |
+|---------|---------|-----------|----------------|---------------------|
 | 512 | 512 | 0.14 | 0.24 | **1.71x** |
-| 512 | 1024 | 0.47 | 0.81 | **1.75x** (was ~2x Opt#8) |
+| 512 | 1024 | 0.47 | 0.81 | **1.75x** |
 | 512 | 2048 | 1.24 | 2.33 | **1.88x** |
 | 512 | 4096 | 4.68 | 8.92 | **1.91x** |
 | 1024 | 512 | 0.21 | 0.39 | **1.85x** |
@@ -294,8 +294,8 @@ batch=8, heads=8, head_dim = d_model/8
 
 ### Summary by d_model (head_dim)
 
-| head_dim | Speedup vs Naive PyTorch | vs Opt #8 absolute time |
-|----------|------------------------|------------------------|
+| head_dim | Speedup vs FP16 WMMA | vs Opt #8 absolute time |
+|----------|---------------------|------------------------|
 | 64 (d=512) | **1.71–1.91x** | kernel 33-38% faster (e.g. 7.53→4.68ms at seq=4096) |
 | 128 (d=1024) | **1.85–1.98x** | kernel 38-41% faster (e.g. 15.56→9.12ms at seq=4096) |
 | 256 (d=2048) | **2.11–2.33x** | kernel 34-42% faster (e.g. 32.10→18.60ms at seq=4096) |
@@ -312,20 +312,20 @@ batch=8, heads=8, head_dim = d_model/8
 
 **Key insight:** for this kernel, doing 2x more useful compute per tile matters more than overlapping loads with compute. The load latency is partially hidden by the larger compute workload per tile naturally.
 
-**vs Naive PyTorch:** now **beats cuBLAS across ALL configurations** (1.71–2.33x). The fused kernel's advantage (no intermediate HBM writes for S matrix) is fully realized with enough compute per tile to amortize the sequential KV processing.
+**vs FP16 WMMA:** now **beats FP16 WMMA across ALL configurations** (1.71–2.33x). INT8 2x TOPS advantage fully realized with enough compute per tile.
 
 ---
 
 ## 3g. Sweep: INT8 Attention after Opt #10 (template TILE_KV=128 for head_dim≤128)
 
 Commit: `f43b3a4` — TILE_KV is now a template parameter: 128 for head_dim≤128 (smem ≤82KB, fits 2 blocks/SM), 64 for head_dim=256 (unchanged).
-Baseline: Naive PyTorch (cuBLAS) `torch.nn.functional.scaled_dot_product_attention`
+Baseline: Jonathan's FP16 WMMA attention kernel (`attention_ext`)
 batch=8, heads=8, head_dim = d_model/8
 
-### Results Table (vs Naive PyTorch)
+### Results Table (vs FP16 WMMA)
 
-| d_model | seq_len | INT8 (ms) | Naive PyTorch (ms) | Speedup vs PyTorch |
-|---------|---------|-----------|-------------------|-------------------|
+| d_model | seq_len | INT8 (ms) | FP16 WMMA (ms) | Speedup vs FP16 WMMA |
+|---------|---------|-----------|----------------|---------------------|
 | 512 | 512 | 0.12 | 0.24 | **1.97x** |
 | 512 | 1024 | 0.40 | 0.82 | **2.05x** |
 | 512 | 2048 | 1.21 | 2.35 | **1.94x** |
@@ -341,8 +341,8 @@ batch=8, heads=8, head_dim = d_model/8
 
 ### Summary by d_model (head_dim)
 
-| head_dim | Speedup range | vs Opt #9 |
-|----------|--------------|-----------|
+| head_dim | Speedup vs FP16 WMMA | vs Opt #9 |
+|----------|---------------------|-----------|
 | 64 (d=512) | **1.94–2.25x** | was 1.71–1.91x (kernel 3-15% faster) |
 | 128 (d=1024) | **1.92–2.22x** | was 1.85–1.98x (kernel 5-10% faster) |
 | 256 (d=2048) | **2.10–2.32x** | unchanged (same TILE_KV=64 path) |
@@ -351,7 +351,31 @@ batch=8, heads=8, head_dim = d_model/8
 
 TILE_KV=128 benefits head_dim=64/128 by halving tile iterations (32 tiles at seq=4096 instead of 64), increasing n_kv_groups from 4 to 8, and doubling attn×V WMMA k-steps per slice. The overhead amortization effect is diminishing (32→64 gave 35-40%, 64→128 gives 5-15%) but still significant.
 
-All 12 configs now ≥1.92x vs Naive PyTorch, with 10 out of 12 exceeding 2x.
+All 12 configs now ≥1.92x vs FP16 WMMA, with 10 out of 12 exceeding 2x.
+
+### vs cuBLAS Naive Attention (from attention_sweep.csv)
+
+The speedup numbers above are vs Jonathan's FP16 WMMA kernel, NOT cuBLAS. The true comparison vs cuBLAS (`attention_baseline`, i.e. `torch.matmul` QK^T + softmax + matmul AV):
+
+| d_model | seq_len | INT8 (ms) | cuBLAS naive (ms) | INT8 vs cuBLAS |
+|---------|---------|-----------|-------------------|----------------|
+| 512 | 512 | 0.12 | 0.25 | **2.11x** ✓ |
+| 512 | 1024 | 0.40 | 0.80 | **2.01x** ✓ |
+| 512 | 2048 | 1.21 | 2.85 | **2.36x** ✓ |
+| 512 | 4096 | 4.00 | 12.75 | **3.19x** ✓ |
+| 1024 | 512 | 0.21 | 0.25 | **1.17x** ✓ |
+| 1024 | 1024 | 0.62 | 0.81 | **1.30x** ✓ |
+| 1024 | 2048 | 2.24 | 3.06 | **1.37x** ✓ |
+| 1024 | 4096 | 8.17 | 13.47 | **1.65x** ✓ |
+| 2048 | 512 | 0.45 | 0.27 | 0.61x ✗ |
+| 2048 | 1024 | 1.36 | 0.92 | 0.68x ✗ |
+| 2048 | 2048 | 4.99 | 3.48 | 0.70x ✗ |
+| 2048 | 4096 | 18.72 | 15.34 | 0.82x ✗ |
+
+cuBLAS numbers from `results/attention_sweep.csv` (same hardware, different run date).
+
+**d_model=512/1024: INT8 crushes cuBLAS** (1.17–3.19x). Fused kernel avoids S×S HBM write.
+**d_model=2048: cuBLAS wins** (1.22–1.65x). cuBLAS can fully parallelize large GEMMs at head_dim=256, while our kernel processes KV tiles sequentially. Gap narrows with seq_len (S×S HBM cost grows quadratically).
 
 ---
 
@@ -371,10 +395,10 @@ All vs Jonathan's FP16 WMMA kernel.
 | Opt #7: template launch_bounds | — | — | — (reverted, no improvement) |
 | Opt #8a: INT8 attn×V + V-scale fold | — | — | 0.82x (reverted, regression) |
 | **Opt #8: double-buffer cp.async** | **1.11–1.19x** | **1.12–1.16x** | **1.35–1.40x** |
-| **Opt #9: TILE_KV=64 single-buf** | **1.71–1.91x** ★ | **1.85–1.98x** ★ | **2.11–2.33x** ★ |
-| **Opt #10: template TILE_KV=128** | **1.94–2.25x** ★ | **1.92–2.22x** ★ | **2.10–2.32x** ★ |
+| **Opt #9: TILE_KV=64 single-buf** | **1.71–1.91x** | **1.85–1.98x** | **2.11–2.33x** |
+| **Opt #10: template TILE_KV=128** | **1.94–2.25x** | **1.92–2.22x** | **2.10–2.32x** |
 
-★ Opt #9+ measured vs Naive PyTorch (cuBLAS), not FP16 WMMA.
+All measured vs Jonathan's FP16 WMMA kernel. vs cuBLAS naive attention: d_model=512 up to 3.19x ✓, d_model=1024 up to 1.65x ✓, d_model=2048 loses 0.61–0.82x ✗.
 
 Key improvements:
 - Opt #3: head_dim=256 from 0.20x to 0.58x (smem 87KB → 36KB, occupancy 1 → 4 blocks/SM)
@@ -428,8 +452,10 @@ Per-token fixes OPT-6.7B precision: 0.984 → 0.9999.
 8. INT8 advantage grows with d_model for MLP (0.58x → 0.69x) — better arithmetic intensity amortizes overhead
 9. Double-buffering (Opt #8): cp.async hides K load latency → head_dim=256 from 1.23–1.35x to **1.35–1.40x**
 10. V-scale folding (Opt #8a) was a dead end: TILE_KV=32 too small for INT8 attn×V to benefit from 2x TOPS
-11. **TILE_KV=64 (Opt #9): the biggest single improvement** — simple single-buffer outperforms complex double-buffer by 35-40%. Larger tiles = more compute per load, fewer iterations, less overhead. Beats Naive PyTorch (cuBLAS) **1.71–2.33x across ALL configs**.
+11. **TILE_KV=64 (Opt #9): the biggest single improvement** — simple single-buffer outperforms complex double-buffer by 35-40%. Larger tiles = more compute per load, fewer iterations, less overhead. **1.71–2.33x vs FP16 WMMA across ALL configs**.
 12. Lesson: doing more useful work per tile matters more than overlapping loads with compute via complex pipelines
-13. Template TILE_KV (Opt #10): larger tiles for smaller head_dims where smem allows — head_dim=64/128 up to 2.25x
-14. Full optimization journey: 0.15x → **2.33x** at head_dim=256, **2.25x** at head_dim=64 (**15.5x improvement** through 10 optimization steps)
-15. **All 12 sweep configs ≥1.92x vs Naive PyTorch**, 10 out of 12 exceed 2x
+13. Template TILE_KV (Opt #10): larger tiles for smaller head_dims where smem allows — head_dim=64/128 up to 2.25x vs FP16 WMMA
+14. Full optimization journey vs FP16 WMMA: 0.15x → **2.33x** at head_dim=256, **2.25x** at head_dim=64 (**15.5x improvement** through 10 optimization steps)
+15. **All 12 sweep configs ≥1.92x vs FP16 WMMA**, 10 out of 12 exceed 2x
+16. vs cuBLAS naive attention: **d_model=512 beats cuBLAS up to 3.19x, d_model=1024 up to 1.65x**; d_model=2048 still loses (0.61–0.82x) due to cuBLAS's advantage in parallelizing large head_dim=256 GEMMs
+17. Fused kernel's advantage (no S×S HBM write) grows quadratically with seq_len — at d_model=2048 the gap narrows from 0.61x (seq=512) to 0.82x (seq=4096)

@@ -11,7 +11,8 @@
 //   WMMA path  (INT8_ATTN_WMMA=1, default):
 //     Q,K in smem as INT8 → INT8 WMMA for QK^T (INT32 accum)
 //     Per-element scale, online softmax, FP16 WMMA for attn×V
-//     Template TILE_KV: 128 for head_dim≤128 (2 blocks/SM), 64 for head_dim=256.
+//     Template TILE_KV: 128 for all head_dims (2 blocks/SM if smem≤82KB, else 1 block/SM).
+//     Fallback to 64 if seq_len not divisible by 128.
 //
 //   Scalar path (INT8_ATTN_WMMA=0, or non-aligned dims):
 //     Same algorithm, loop-based dot products.
@@ -401,19 +402,31 @@ void int8_attention_forward(
                    (size_t)tile_kv * sizeof(float);                // K_scales
         };
 
-        // Try TILE_KV=128 first (head_dim≤128: fits 2 blocks/SM, halves tile count).
-        // Max smem per block for 2 blocks/SM on A100 = 164KB/2 = 82KB.
+        // Try TILE_KV=128 first (halves tile count → less loop overhead).
         const size_t smem_128 = calc_smem(128);
-        if (seq_len % 128 == 0 && smem_128 <= 82000) {
-            cudaFuncSetAttribute(int8_wmma_attention_kernel<128>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_128);
-            int8_wmma_attention_kernel<128><<<grid, ATTN_BDIM, smem_128>>>(
-                Q, K, V, out, scale_Q, scale_K, scale_V,
-                seq_len, head_dim, attn_scale);
-            return;
+        if (seq_len % 128 == 0) {
+            if (smem_128 <= 82000) {
+                // Fits 2 blocks/SM (82KB per block, total 164KB).
+                cudaFuncSetAttribute(int8_wmma_attention_kernel<128>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_128);
+                int8_wmma_attention_kernel<128><<<grid, ATTN_BDIM, smem_128>>>(
+                    Q, K, V, out, scale_Q, scale_K, scale_V,
+                    seq_len, head_dim, attn_scale);
+                return;
+            }
+            if (smem_128 <= 163000) {
+                // Fits 1 block/SM (max ~163KB dynamic smem on A100).
+                // head_dim=256: smem_128≈135KB → 1 block/SM but halves tile count.
+                cudaFuncSetAttribute(int8_wmma_attention_kernel<128>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_128);
+                int8_wmma_attention_kernel<128><<<grid, ATTN_BDIM, smem_128>>>(
+                    Q, K, V, out, scale_Q, scale_K, scale_V,
+                    seq_len, head_dim, attn_scale);
+                return;
+            }
         }
 
-        // Fallback: TILE_KV=64 (always fits 2 blocks/SM up to head_dim=256).
+        // Fallback: TILE_KV=64 (fits 2 blocks/SM up to head_dim=256, 78KB).
         if (seq_len % 64 == 0) {
             const size_t smem_64 = calc_smem(64);
             cudaFuncSetAttribute(int8_wmma_attention_kernel<64>,

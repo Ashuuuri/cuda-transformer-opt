@@ -4,14 +4,13 @@
 // Per-token symmetric quantization:
 //   Each token row has its own scale factor → scale arrays of size [batch*heads*seq_len].
 //   QK^T element [i][j] = int32_acc * scale_Q[i] * scale_K[j] * attn_scale
-//   V stays INT8 — its per-token scale is folded into softmax weights before quantization.
-//   Softmax weights × v_scale → quantize per-row → INT8 WMMA for attn×V.
-//   Output is FP16: int32_acc × w_scale[q] / softmax_sum.
+//   V dequant row r: V_fp16[r][c] = V_int8[r][c] * scale_V[r]
+//   Output is FP16 (can't factor out a single scale from weighted V rows).
 //
 // Two paths:
 //   WMMA path  (INT8_ATTN_WMMA=1, default):
-//     Full INT8 pipeline: INT8 WMMA for both QK^T and attn×V (2x TOPS).
-//     V-scale folding eliminates FP16 dequant, keeps V in INT8 throughout.
+//     Q,K in smem as INT8 → INT8 WMMA for QK^T (INT32 accum)
+//     Per-element scale, online softmax, FP16 WMMA for attn×V
 //
 //   Scalar path (INT8_ATTN_WMMA=0, or non-aligned dims):
 //     Same algorithm, loop-based dot products.
@@ -165,17 +164,18 @@ void int8_wmma_attention_kernel(
     // Without padding, head_dim=256 → stride 256 bytes → 256%128=0 → all rows hit same banks.
     // With +16 bytes, stride=272 → 272%128=16 → rows cycle through different bank sets.
     const int ks_i8 = head_dim + ATTN_I8_PAD;
-    // INT8 scores row stride (V-scale-folded quantized softmax weights).
-    const int ss_i8 = ATTN_TILE_KV + ATTN_I8_PAD;
+    // FP16 strides (in half elements).
+    const int vs = head_dim + ATTN_SMEM_PAD;      // V row stride
+    const int ss = ATTN_TILE_KV + ATTN_SMEM_PAD;  // scores row stride
 
-    // Smem layout: [Q INT8][K INT8][V INT8][scores INT8][K_scales float][V_scales float]
-    // V stays INT8 throughout — its scale is folded into softmax weights before quantization.
-    int8_t* s_Q_i8      = (int8_t*) smem_raw;
-    int8_t* s_K_i8      = s_Q_i8 + ATTN_TILE_Q  * ks_i8;
-    int8_t* s_V_i8      = s_K_i8 + ATTN_TILE_KV * ks_i8;
-    int8_t* s_scores_i8 = s_V_i8 + ATTN_TILE_KV * ks_i8;
-    float*  s_scale_K   = (float*)(s_scores_i8 + ATTN_TILE_Q * ss_i8);
-    float*  s_scale_V   = s_scale_K + ATTN_TILE_KV;
+    // Smem layout: [Q INT8][K INT8][V FP16][scores FP16][K_scales float]
+    // V scales are read directly from global via __ldg (L1 cached, only TILE_KV unique values).
+    int8_t* s_Q_i8   = (int8_t*) smem_raw;
+    int8_t* s_K_i8   = s_Q_i8 + ATTN_TILE_Q  * ks_i8;
+    half*   s_V_fp16 = (half*)(s_K_i8 + ATTN_TILE_KV * ks_i8);
+    half*   s_scores = s_V_fp16 + ATTN_TILE_KV * vs;
+    // Per-token K scales for current KV tile (needed for per-element QK^T scaling)
+    float*  s_scale_K = (float*)(s_scores + ATTN_TILE_Q * ss);
 
     // Load Q tile as INT8 (vectorized 16-byte loads).
     // head_dim is always a multiple of 16, so we can use int4 (128-bit) loads.
@@ -229,8 +229,7 @@ void int8_wmma_attention_kernel(
         const int kv_tile_start = t * ATTN_TILE_KV;
         const size_t kv_base = ((size_t)bh * seq_len + kv_tile_start) * head_dim;
 
-        // Load K + V (both INT8, no dequant) — vectorized 16-byte loads.
-        // V scale is folded into softmax weights later, so V stays raw INT8.
+        // Load K (INT8) + V (dequant to FP16) — vectorized 16-byte loads.
         const size_t scale_base = (size_t)bh * seq_len + kv_tile_start;
         {
             const int kv_vecs = ATTN_TILE_KV * head_dim / 16;
@@ -239,18 +238,25 @@ void int8_wmma_attention_kernel(
                 const int row = byte_off / head_dim;
                 const int col = byte_off % head_dim;
                 const size_t goff = kv_base + row * head_dim + col;
-                // K: vectorized load to padded smem
+                // K: 16-byte vectorized load + store to padded smem
                 *reinterpret_cast<int4*>(&s_K_i8[row * ks_i8 + col]) =
                     *reinterpret_cast<const int4*>(&K[goff]);
-                // V: vectorized load to padded smem (no dequant needed!)
-                *reinterpret_cast<int4*>(&s_V_i8[row * ks_i8 + col]) =
-                    *reinterpret_cast<const int4*>(&V[goff]);
+                // V: 16-byte vectorized load, per-row dequant, write FP16
+                int4 v_vec = *reinterpret_cast<const int4*>(&V[goff]);
+                const float sv = __ldg(&d_scale_V[scale_base + row]);
+                const int8_t* vb = reinterpret_cast<const int8_t*>(&v_vec);
+                half* vdst = &s_V_fp16[row * vs + col];
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    reinterpret_cast<half2*>(vdst)[i] = __halves2half2(
+                        __float2half((float)vb[2*i]     * sv),
+                        __float2half((float)vb[2*i + 1] * sv));
+                }
             }
         }
-        // Load per-token K and V scales to smem
+        // Load per-token K scales to smem (needed for per-element QK^T scaling)
         for (int idx = tid; idx < ATTN_TILE_KV; idx += ATTN_BDIM) {
             s_scale_K[idx] = __ldg(&d_scale_K[scale_base + idx]);
-            s_scale_V[idx] = __ldg(&d_scale_V[scale_base + idx]);
         }
         __syncthreads();
 
@@ -272,13 +278,18 @@ void int8_wmma_attention_kernel(
 
         // Cast INT32 accumulators to float with per-element scaling.
         // Element mapping (m16n16k16 accumulator on sm_80):
-        //   x[0]: row=frow0, col=g*16+fcol_lo      x[1]: row=frow0, col=g*16+fcol_lo+1
-        //   x[2]: row=frow1, col=g*16+fcol_lo       x[3]: row=frow1, col=g*16+fcol_lo+1
-        //   x[4]: row=frow0, col=g*16+fcol_lo+8     x[5]: row=frow0, col=g*16+fcol_lo+9
-        //   x[6]: row=frow1, col=g*16+fcol_lo+8     x[7]: row=frow1, col=g*16+fcol_lo+9
+        //   x[0]: row=frow0, col=g*16+fcol_lo
+        //   x[1]: row=frow0, col=g*16+fcol_lo+1
+        //   x[2]: row=frow1, col=g*16+fcol_lo
+        //   x[3]: row=frow1, col=g*16+fcol_lo+1
+        //   x[4]: row=frow0, col=g*16+fcol_lo+8
+        //   x[5]: row=frow0, col=g*16+fcol_lo+9
+        //   x[6]: row=frow1, col=g*16+fcol_lo+8
+        //   x[7]: row=frow1, col=g*16+fcol_lo+9
         float sf[ATTN_TILE_KV / ATTN_WMMA_N][8];
         float lmax0 = -1e38f, lmax1 = -1e38f;
         for (int g = 0; g < n_kv_groups; ++g) {
+            // Per-token K scales for the columns this thread touches
             const int kc_base = g * ATTN_WMMA_N;
             float sK_c0 = s_scale_K[kc_base + fcol_lo];
             float sK_c1 = s_scale_K[kc_base + fcol_lo + 1];
@@ -316,100 +327,41 @@ void int8_wmma_attention_kernel(
             frag_out[s].x[6]*=corr1; frag_out[s].x[7]*=corr1;
         }
 
-        // ── V-scale folding + per-row INT8 quantization of softmax weights ──
-        // w_scaled[q,k] = exp(score[q,k] - rmax) * v_scale[k]
-        // Then quantize per-row: w_i8 = round(w_scaled * 127 / row_max)
-        // This folds V's per-token scale into the weights, so attn×V can be pure INT8.
+        // Softmax weights -> s_scores (FP16, for attn x V WMMA).
         float lsum0 = 0.f, lsum1 = 0.f;
-        float wmax0 = 0.f, wmax1 = 0.f;
-        float ws0[8], ws1[8];   // V-scale-folded weights (registers, 2 groups × 4 elems)
-
         for (int g = 0; g < n_kv_groups; ++g) {
-            const int kc_base = g * ATTN_WMMA_N;
-            // V scales for the columns this thread touches
-            float sV_c0 = s_scale_V[kc_base + fcol_lo];
-            float sV_c1 = s_scale_V[kc_base + fcol_lo + 1];
-            float sV_c8 = s_scale_V[kc_base + fcol_lo + 8];
-            float sV_c9 = s_scale_V[kc_base + fcol_lo + 9];
-
-            // Row 0: compute exp weights, accumulate softmax sum, fold V scale
-            float w0 = __expf(sf[g][0] - rmax0), w1 = __expf(sf[g][1] - rmax0);
-            float w8 = __expf(sf[g][4] - rmax0), w9 = __expf(sf[g][5] - rmax0);
-            lsum0 += w0 + w1 + w8 + w9;
-            ws0[g*4+0] = w0 * sV_c0;  ws0[g*4+1] = w1 * sV_c1;
-            ws0[g*4+2] = w8 * sV_c8;  ws0[g*4+3] = w9 * sV_c9;
-            wmax0 = fmaxf(wmax0, fmaxf(fmaxf(ws0[g*4],ws0[g*4+1]),
-                                        fmaxf(ws0[g*4+2],ws0[g*4+3])));
-
-            // Row 1
-            float u0 = __expf(sf[g][2] - rmax1), u1 = __expf(sf[g][3] - rmax1);
-            float u8 = __expf(sf[g][6] - rmax1), u9 = __expf(sf[g][7] - rmax1);
-            lsum1 += u0 + u1 + u8 + u9;
-            ws1[g*4+0] = u0 * sV_c0;  ws1[g*4+1] = u1 * sV_c1;
-            ws1[g*4+2] = u8 * sV_c8;  ws1[g*4+3] = u9 * sV_c9;
-            wmax1 = fmaxf(wmax1, fmaxf(fmaxf(ws1[g*4],ws1[g*4+1]),
-                                        fmaxf(ws1[g*4+2],ws1[g*4+3])));
+            const int qr0 = warp_id * ATTN_WMMA_M + frow0;
+            const int qr1 = warp_id * ATTN_WMMA_M + frow1;
+            const int kc  = g * ATTN_WMMA_N + fcol_lo;
+            const float w0=__expf(sf[g][0]-rmax0), w1=__expf(sf[g][1]-rmax0);
+            const float w8=__expf(sf[g][4]-rmax0), w9=__expf(sf[g][5]-rmax0);
+            lsum0 += w0+w1+w8+w9;
+            s_scores[qr0*ss+kc]=__float2half(w0); s_scores[qr0*ss+kc+1]=__float2half(w1);
+            s_scores[qr0*ss+kc+8]=__float2half(w8); s_scores[qr0*ss+kc+9]=__float2half(w9);
+            const float u0=__expf(sf[g][2]-rmax1), u1=__expf(sf[g][3]-rmax1);
+            const float u8=__expf(sf[g][6]-rmax1), u9=__expf(sf[g][7]-rmax1);
+            lsum1 += u0+u1+u8+u9;
+            s_scores[qr1*ss+kc]=__float2half(u0); s_scores[qr1*ss+kc+1]=__float2half(u1);
+            s_scores[qr1*ss+kc+8]=__float2half(u8); s_scores[qr1*ss+kc+9]=__float2half(u9);
         }
-
-        // Reduce softmax sums across threads sharing same row
         lsum0 += __shfl_xor_sync(0xffffffff, lsum0, 1);
         lsum0 += __shfl_xor_sync(0xffffffff, lsum0, 2);
         lsum1 += __shfl_xor_sync(0xffffffff, lsum1, 1);
         lsum1 += __shfl_xor_sync(0xffffffff, lsum1, 2);
         rsum0 += lsum0;  rsum1 += lsum1;
 
-        // Reduce wmax across threads sharing same row (for per-row quantization scale)
-        wmax0 = fmaxf(wmax0, __shfl_xor_sync(0xffffffff, wmax0, 1));
-        wmax0 = fmaxf(wmax0, __shfl_xor_sync(0xffffffff, wmax0, 2));
-        wmax1 = fmaxf(wmax1, __shfl_xor_sync(0xffffffff, wmax1, 1));
-        wmax1 = fmaxf(wmax1, __shfl_xor_sync(0xffffffff, wmax1, 2));
-
-        // Per-row quantization scale (saved for dequant after INT8 attn×V)
-        const float r_wscale0 = fmaxf(wmax0, 1e-10f) / 127.f;
-        const float r_wscale1 = fmaxf(wmax1, 1e-10f) / 127.f;
-        const float inv_ws0 = 1.f / r_wscale0;
-        const float inv_ws1 = 1.f / r_wscale1;
-
-        // Write quantized INT8 weights to smem
-        for (int g = 0; g < n_kv_groups; ++g) {
-            const int qr0 = warp_id * ATTN_WMMA_M + frow0;
-            const int qr1 = warp_id * ATTN_WMMA_M + frow1;
-            const int kc  = g * ATTN_WMMA_N + fcol_lo;
-            s_scores_i8[qr0*ss_i8+kc]   = (int8_t)__float2int_rn(fminf(127.f, ws0[g*4+0]*inv_ws0));
-            s_scores_i8[qr0*ss_i8+kc+1] = (int8_t)__float2int_rn(fminf(127.f, ws0[g*4+1]*inv_ws0));
-            s_scores_i8[qr0*ss_i8+kc+8] = (int8_t)__float2int_rn(fminf(127.f, ws0[g*4+2]*inv_ws0));
-            s_scores_i8[qr0*ss_i8+kc+9] = (int8_t)__float2int_rn(fminf(127.f, ws0[g*4+3]*inv_ws0));
-            s_scores_i8[qr1*ss_i8+kc]   = (int8_t)__float2int_rn(fminf(127.f, ws1[g*4+0]*inv_ws1));
-            s_scores_i8[qr1*ss_i8+kc+1] = (int8_t)__float2int_rn(fminf(127.f, ws1[g*4+1]*inv_ws1));
-            s_scores_i8[qr1*ss_i8+kc+8] = (int8_t)__float2int_rn(fminf(127.f, ws1[g*4+2]*inv_ws1));
-            s_scores_i8[qr1*ss_i8+kc+9] = (int8_t)__float2int_rn(fminf(127.f, ws1[g*4+3]*inv_ws1));
-        }
-
-        // ── attn×V via INT8 WMMA → INT32 accumulator ────────────────────
-        // Both A (quantized weights) and B (raw V) are INT8.
-        // Dequant: frag_out[s] += int32_acc × r_wscale (per-query-row scale).
+        // attn x V via FP16 WMMA (s_V_fp16 already dequantized per-row).
         __syncwarp();
         for (int s = 0; s < n_slices; ++s) {
             const int d_base = s * ATTN_WMMA_N;
-            fragment<accumulator, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int32_t> frag_av;
-            fill_fragment(frag_av, (int32_t)0);
             #pragma unroll
             for (int k = 0; k < ATTN_TILE_KV; k += ATTN_WMMA_K) {
-                fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, row_major> fw;
-                fragment<matrix_b, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, row_major> fv;
-                load_matrix_sync(fw, s_scores_i8 + warp_id * ATTN_WMMA_M * ss_i8 + k, ss_i8);
-                load_matrix_sync(fv, s_V_i8 + k * ks_i8 + d_base,                      ks_i8);
-                mma_sync(frag_av, fw, fv, frag_av);
+                fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, half, row_major> fw;
+                fragment<matrix_b, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, half, row_major> fv;
+                load_matrix_sync(fw, s_scores + warp_id * ATTN_WMMA_M * ss + k, ss);
+                load_matrix_sync(fv, s_V_fp16 + k * vs + d_base,                vs);
+                mma_sync(frag_out[s], fw, fv, frag_out[s]);
             }
-            // Convert INT32 → float and accumulate with per-row weight scale
-            frag_out[s].x[0] += (float)frag_av.x[0] * r_wscale0;
-            frag_out[s].x[1] += (float)frag_av.x[1] * r_wscale0;
-            frag_out[s].x[2] += (float)frag_av.x[2] * r_wscale1;
-            frag_out[s].x[3] += (float)frag_av.x[3] * r_wscale1;
-            frag_out[s].x[4] += (float)frag_av.x[4] * r_wscale0;
-            frag_out[s].x[5] += (float)frag_av.x[5] * r_wscale0;
-            frag_out[s].x[6] += (float)frag_av.x[6] * r_wscale1;
-            frag_out[s].x[7] += (float)frag_av.x[7] * r_wscale1;
         }
         __syncthreads();
     }
@@ -454,16 +406,14 @@ void int8_attention_forward(
     if (head_dim % ATTN_WMMA_K == 0 && seq_len % ATTN_TILE_KV == 0) {
         const int BH = batch * heads;
         dim3 grid((seq_len + ATTN_TILE_Q - 1) / ATTN_TILE_Q, BH);
-        // Smem: Q(INT8) + K(INT8) + V(INT8) + scores(INT8) + K_scales(float) + V_scales(float)
+        // Smem: Q(INT8 padded) + K(INT8 padded) + V(FP16) + scores(FP16) + K_scales(float)
         const int ks_i8_host = head_dim + ATTN_I8_PAD;
-        const int ss_i8_host = ATTN_TILE_KV + ATTN_I8_PAD;
         const size_t smem =
-            (size_t) ATTN_TILE_Q  * ks_i8_host * sizeof(int8_t) +   // Q
-            (size_t) ATTN_TILE_KV * ks_i8_host * sizeof(int8_t) +   // K
-            (size_t) ATTN_TILE_KV * ks_i8_host * sizeof(int8_t) +   // V (INT8, not FP16!)
-            (size_t) ATTN_TILE_Q  * ss_i8_host * sizeof(int8_t) +   // scores (INT8 quantized weights)
-            (size_t) ATTN_TILE_KV * sizeof(float) +                  // K_scales
-            (size_t) ATTN_TILE_KV * sizeof(float);                   // V_scales
+            (size_t) ATTN_TILE_Q  * ks_i8_host * sizeof(int8_t) +
+            (size_t) ATTN_TILE_KV * ks_i8_host * sizeof(int8_t) +
+            (size_t) ATTN_TILE_KV * (head_dim + ATTN_SMEM_PAD) * sizeof(half) +
+            (size_t) ATTN_TILE_Q  * (ATTN_TILE_KV + ATTN_SMEM_PAD) * sizeof(half) +
+            (size_t) ATTN_TILE_KV * sizeof(float);  // K_scales only
         cudaFuncSetAttribute(int8_wmma_attention_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         int8_wmma_attention_kernel<<<grid, ATTN_BDIM, smem>>>(

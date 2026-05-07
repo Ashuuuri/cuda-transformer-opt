@@ -556,7 +556,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
             ax.plot(seqs, [r[col] for r in sub],
                     marker=mrk_map[lbl], color=col_map[lbl],
                     label=lbl, linewidth=2, markersize=6)
-        ax.set_title(f"d_model={dm}  d_ff={dm*4}", fontsize=11)
+        ax.set_title(dm_short(dm), fontsize=11)
         ax.set_xlabel("Sequence length")
         ax.set_ylabel("Latency (ms)")
         ax.set_xticks(seqs)

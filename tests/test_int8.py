@@ -1,12 +1,20 @@
-"""Test harness for INT8 attention + MLP kernels — Heling.
+# -*- coding: utf-8 -*-
+"""Test harness for INT8 attention + MLP kernels - Heling.
 
 Usage:
-    python tests/test_int8.py
+    python tests/test_int8.py              # full test (correctness + benchmark)
+    python tests/test_int8.py --quick      # correctness only, all head_dims
+    python tests/test_int8.py --head-dim 256  # test specific head_dim only
 
-Runs correctness checks against dequantized FP16 baseline, then benchmarks
-against FP16 baseline and cuBLAS INT8 (torch._int_mm).
+Attention uses per-token symmetric quantization (each token row has its own scale).
+MLP still uses per-tensor quantization.
+
+Correctness:
+  Reference = dequantized FP16 attention (per-token dequant -> FP16 matmuls).
+  INT8 kernel output is FP16 (no dequant needed on the Python side).
 """
 
+import argparse
 import os
 import sys
 import torch
@@ -22,12 +30,33 @@ A100_FP16_TFLOPS = 312.0
 A100_INT8_TOPS = 624.0
 
 
+# ── Per-tensor quantization (MLP still uses this) ──────────────────────
 def quantize_to_int8(t):
     """Per-tensor symmetric quantization to INT8."""
     t_f = t.float()
     scale = t_f.abs().max() / 127.0
     t_int8 = (t_f / scale).round().clamp(-128, 127).to(torch.int8)
     return t_int8, scale
+
+
+# ── Per-token quantization (attention uses this) ──────────────────────
+def quantize_per_token(t):
+    """Per-token symmetric quantization to INT8.
+
+    Each token row (last dim = head_dim) gets its own scale factor.
+    Input:  (batch, heads, seq_len, head_dim)
+    Returns:
+        t_int8: (batch, heads, seq_len, head_dim) torch.int8
+        scales: (batch, heads, seq_len) torch.float32  (one scale per row)
+    """
+    t_f = t.float()
+    # abs max along last dim -> [batch, heads, seq_len, 1]
+    abs_max = t_f.abs().amax(dim=-1, keepdim=True)
+    abs_max = abs_max.clamp(min=1e-8)
+    scales = abs_max / 127.0                        # [batch, heads, seq_len, 1]
+    t_int8 = (t_f / scales).round().clamp(-128, 127).to(torch.int8)
+    scales = scales.squeeze(-1)                      # [batch, heads, seq_len]
+    return t_int8, scales
 
 
 def compute_attention_flops(batch, heads, seq_len, head_dim):
@@ -41,90 +70,225 @@ def compute_mlp_flops(batch, seq_len, d_model, d_ff):
     return 2 * tokens * d_model * d_ff + 2 * tokens * d_ff * d_model
 
 
-def main():
-    check_cuda()
+# ── Multi-config correctness ──────────────────────────────────────────
+ATTN_CONFIGS = [
+    # (batch, heads, seq_len, head_dim, description)
+    (2, 8, 512,  64,  "head_dim=64  (d_model=512)"),
+    (2, 8, 512,  128, "head_dim=128 (d_model=1024)"),
+    (2, 8, 512,  256, "head_dim=256 (d_model=2048) [Opt#3 target]"),
+    (2, 8, 1024, 64,  "head_dim=64  seq=1024"),
+    (2, 8, 1024, 128, "head_dim=128 seq=1024"),
+    (2, 8, 1024, 256, "head_dim=256 seq=1024 [Opt#3 target]"),
+]
+
+
+def test_attention_correctness(int8_ext, configs=None):
+    """Run attention correctness across multiple configs. Returns (n_pass, n_total)."""
+    if configs is None:
+        configs = ATTN_CONFIGS
 
     device = "cuda"
     dtype = torch.float16
-    batch, heads, seq_len, head_dim = 2, 8, 512, 64
-    d_model, d_ff = 512, 2048
+    n_pass = 0
+
+    for batch, heads, seq_len, head_dim, desc in configs:
+        torch.manual_seed(42)
+        Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+        K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+        V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+
+        # Per-token quantization
+        Q_i8, sQ = quantize_per_token(Q)   # sQ: [batch, heads, seq_len]
+        K_i8, sK = quantize_per_token(K)
+        V_i8, sV = quantize_per_token(V)
+
+        # Reference: dequant per-token, then FP16 attention
+        Q_deq = (Q_i8.float() * sQ.unsqueeze(-1)).half()   # broadcast [b,h,s,1] * [b,h,s,d]
+        K_deq = (K_i8.float() * sK.unsqueeze(-1)).half()
+        V_deq = (V_i8.float() * sV.unsqueeze(-1)).half()
+        ref = attention_baseline(Q_deq, K_deq, V_deq)
+
+        # INT8 kernel — scales passed as CUDA float tensors
+        # The kernel expects flat [batch*heads*seq_len] scales
+        out = int8_ext.int8_attention_forward(
+            Q_i8, K_i8, V_i8,
+            sQ.contiguous().cuda(),
+            sK.contiguous().cuda(),
+            sV.contiguous().cuda())
+
+        passed = check_correctness(ref, out, label=f"int8_attn_pertoken [{desc}]", mode="int8")
+        if passed:
+            n_pass += 1
+
+    return n_pass, len(configs)
+
+
+def test_mlp_correctness(int8_ext):
+    """Run MLP correctness check (still per-tensor). Returns True if passed."""
+    device = "cuda"
+    dtype = torch.float16
+    batch, seq_len, d_model, d_ff = 2, 512, 512, 2048
 
     torch.manual_seed(42)
-
-    # ── Prepare FP16 inputs ─────────────────────────────────────────────
-    Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-    K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-    V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-
-    x = torch.randn(batch, seq_len, d_model, device=device, dtype=dtype)
+    x  = torch.randn(batch, seq_len, d_model, device=device, dtype=dtype)
     W1 = torch.randn(d_model, d_ff, device=device, dtype=dtype) * 0.02
     W2 = torch.randn(d_ff, d_model, device=device, dtype=dtype) * 0.02
 
-    # ── Quantize ────────────────────────────────────────────────────────
-    Q_int8, scale_Q = quantize_to_int8(Q)
-    K_int8, scale_K = quantize_to_int8(K)
-    V_int8, scale_V = quantize_to_int8(V)
+    x_i8, sx   = quantize_to_int8(x)
+    W1_i8, sW1 = quantize_to_int8(W1)
+    W2_i8, sW2 = quantize_to_int8(W2)
 
-    x_int8, scale_x = quantize_to_int8(x)
-    W1_int8, scale_W1 = quantize_to_int8(W1)
-    W2_int8, scale_W2 = quantize_to_int8(W2)
+    x_deq  = (x_i8.float() * sx).half()
+    W1_deq = (W1_i8.float() * sW1).half()
+    W2_deq = (W2_i8.float() * sW2).half()
+    ref = mlp_baseline(x_deq, W1_deq, W2_deq)
 
-    # ── INT8 reference: dequant → FP16 baseline ────────────────────────
-    Q_deq = (Q_int8.float() * scale_Q).half()
-    K_deq = (K_int8.float() * scale_K).half()
-    V_deq = (V_int8.float() * scale_V).half()
-    attn_ref = attention_baseline(Q_deq, K_deq, V_deq)
+    out_i8, out_scale = int8_ext.int8_mlp_forward(
+        x_i8, W1_i8, W2_i8, float(sx), float(sW1), float(sW2))
+    out = (out_i8.float() * out_scale).half()
 
-    x_deq = (x_int8.float() * scale_x).half()
-    W1_deq = (W1_int8.float() * scale_W1).half()
-    W2_deq = (W2_int8.float() * scale_W2).half()
-    mlp_ref = mlp_baseline(x_deq, W1_deq, W2_deq)
+    return check_correctness(ref, out, label="int8_mlp", mode="int8")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="INT8 kernel correctness & benchmark")
+    parser.add_argument("--quick", action="store_true",
+                        help="Correctness only (skip benchmark)")
+    parser.add_argument("--head-dim", type=int, default=None,
+                        help="Test only this head_dim (64, 128, or 256)")
+    args = parser.parse_args()
+
+    check_cuda()
+
+    # ── Load INT8 CUDA kernels ───────────────────────────────────────────
+    from torch.utils.cpp_extension import load
+    print("Compiling INT8 kernels ...")
+    int8_ext = load(
+        name="int8_ext",
+        sources=[
+            "kernels/int8_attention.cu",
+            "kernels/int8_mlp.cu",
+            "kernels/quant_utils.cu",
+            "kernels/int8_ext.cu",
+        ],
+        extra_cuda_cflags=["-arch=sm_80", "--std=c++17", "-O3"],
+        verbose=False,
+    )
+    print("Done.\n")
 
     # ── Correctness ─────────────────────────────────────────────────────
-    print("\n=== Correctness ===")
-    # TODO: Replace placeholders with your CUDA kernel outputs.
-    #   from torch.utils.cpp_extension import load
-    #   int8_mod = load(name="int8_kernels",
-    #       sources=["kernels/int8_attention.cu", "kernels/int8_mlp.cu", "kernels/quant_utils.cu"],
-    #       verbose=True)
-    #   attn_out = int8_mod.int8_attention_forward(Q_int8, K_int8, V_int8, scale_Q, scale_K, scale_V)
-    #   mlp_out = int8_mod.int8_mlp_forward(x_int8, W1_int8, W2_int8, scale_x, scale_W1, scale_W2)
-    print("[SKIP] INT8 kernels not yet implemented — using dequant+baseline as placeholder")
-    attn_out = attn_ref  # placeholder
-    mlp_out = mlp_ref    # placeholder
+    print("=" * 60)
+    print("  CORRECTNESS: INT8 Attention (per-token quantization)")
+    print("=" * 60)
 
-    check_correctness(attn_ref, attn_out, label="int8_attention", mode="int8")
-    check_correctness(mlp_ref, mlp_out, label="int8_mlp", mode="int8")
+    if args.head_dim:
+        configs = [(b, h, s, hd, desc) for b, h, s, hd, desc in ATTN_CONFIGS
+                   if hd == args.head_dim]
+        if not configs:
+            print(f"No configs with head_dim={args.head_dim}")
+            sys.exit(1)
+    else:
+        configs = ATTN_CONFIGS
+
+    attn_pass, attn_total = test_attention_correctness(int8_ext, configs)
+    print(f"\nAttention: {attn_pass}/{attn_total} configs passed")
+
+    print("\n" + "=" * 60)
+    print("  CORRECTNESS: INT8 MLP")
+    print("=" * 60)
+    mlp_passed = test_mlp_correctness(int8_ext)
+
+    # ── Summary ─────────────────────────────────────────────────────────
+    all_pass = (attn_pass == attn_total) and mlp_passed
+    print("\n" + "=" * 60)
+    if all_pass:
+        print("  ALL CORRECTNESS CHECKS PASSED")
+    else:
+        print("  SOME CHECKS FAILED")
+        if attn_pass < attn_total:
+            print(f"    Attention: {attn_total - attn_pass} config(s) failed")
+        if not mlp_passed:
+            print(f"    MLP: FAILED")
+    print("=" * 60)
+
+    if args.quick:
+        sys.exit(0 if all_pass else 1)
+
+    if not all_pass:
+        print("\nSkipping benchmark due to correctness failures.")
+        sys.exit(1)
 
     # ── Benchmark: INT8 Attention ───────────────────────────────────────
-    print("\n=== Benchmark: INT8 Attention ===")
+    device = "cuda"
+    dtype = torch.float16
+    batch, heads, seq_len, head_dim = 2, 8, 512, 64
 
+    torch.manual_seed(42)
+    Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    Q_i8, sQ = quantize_per_token(Q)
+    K_i8, sK = quantize_per_token(K)
+    V_i8, sV = quantize_per_token(V)
+
+    print("\n=== Benchmark: INT8 Attention (head_dim=64, per-token) ===")
     fp16_attn_ms = benchmark(attention_baseline, Q, K, V)
-
-    # Your INT8 kernel (placeholder)
-    int8_attn_ms = benchmark(attention_baseline, Q_deq, K_deq, V_deq)  # TODO: replace
-
+    int8_attn_ms = benchmark(int8_ext.int8_attention_forward,
+                             Q_i8, K_i8, V_i8,
+                             sQ.contiguous().cuda(),
+                             sK.contiguous().cuda(),
+                             sV.contiguous().cuda())
     attn_flops = compute_attention_flops(batch, heads, seq_len, head_dim)
     attn_tops = attn_flops / (int8_attn_ms * 1e-3) / 1e12
-
     print(f"  FP16 baseline:    {fp16_attn_ms:.3f} ms")
     print(f"  Your INT8 kernel: {int8_attn_ms:.3f} ms  ({fp16_attn_ms / int8_attn_ms:.2f}x vs FP16)")
     print(f"  Your TOPS:        {attn_tops:.1f}  |  Utilization: {attn_tops / A100_INT8_TOPS * 100:.1f}%")
 
+    # Benchmark head_dim=256
+    head_dim_256 = 256
+    heads_256 = 8
+    print("\n=== Benchmark: INT8 Attention (head_dim=256, per-token) [Opt #3 target] ===")
+    torch.manual_seed(42)
+    Q2 = torch.randn(batch, heads_256, seq_len, head_dim_256, device=device, dtype=dtype)
+    K2 = torch.randn(batch, heads_256, seq_len, head_dim_256, device=device, dtype=dtype)
+    V2 = torch.randn(batch, heads_256, seq_len, head_dim_256, device=device, dtype=dtype)
+    Q2_i8, sQ2 = quantize_per_token(Q2)
+    K2_i8, sK2 = quantize_per_token(K2)
+    V2_i8, sV2 = quantize_per_token(V2)
+
+    fp16_attn256_ms = benchmark(attention_baseline, Q2, K2, V2)
+    int8_attn256_ms = benchmark(int8_ext.int8_attention_forward,
+                                Q2_i8, K2_i8, V2_i8,
+                                sQ2.contiguous().cuda(),
+                                sK2.contiguous().cuda(),
+                                sV2.contiguous().cuda())
+    attn256_flops = compute_attention_flops(batch, heads_256, seq_len, head_dim_256)
+    attn256_tops = attn256_flops / (int8_attn256_ms * 1e-3) / 1e12
+    print(f"  FP16 baseline:    {fp16_attn256_ms:.3f} ms")
+    print(f"  Your INT8 kernel: {int8_attn256_ms:.3f} ms  ({fp16_attn256_ms / int8_attn256_ms:.2f}x vs FP16)")
+    print(f"  Your TOPS:        {attn256_tops:.1f}  |  Utilization: {attn256_tops / A100_INT8_TOPS * 100:.1f}%")
+
     # ── Benchmark: INT8 MLP ─────────────────────────────────────────────
+    d_model, d_ff = 512, 2048
+    torch.manual_seed(42)
+    x = torch.randn(batch, seq_len, d_model, device=device, dtype=dtype)
+    W1 = torch.randn(d_model, d_ff, device=device, dtype=dtype) * 0.02
+    W2 = torch.randn(d_ff, d_model, device=device, dtype=dtype) * 0.02
+    x_int8, scale_x = quantize_to_int8(x)
+    W1_int8, scale_W1 = quantize_to_int8(W1)
+    W2_int8, scale_W2 = quantize_to_int8(W2)
+    x_deq = (x_int8.float() * scale_x).half()
+    W1_deq = (W1_int8.float() * scale_W1).half()
+    W2_deq = (W2_int8.float() * scale_W2).half()
+
     print("\n=== Benchmark: INT8 MLP ===")
+    fp16_mlp_ms = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)
+    int8_mlp_ms = benchmark(lambda: int8_ext.int8_mlp_forward(
+        x_int8, W1_int8, W2_int8, float(scale_x), float(scale_W1), float(scale_W2)))
 
-    fp16_mlp_ms = benchmark(mlp_baseline, x, W1, W2)
-
-    # Your INT8 kernel (placeholder)
-    int8_mlp_ms = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)  # TODO: replace
-
-    # cuBLAS INT8 comparison (torch._int_mm, 2D only)
     x_2d_int8 = x_int8.view(-1, d_model)
-
     def cublas_int8_gemm():
         torch._int_mm(x_2d_int8, W1_int8)
-
     cublas_int8_ms = benchmark(cublas_int8_gemm)
 
     mlp_flops = compute_mlp_flops(batch, seq_len, d_model, d_ff)

@@ -384,6 +384,8 @@ def bench_int8(ext, batch, seq_len, d_model):
     )
     row["naive_pytorch_ms"] = fp16_wmma_ms
     row["naive_pytorch_label"] = "FP16 Fused Kernel"
+    achieved = mlp_hbm_fused(batch, seq_len, d_model, d_ff) / (fp16_wmma_ms * 1e-3) / 1e12
+    row["naive_pytorch_bw_util_pct"] = achieved / A100_HBM_BW_TBps * 100
     return row
 
 
@@ -558,8 +560,8 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3)
 
-    fig.suptitle(f"{kname} Kernel: Latency vs Sequence Length  "
-                 f"(batch={BATCH}, FP16, A100)", fontsize=13, y=1.02)
+    fig.suptitle(f"{kname}: Latency vs Sequence Length  "
+                 f"(batch={BATCH}, A100)", fontsize=13, y=1.02)
     fig.tight_layout()
     p = os.path.join(figures_dir, f"{kernel_name}_latency_vs_seqlen.png")
     fig.savefig(p, dpi=150, bbox_inches="tight")
@@ -584,7 +586,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     ax.set_xticklabels([dm_label(dm) for dm in D_MODELS])
     ax.set_ylabel("Latency (ms)")
     ax.set_title(f"{kname} Latency by Hidden Size  "
-                 f"(seq_len={max_seq}, batch={BATCH}, FP16, A100)")
+                 f"(seq_len={max_seq}, batch={BATCH}, A100)")
     ax.legend(fontsize=9)
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
@@ -627,6 +629,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         bw_methods.append((ref2_label, "ref2_bw_util_pct"))
     if has_naive_pytorch and "naive_pytorch_bw_util_pct" in rows[0]:
         bw_methods.append((np_label or "Naive PyTorch (cuBLAS)", "naive_pytorch_bw_util_pct"))
+    bw_methods = sorted(bw_methods, key=sort_key)
 
     n_bw = len(bw_methods)
     bw_w = min(0.30, 0.8 / n_bw)

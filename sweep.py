@@ -15,6 +15,7 @@ Each run produces:
     results/<kernel>_sweep.csv
     results/figures/<kernel>_latency_vs_seqlen.png
     results/figures/<kernel>_latency_bar_by_dmodel.png
+    results/figures/<kernel>_tflops_vs_seqlen.png   (MLP only)
     results/figures/<kernel>_hbm_bw_utilisation.png
 
 All plots use the same colour scheme and layout so every kernel's
@@ -587,6 +588,30 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     plt.close(fig)
     print(f"[Plot] {p}")
 
+
+    # ── Fig 3: TFLOPS (MLP only — compute bound) ──────────────────────
+    if kernel_name in ("mlp", "int8"):
+        fig, ax = plt.subplots(figsize=(6, 4))
+        for dm in D_MODELS:
+            sub = sorted(by_dm[dm], key=lambda r: r["seq_len"])
+            ax.plot([r["seq_len"] for r in sub],
+                    [r["kernel_tops"] for r in sub],
+                    marker="o", label=dm_short(dm), linewidth=2, markersize=6)
+        ax.axhline(peak_tops, color="gray", linestyle="--", linewidth=1.2,
+                   label=f"A100 peak ({peak_tops:.0f} TOPS)")
+        ax.set_xlabel("Sequence length")
+        ax.set_ylabel("TFLOPS / TOPS")
+        ax.set_xticks(SEQ_LENS)
+        ax.xaxis.set_major_formatter(
+            ticker.FuncFormatter(lambda x, _: str(int(x))))
+        ax.set_title(f"{kname} Throughput  (batch={BATCH}, A100)")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        p = os.path.join(figures_dir, f"{kernel_name}_tflops_vs_seqlen.png")
+        fig.savefig(p, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[Plot] {p}")
 
     # ── Fig 4: HBM bandwidth utilisation ─────────────────────────────
     bw_methods = [

@@ -514,13 +514,18 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     col_map = {lbl: get_color(lbl) for lbl, _ in method_cols}
     mrk_map = {lbl: get_marker(lbl) for lbl, _ in method_cols}
 
-    # x-axis label helper: show heads×head_dim so reader knows what varies
+    # x-axis label helper
+    is_attn = kernel_name in ("attention", "int8_attn")
     def dm_label(dm):
-        h, hd = attn_config(dm)
-        return f"d={dm}\n{h}h×{hd}"
+        if is_attn:
+            h, hd = attn_config(dm)
+            return f"d={dm}\n{h}h×{hd}"
+        return f"d={dm}\nd_ff={dm*4}"
     def dm_short(dm):
-        h, hd = attn_config(dm)
-        return f"d={dm} ({h}h×{hd})"
+        if is_attn:
+            h, hd = attn_config(dm)
+            return f"d={dm} ({h}h×{hd})"
+        return f"d={dm} (d_ff={dm*4})"
 
     def group_by(rows, key):
         d = collections.defaultdict(list)

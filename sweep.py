@@ -560,8 +560,8 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3)
 
-    fig.suptitle(f"{kname} Kernel: Latency vs Sequence Length  "
-                 f"(batch={BATCH}, FP16, A100)", fontsize=13, y=1.02)
+    fig.suptitle(f"{kname}: Latency vs Sequence Length  "
+                 f"(batch={BATCH}, A100)", fontsize=13, y=1.02)
     fig.tight_layout()
     p = os.path.join(figures_dir, f"{kernel_name}_latency_vs_seqlen.png")
     fig.savefig(p, dpi=150, bbox_inches="tight")
@@ -586,7 +586,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     ax.set_xticklabels([dm_label(dm) for dm in D_MODELS])
     ax.set_ylabel("Latency (ms)")
     ax.set_title(f"{kname} Latency by Hidden Size  "
-                 f"(seq_len={max_seq}, batch={BATCH}, FP16, A100)")
+                 f"(seq_len={max_seq}, batch={BATCH}, A100)")
     ax.legend(fontsize=9)
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()

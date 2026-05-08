@@ -384,6 +384,8 @@ def bench_int8(ext, batch, seq_len, d_model):
     )
     row["naive_pytorch_ms"] = fp16_wmma_ms
     row["naive_pytorch_label"] = "FP16 Fused Kernel"
+    achieved = mlp_hbm_fused(batch, seq_len, d_model, d_ff) / (fp16_wmma_ms * 1e-3) / 1e12
+    row["naive_pytorch_bw_util_pct"] = achieved / A100_HBM_BW_TBps * 100
     return row
 
 

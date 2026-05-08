@@ -629,6 +629,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         bw_methods.append((ref2_label, "ref2_bw_util_pct"))
     if has_naive_pytorch and "naive_pytorch_bw_util_pct" in rows[0]:
         bw_methods.append((np_label or "Naive PyTorch (cuBLAS)", "naive_pytorch_bw_util_pct"))
+    bw_methods = sorted(bw_methods, key=sort_key)
 
     n_bw = len(bw_methods)
     bw_w = min(0.30, 0.8 / n_bw)

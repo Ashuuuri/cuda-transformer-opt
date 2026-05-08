@@ -64,11 +64,11 @@ def attn_config(d_model):
 # ══════════════════════════════════════════════════════════════════════════
 # Semantic colour scheme — same thing always gets the same colour
 COLORS = {
-    "INT8 Fused Kernel":         "#1F77B4",   # steel blue
-    "FP16 Fused Kernel":         "#D4793A",   # terracotta
-    "Naive PyTorch":             "#AAAAAA",   # light gray
-    "FlashAttn-2":               "#2CA02C",   # muted green
-    "cuBLAS GEMMs":              "#7B6CB2",   # muted purple
+    "INT8 Fused Kernel":         "#5E81AC",   # nord blue
+    "FP16 Fused Kernel":         "#D08770",   # nord orange
+    "Naive PyTorch":             "#B8B8B8",   # silver gray
+    "FlashAttn-2":               "#A3BE8C",   # nord green
+    "cuBLAS GEMMs":              "#B48EAD",   # nord purple
 }
 MARKERS = {
     "INT8 Fused Kernel":         "o",

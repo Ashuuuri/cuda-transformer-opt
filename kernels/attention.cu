@@ -173,8 +173,10 @@ using namespace nvcuda::wmma;
 #define WMMA_N       16
 #define WMMA_K_DIM   16
 #define WMMA_TILE_Q  32
-#define WMMA_TILE_KV 32
 #define WMMA_BDIM    64
+// WMMA_TILE_KV is a template parameter on the kernel — the host launcher
+// picks 32 for small head_dim and 16 for head_dim ≥ ~192 so that 2 blocks
+// still fit per SM (otherwise smem caps occupancy at 1 block/SM).
 // Pad each smem row by 8 halves (16 bytes) to reduce bank conflicts.
 // Rows whose byte-stride is a multiple of 128 (32 bank widths) alias to the
 // same banks; PAD=8 breaks that alignment and reduces conflicts.
@@ -206,6 +208,7 @@ static __device__ __forceinline__ void cp_async_wait_all() {
     asm volatile("cp.async.wait_all;" ::: "memory");
 }
 
+template <int WMMA_TILE_KV>
 __global__ __launch_bounds__(WMMA_BDIM, 2)
 void wmma_attention_kernel(
     const half* __restrict__ Q,
@@ -410,6 +413,25 @@ void wmma_attention_kernel(
     }
 }
 
+// Per-block smem in bytes: s_Q + 2*s_K + 2*s_V + s_scores_h (rows padded by SMEM_PAD).
+static inline size_t wmma_smem_bytes(int tile_kv, int head_dim) {
+    return ((size_t)(WMMA_TILE_Q + 4 * tile_kv) * (head_dim + SMEM_PAD) +
+            (size_t) WMMA_TILE_Q * (tile_kv + SMEM_PAD)) * sizeof(half);
+}
+
+template <int KV_TILE>
+static void wmma_launch(
+    const half* Q, const half* K, const half* V, half* out,
+    dim3 grid, int seq_len, int head_dim, float scale
+) {
+    const size_t smem = wmma_smem_bytes(KV_TILE, head_dim);
+    cudaFuncSetAttribute(wmma_attention_kernel<KV_TILE>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)smem);
+    wmma_attention_kernel<KV_TILE><<<grid, WMMA_BDIM, smem>>>(
+        Q, K, V, out, seq_len, head_dim, scale);
+}
+
 static void wmma_attention_forward(
     const half* Q, const half* K, const half* V, half* out,
     int batch, int heads, int seq_len, int head_dim
@@ -423,16 +445,21 @@ static void wmma_attention_forward(
     const int BH = batch * heads;
     dim3 grid((seq_len + WMMA_TILE_Q - 1) / WMMA_TILE_Q, BH);
 
-    // s_Q + 2*s_K + 2*s_V + s_scores_h (all rows padded by SMEM_PAD)
-    const size_t smem =
-        ((size_t)(WMMA_TILE_Q + 4 * WMMA_TILE_KV) * (head_dim + SMEM_PAD) +
-         (size_t) WMMA_TILE_Q * (WMMA_TILE_KV + SMEM_PAD)) * sizeof(half);
-
-    cudaFuncSetAttribute(wmma_attention_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         (int)smem);
-    wmma_attention_kernel<<<grid, WMMA_BDIM, smem>>>(
-        Q, K, V, out, seq_len, head_dim, scale);
+    // A100: ~160 KB dynamic smem per SM. Two blocks per SM means at most
+    // ~80 KB per block. Pick the largest TILE_KV that still fits 2 blocks:
+    //   head_dim=64   TILE_KV=64  (46 KB per block)
+    //   head_dim=128  TILE_KV=32  (45 KB per block; 64 would need 87 KB)
+    //   head_dim=256  TILE_KV=16  (52 KB per block; 32 would need 85 KB)
+    // Larger tiles cut num_tiles = seq_len / TILE_KV and amortize the
+    // per-iter softmax-correction overhead.
+    const size_t budget = 80 * 1024;
+    if (wmma_smem_bytes(64, head_dim) <= budget) {
+        wmma_launch<64>(Q, K, V, out, grid, seq_len, head_dim, scale);
+    } else if (wmma_smem_bytes(32, head_dim) <= budget) {
+        wmma_launch<32>(Q, K, V, out, grid, seq_len, head_dim, scale);
+    } else {
+        wmma_launch<16>(Q, K, V, out, grid, seq_len, head_dim, scale);
+    }
 }
 
 #endif  // ATTN_WMMA

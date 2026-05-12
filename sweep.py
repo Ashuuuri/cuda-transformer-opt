@@ -215,7 +215,7 @@ def bench_mlp(ext, batch, seq_len, d_model):
 def bench_attention(ext, batch, seq_len, d_model):
     import torch.nn.functional as F
     heads    = HEADS
-    head_dim = HEAD_DIM  # fixed at 64; attention sweeps seq_len, not d_model
+    head_dim = d_model // heads
     device   = "cuda"
     dtype    = torch.float16
     torch.manual_seed(42)

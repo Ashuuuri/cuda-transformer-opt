@@ -1,0 +1,7 @@
+==PROF== Connected to process 115808 (/global/u1/s/sz755/cuda-transformer-opt/test_mlp)
+
+==ERROR== An error was reported by the driver:
+==ERROR== Profiling failed because a driver resource was unavailable. Ensure that no other tool (like DCGM) is concurrently collecting profiling data. See https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#faq for more details.
+==ERROR== Failed to profile "gemm_fp16_kernel" in process 115808
+==PROF== Trying to shutdown target application
+==ERROR== The application returned an error code (9).

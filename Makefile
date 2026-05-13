@@ -12,7 +12,7 @@
 #   Example: make test_attention DFLAGS="-DATTN_WMMA=0 -DATTN_FAST_MATH=0"
 
 NVCC       = nvcc
-NVCC_FLAGS = -arch=sm_80 --std=c++17 -O2
+NVCC_FLAGS = -arch=sm_80 --std=c++17 -O3
 INCLUDES   = -I kernels -I tests/cuda
 DFLAGS     ?=
 
@@ -38,7 +38,7 @@ ablation_attention: kernels/attention.cu tests/cuda/test_attention.cu
 
 # ── MLP (Shengjing) ────────────────────────────────────────────────────
 test_mlp: kernels/mlp.cu tests/cuda/test_mlp.cu
-	$(NVCC) $(NVCC_FLAGS) $(INCLUDES) \
+	$(NVCC) $(NVCC_FLAGS) --use_fast_math -DMLP_STAGE_K=32 $(INCLUDES) \
 		kernels/mlp.cu \
 		tests/cuda/test_mlp.cu \
 		-o test_mlp

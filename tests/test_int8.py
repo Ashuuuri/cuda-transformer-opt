@@ -268,18 +268,9 @@ def main():
     print(f"  Your INT8 kernel: {int8_attn256_ms:.3f} ms  ({fp16_attn256_ms / int8_attn256_ms:.2f}x vs FP16)")
     print(f"  Your TOPS:        {attn256_tops:.1f}  |  Utilization: {attn256_tops / A100_INT8_TOPS * 100:.1f}%")
 
-    # ── Benchmark: INT8 MLP ─────────────────────────────────────────────
-    d_model, d_ff = 512, 2048
-    torch.manual_seed(42)
-    x = torch.randn(batch, seq_len, d_model, device=device, dtype=dtype)
-    W1 = torch.randn(d_model, d_ff, device=device, dtype=dtype) * 0.02
-    W2 = torch.randn(d_ff, d_model, device=device, dtype=dtype) * 0.02
-    x_int8, scale_x = quantize_to_int8(x)
-    W1_int8, scale_W1 = quantize_to_int8(W1)
-    W2_int8, scale_W2 = quantize_to_int8(W2)
-    x_deq = (x_int8.float() * scale_x).half()
-    W1_deq = (W1_int8.float() * scale_W1).half()
-    W2_deq = (W2_int8.float() * scale_W2).half()
+    # Fair FP16 reference for INT8: benchmark the same values that the INT8
+    # kernel sees after quantize/dequantize, not the original unquantized input.
+    fp16_mlp_ms = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)
 
     print("\n=== Benchmark: INT8 MLP ===")
     fp16_mlp_ms = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)

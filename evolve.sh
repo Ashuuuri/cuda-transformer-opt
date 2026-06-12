@@ -107,13 +107,16 @@ for i in $(seq 1 "$MAX_ITER"); do
     python3 tests/test_int8.py --quick > /dev/null 2>&1
     if sudo -n true 2>/dev/null && command -v ncu >/dev/null; then
         log "profiling with ncu ..."
-        sudo ncu --kernel-name regex:int8_wmma --launch-count 3 \
+        # env PATH/HOME: keep the user's JIT cache + ninja visible under sudo,
+        # otherwise root rebuilds the extension inside the profiler (or fails).
+        sudo env "PATH=$PATH" HOME="$HOME" \
+            ncu --kernel-name regex:int8_wmma --launch-count 3 \
             --metrics "$NCU_METRICS" \
             python3 tests/test_int8.py --quick 2>&1 \
             | grep -E "int8_|Metric Name|----|pct|registers|wavefronts|occupancy" \
             > "$NCU_OUT" || true
     fi
-    if [ ! -s "$NCU_OUT" ]; then
+    if ! grep -q "registers" "$NCU_OUT" 2>/dev/null; then
         log "ncu unavailable/empty — falling back to torch.profiler"
         python3 - > "$NCU_OUT" 2>&1 <<'EOF'
 import torch, sys; sys.path.insert(0, ".")

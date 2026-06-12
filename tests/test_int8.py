@@ -28,6 +28,10 @@ from benchmark import benchmark
 # ── A100 peak performance ───────────────────────────────────────────────
 A100_FP16_TFLOPS = 312.0
 A100_INT8_TOPS = 624.0
+# INT8 attention is mixed-precision: QK^T runs INT8 (624 TOPS) but attn×V runs
+# FP16 (312 TFLOPS). The two halves have equal FLOP counts, so the blended
+# achievable peak is 1 / (0.5/624 + 0.5/312) = 416.
+A100_INT8_ATTN_TOPS = 416.0
 
 
 # ── Per-tensor quantization (MLP still uses this) ──────────────────────
@@ -218,77 +222,119 @@ def main():
         print("\nSkipping benchmark due to correctness failures.")
         sys.exit(1)
 
+    # ── Load FP16 WMMA attention kernel (same-engineering FP16 reference) ──
+    print("\nCompiling FP16 attention kernel (comparison baseline) ...")
+    attn_ext = load(
+        name="attention_ext",
+        sources=[
+            "kernels/attention.cu",
+            "kernels/attention_ext.cu",
+        ],
+        extra_cuda_cflags=["-arch=sm_80", "--std=c++17", "-O2"],
+        verbose=False,
+    )
+    print("Done.")
+
     # ── Benchmark: INT8 Attention ───────────────────────────────────────
     device = "cuda"
     dtype = torch.float16
-    batch, heads, seq_len, head_dim = 2, 8, 512, 64
 
-    torch.manual_seed(42)
-    Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-    K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-    V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
-    Q_i8, sQ = quantize_per_token(Q)
-    K_i8, sK = quantize_per_token(K)
-    V_i8, sV = quantize_per_token(V)
+    for batch, heads, seq_len, head_dim, tag in [
+        (2, 8, 512, 64,  "head_dim=64"),
+        (2, 8, 512, 256, "head_dim=256 [Opt #3 target]"),
+    ]:
+        torch.manual_seed(42)
+        Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+        K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+        V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+        Q_i8, sQ = quantize_per_token(Q)
+        K_i8, sK = quantize_per_token(K)
+        V_i8, sV = quantize_per_token(V)
+        # All FP16 references run on the dequantized values — the same numbers
+        # the INT8 kernel represents — so latencies compare the same workload.
+        Q_deq = (Q_i8.float() * sQ.unsqueeze(-1)).half()
+        K_deq = (K_i8.float() * sK.unsqueeze(-1)).half()
+        V_deq = (V_i8.float() * sV.unsqueeze(-1)).half()
 
-    print("\n=== Benchmark: INT8 Attention (head_dim=64, per-token) ===")
-    fp16_attn_ms = benchmark(attention_baseline, Q, K, V)
-    int8_attn_ms = benchmark(int8_ext.int8_attention_forward,
+        print(f"\n=== Benchmark: INT8 Attention ({tag}, per-token, "
+              f"b={batch} h={heads} s={seq_len}) ===")
+        naive_ms = benchmark(attention_baseline, Q_deq, K_deq, V_deq)
+        flash_ms = benchmark(F.scaled_dot_product_attention, Q_deq, K_deq, V_deq)
+        fp16k_ms = benchmark(attn_ext.attention_forward, Q_deq, K_deq, V_deq)
+        int8_ms  = benchmark(int8_ext.int8_attention_forward,
                              Q_i8, K_i8, V_i8,
-                             sQ.contiguous().cuda(),
-                             sK.contiguous().cuda(),
-                             sV.contiguous().cuda())
-    attn_flops = compute_attention_flops(batch, heads, seq_len, head_dim)
-    attn_tops = attn_flops / (int8_attn_ms * 1e-3) / 1e12
-    print(f"  FP16 baseline:    {fp16_attn_ms:.3f} ms")
-    print(f"  Your INT8 kernel: {int8_attn_ms:.3f} ms  ({fp16_attn_ms / int8_attn_ms:.2f}x vs FP16)")
-    print(f"  Your TOPS:        {attn_tops:.1f}  |  Utilization: {attn_tops / A100_INT8_TOPS * 100:.1f}%")
+                             sQ.contiguous(), sK.contiguous(), sV.contiguous())
 
-    # Benchmark head_dim=256
-    head_dim_256 = 256
-    heads_256 = 8
-    print("\n=== Benchmark: INT8 Attention (head_dim=256, per-token) [Opt #3 target] ===")
+        flops = compute_attention_flops(batch, heads, seq_len, head_dim)
+        tops = flops / (int8_ms * 1e-3) / 1e12
+        print(f"  Naive PyTorch FP16:  {naive_ms:.3f} ms")
+        print(f"  FlashAttention-2:    {flash_ms:.3f} ms")
+        print(f"  FP16 WMMA kernel:    {fp16k_ms:.3f} ms")
+        print(f"  Your INT8 kernel:    {int8_ms:.3f} ms")
+        print(f"  Speedup vs naive:    {naive_ms / int8_ms:.2f}x")
+        print(f"  Speedup vs FA-2:     {flash_ms / int8_ms:.2f}x")
+        print(f"  Speedup vs FP16 WMMA:{fp16k_ms / int8_ms:.2f}x")
+        print(f"  Your TOPS:           {tops:.1f}  |  "
+              f"Utilization: {tops / A100_INT8_ATTN_TOPS * 100:.1f}% "
+              f"(blended INT8/FP16 peak {A100_INT8_ATTN_TOPS:.0f})")
+
+    # ── Benchmark: INT8 MLP ─────────────────────────────────────────────
+    batch, seq_len, d_model, d_ff = 8, 512, 1024, 4096
+
     torch.manual_seed(42)
-    Q2 = torch.randn(batch, heads_256, seq_len, head_dim_256, device=device, dtype=dtype)
-    K2 = torch.randn(batch, heads_256, seq_len, head_dim_256, device=device, dtype=dtype)
-    V2 = torch.randn(batch, heads_256, seq_len, head_dim_256, device=device, dtype=dtype)
-    Q2_i8, sQ2 = quantize_per_token(Q2)
-    K2_i8, sK2 = quantize_per_token(K2)
-    V2_i8, sV2 = quantize_per_token(V2)
+    x  = torch.randn(batch, seq_len, d_model, device=device, dtype=dtype)
+    W1 = torch.randn(d_model, d_ff, device=device, dtype=dtype) * 0.02
+    W2 = torch.randn(d_ff, d_model, device=device, dtype=dtype) * 0.02
+    x_i8, sx   = quantize_to_int8(x)
+    W1_i8, sW1 = quantize_to_int8(W1)
+    W2_i8, sW2 = quantize_to_int8(W2)
+    x_deq  = (x_i8.float() * sx).half()
+    W1_deq = (W1_i8.float() * sW1).half()
+    W2_deq = (W2_i8.float() * sW2).half()
 
-    fp16_attn256_ms = benchmark(attention_baseline, Q2, K2, V2)
-    int8_attn256_ms = benchmark(int8_ext.int8_attention_forward,
-                                Q2_i8, K2_i8, V2_i8,
-                                sQ2.contiguous().cuda(),
-                                sK2.contiguous().cuda(),
-                                sV2.contiguous().cuda())
-    attn256_flops = compute_attention_flops(batch, heads_256, seq_len, head_dim_256)
-    attn256_tops = attn256_flops / (int8_attn256_ms * 1e-3) / 1e12
-    print(f"  FP16 baseline:    {fp16_attn256_ms:.3f} ms")
-    print(f"  Your INT8 kernel: {int8_attn256_ms:.3f} ms  ({fp16_attn256_ms / int8_attn256_ms:.2f}x vs FP16)")
-    print(f"  Your TOPS:        {attn256_tops:.1f}  |  Utilization: {attn256_tops / A100_INT8_TOPS * 100:.1f}%")
-
-    # Fair FP16 reference for INT8: benchmark the same values that the INT8
-    # kernel sees after quantize/dequantize, not the original unquantized input.
-    fp16_mlp_ms = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)
-
-    print("\n=== Benchmark: INT8 MLP ===")
+    print(f"\n=== Benchmark: INT8 MLP (b={batch} s={seq_len} "
+          f"d_model={d_model} d_ff={d_ff}) ===")
+    # FP16 reference on dequantized values (the practical FP16 path).
     fp16_mlp_ms = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)
     int8_mlp_ms = benchmark(lambda: int8_ext.int8_mlp_forward(
-        x_int8, W1_int8, W2_int8, float(scale_x), float(scale_W1), float(scale_W2)))
+        x_i8, W1_i8, W2_i8, float(sx), float(sW1), float(sW2)))
 
-    x_2d_int8 = x_int8.view(-1, d_model)
-    def cublas_int8_gemm():
-        torch._int_mm(x_2d_int8, W1_int8)
-    cublas_int8_ms = benchmark(cublas_int8_gemm)
+    # Fair cuBLAS INT8 reference: the full pipeline our kernel performs
+    # (GEMM1 → dequant → GELU → requant → GEMM2 → quantized output),
+    # built from torch._int_mm + elementwise ops. Same static hidden scale
+    # as the kernel: sx*sW1*d_model.
+    x_2d_i8 = x_i8.view(-1, d_model)
+    sxw1 = float(sx) * float(sW1)
+    scale_h = sxw1 * d_model
+    scale_o = scale_h * float(sW2) * d_ff
+    def cublas_int8_pipeline():
+        h32 = torch._int_mm(x_2d_i8, W1_i8)
+        h = F.gelu(h32.float() * sxw1, approximate="tanh")
+        h_i8 = (h / scale_h).round_().clamp_(-128, 127).to(torch.int8)
+        o32 = torch._int_mm(h_i8, W2_i8)
+        (o32.float() * (scale_h * float(sW2)) / scale_o) \
+            .round_().clamp_(-128, 127).to(torch.int8)
+    cublas_pipe_ms = benchmark(cublas_int8_pipeline)
+
+    # GEMM-only lower bound: the two bare INT8 GEMMs with no epilogue work.
+    h_i8_pre = torch.randint(-128, 128, (batch * seq_len, d_ff),
+                             device=device, dtype=torch.int8)
+    def cublas_int8_gemms():
+        torch._int_mm(x_2d_i8, W1_i8)
+        torch._int_mm(h_i8_pre, W2_i8)
+    cublas_gemm_ms = benchmark(cublas_int8_gemms)
 
     mlp_flops = compute_mlp_flops(batch, seq_len, d_model, d_ff)
     mlp_tops = mlp_flops / (int8_mlp_ms * 1e-3) / 1e12
 
-    print(f"  FP16 baseline:     {fp16_mlp_ms:.3f} ms")
-    print(f"  Your INT8 kernel:  {int8_mlp_ms:.3f} ms  ({fp16_mlp_ms / int8_mlp_ms:.2f}x vs FP16)")
-    print(f"  cuBLAS INT8 GEMM:  {cublas_int8_ms:.3f} ms  (single GEMM only)")
-    print(f"  Your TOPS:         {mlp_tops:.1f}  |  Utilization: {mlp_tops / A100_INT8_TOPS * 100:.1f}%")
+    print(f"  FP16 cuBLAS MLP:        {fp16_mlp_ms:.3f} ms")
+    print(f"  cuBLAS INT8 pipeline:   {cublas_pipe_ms:.3f} ms  (fair: full quantized MLP)")
+    print(f"  cuBLAS INT8 2x GEMM:    {cublas_gemm_ms:.3f} ms  (GEMM-only lower bound)")
+    print(f"  Your INT8 kernel:       {int8_mlp_ms:.3f} ms")
+    print(f"  Speedup vs FP16:        {fp16_mlp_ms / int8_mlp_ms:.2f}x")
+    print(f"  Speedup vs INT8 pipe:   {cublas_pipe_ms / int8_mlp_ms:.2f}x")
+    print(f"  Your TOPS:              {mlp_tops:.1f}  |  "
+          f"Utilization: {mlp_tops / A100_INT8_TOPS * 100:.1f}%")
 
 
 if __name__ == "__main__":

@@ -7,9 +7,10 @@ Sweeps (from proposal §4):
   batch    : fixed at 8
 
 Usage:
-    python sweep.py --kernel mlp        # Shengjing
-    python sweep.py --kernel attention  # Jonathan
-    python sweep.py --kernel int8       # Heling
+    python sweep.py --kernel mlp        # FP16 MLP
+    python sweep.py --kernel attention  # FP16 attention
+    python sweep.py --kernel int8_mlp   # INT8 MLP   (alias: int8)
+    python sweep.py --kernel int8_attn  # INT8 attention
 
 Each run produces:
     results/<kernel>_sweep.csv
@@ -44,6 +45,9 @@ from benchmark import benchmark
 # ══════════════════════════════════════════════════════════════════════════
 A100_FP16_TFLOPS = 312.0   # Tensor Core FP16 peak (TFLOPS)
 A100_INT8_TOPS   = 624.0   # Tensor Core INT8 peak (TOPS)
+# INT8 attention is mixed-precision: QK^T runs INT8 (624) but attn×V runs FP16
+# (312). Equal FLOPs in each half → blended peak = 1/(0.5/624 + 0.5/312).
+A100_INT8_ATTN_TOPS = 416.0
 A100_HBM_BW_TBps = 2.0    # HBM bandwidth peak (TB/s)
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -166,14 +170,49 @@ def attn_hbm_unfused(batch, heads, seq_len, head_dim):
     return attn_hbm_fused(batch, heads, seq_len, head_dim) + extra
 
 
+def int8_mlp_hbm_fused(batch, seq_len, d_model, d_ff):
+    """INT8 fused MLP: INT8 in/out/weights (1 B), hidden in HBM as INT8."""
+    T = batch * seq_len
+    reads  = T * d_model + d_model * d_ff + d_ff * d_model + T * d_ff
+    writes = T * d_ff + T * d_model
+    return reads + writes
+
+
+def int8_attn_hbm_fused(batch, heads, seq_len, head_dim):
+    """INT8 fused attention: Q/K/V INT8 (1 B), output FP16 (2 B)."""
+    T   = batch * heads
+    qkv = T * seq_len * head_dim * 3            # INT8 = 1 B
+    out = T * seq_len * head_dim * 2            # FP16 = 2 B
+    scales = T * seq_len * 4 * 3                # per-token float scales
+    return qkv + out + scales
+
+
 # ══════════════════════════════════════════════════════════════════════════
-#  INT8 quantisation helper
+#  INT8 quantisation helpers
 # ══════════════════════════════════════════════════════════════════════════
 def quantize_to_int8(t):
     t_f   = t.float()
     scale = t_f.abs().max() / 127.0
     t_i8  = (t_f / scale).round().clamp(-128, 127).to(torch.int8)
     return t_i8, scale
+
+
+def quantize_per_token(t):
+    """Per-token symmetric INT8 quantization over the last dim.
+
+    Returns (int8 tensor, float32 scales with the last dim squeezed).
+    """
+    t_f = t.float()
+    abs_max = t_f.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    scales = abs_max / 127.0
+    t_i8 = (t_f / scales).round().clamp(-128, 127).to(torch.int8)
+    return t_i8, scales.squeeze(-1).contiguous()
+
+
+def _err_stats(reference, actual):
+    """Max/mean absolute error between kernel output and FP16 reference."""
+    diff = (reference.float() - actual.float()).abs()
+    return diff.max().item(), diff.mean().item()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -201,6 +240,9 @@ def bench_mlp(ext, batch, seq_len, d_model):
         torch.mm(h, W2)
     ref2_ms = benchmark(ref2)
 
+    max_err, mean_err = _err_stats(mlp_baseline(x, W1, W2),
+                                   ext.mlp_forward(x, W1, W2))
+
     flops       = mlp_flops(batch, seq_len, d_model, d_ff)
     peak_tops   = A100_FP16_TFLOPS
 
@@ -211,6 +253,7 @@ def bench_mlp(ext, batch, seq_len, d_model):
         mlp_hbm_fused(batch, seq_len, d_model, d_ff),
         mlp_hbm_unfused(batch, seq_len, d_model, d_ff),
         ref2_label="cuBLAS GEMMs",
+        kernel_max_err=max_err, kernel_mean_err=mean_err,
     )
 
 
@@ -231,6 +274,9 @@ def bench_attention(ext, batch, seq_len, d_model):
     naive_ms  = benchmark(attention_baseline, Q, K, V)
     flash_ms  = benchmark(F.scaled_dot_product_attention, Q, K, V)
 
+    max_err, mean_err = _err_stats(attention_baseline(Q, K, V),
+                                   ext.attention_forward(Q, K, V))
+
     flops     = attention_flops(batch, heads, seq_len, head_dim)
     peak_tops = A100_FP16_TFLOPS
 
@@ -241,6 +287,7 @@ def bench_attention(ext, batch, seq_len, d_model):
         attn_hbm_fused(batch, heads, seq_len, head_dim),
         attn_hbm_unfused(batch, heads, seq_len, head_dim),
         ref2_label="FlashAttn-2",
+        kernel_max_err=max_err, kernel_mean_err=mean_err,
     )
 
 
@@ -262,18 +309,46 @@ def bench_int8(ext, batch, seq_len, d_model):
     W1_deq = W1_i8.float().mul(sW1).half()
     W2_deq = W2_i8.float().mul(sW2).half()
 
+    sx_f, sW1_f, sW2_f = float(sx), float(sW1), float(sW2)
+
     def run_int8():
-        ext.int8_mlp_forward(x_i8, W1_i8, W2_i8, sx, sW1, sW2)
+        ext.int8_mlp_forward(x_i8, W1_i8, W2_i8, sx_f, sW1_f, sW2_f)
 
     kernel_ms = benchmark(run_int8)
     # Fair FP16 reference for INT8: use the quantized/dequantized values that
     # the INT8 path actually represents, not the original unquantized tensors.
     naive_ms  = benchmark(mlp_baseline, x_deq, W1_deq, W2_deq)
 
+    # Fair cuBLAS INT8 reference: the full pipeline our kernel performs
+    # (GEMM1 → dequant → GELU → requant → GEMM2 → quantized output), using
+    # the same static hidden scale as the kernel (sx*sW1*d_model).
     x_2d = x_i8.view(-1, d_model)
-    def cublas_int8():
+    sxw1    = sx_f * sW1_f
+    scale_h = sxw1 * d_model
+    scale_o = scale_h * sW2_f * d_ff
+    import torch.nn.functional as F
+    def cublas_int8_pipeline():
+        h32  = torch._int_mm(x_2d, W1_i8)
+        h    = F.gelu(h32.float() * sxw1, approximate="tanh")
+        h_i8 = (h / scale_h).round_().clamp_(-128, 127).to(torch.int8)
+        o32  = torch._int_mm(h_i8, W2_i8)
+        (o32.float() * (scale_h * sW2_f) / scale_o) \
+            .round_().clamp_(-128, 127).to(torch.int8)
+    ref2_ms = benchmark(cublas_int8_pipeline)
+
+    # GEMM-only lower bound: two bare INT8 GEMMs, no epilogue work.
+    h_i8_pre = torch.randint(-128, 128, (batch * seq_len, d_ff),
+                             device=device, dtype=torch.int8)
+    def cublas_int8_gemms():
         torch._int_mm(x_2d, W1_i8)
-    ref2_ms = benchmark(cublas_int8)
+        torch._int_mm(h_i8_pre, W2_i8)
+    ref3_ms = benchmark(cublas_int8_gemms)
+
+    # Accuracy vs the FP16 reference on dequantized values.
+    out_i8, out_scale = ext.int8_mlp_forward(x_i8, W1_i8, W2_i8,
+                                             sx_f, sW1_f, sW2_f)
+    out_deq = out_i8.float().mul(out_scale).half()
+    max_err, mean_err = _err_stats(mlp_baseline(x_deq, W1_deq, W2_deq), out_deq)
 
     flops     = int8_mlp_flops(batch, seq_len, d_model, d_ff)
     peak_tops = A100_INT8_TOPS
@@ -282,9 +357,60 @@ def bench_int8(ext, batch, seq_len, d_model):
         batch, seq_len, d_model,
         kernel_ms, naive_ms, ref2_ms,
         flops, peak_tops,
-        mlp_hbm_fused(batch, seq_len, d_model, d_ff),
+        int8_mlp_hbm_fused(batch, seq_len, d_model, d_ff),
         mlp_hbm_unfused(batch, seq_len, d_model, d_ff),
-        ref2_label="cuBLAS INT8",
+        ref2_label="cuBLAS INT8 pipeline",
+        kernel_max_err=max_err, kernel_mean_err=mean_err,
+        ref3_ms=ref3_ms, ref3_label="cuBLAS INT8 2xGEMM",
+    )
+
+
+# ── INT8 Attention ────────────────────────────────────────────────────────
+def bench_int8_attn(ext_pair, batch, seq_len, d_model):
+    """ext_pair = (int8_ext, attention_ext) — the FP16 WMMA kernel is the
+    same-engineering reference for isolating the INT8 speedup."""
+    import torch.nn.functional as F
+    int8_ext, fp16_ext = ext_pair
+    heads    = HEADS
+    head_dim = d_model // heads
+    device   = "cuda"
+    dtype    = torch.float16
+    torch.manual_seed(42)
+
+    Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+
+    Q_i8, sQ = quantize_per_token(Q)
+    K_i8, sK = quantize_per_token(K)
+    V_i8, sV = quantize_per_token(V)
+    # FP16 references run on the dequantized values — the same numbers the
+    # INT8 kernel represents — so all rows time the same workload.
+    Q_deq = (Q_i8.float() * sQ.unsqueeze(-1)).half()
+    K_deq = (K_i8.float() * sK.unsqueeze(-1)).half()
+    V_deq = (V_i8.float() * sV.unsqueeze(-1)).half()
+
+    kernel_ms = benchmark(int8_ext.int8_attention_forward,
+                          Q_i8, K_i8, V_i8, sQ, sK, sV)
+    naive_ms  = benchmark(attention_baseline, Q_deq, K_deq, V_deq)
+    flash_ms  = benchmark(F.scaled_dot_product_attention, Q_deq, K_deq, V_deq)
+    fp16k_ms  = benchmark(fp16_ext.attention_forward, Q_deq, K_deq, V_deq)
+
+    out = int8_ext.int8_attention_forward(Q_i8, K_i8, V_i8, sQ, sK, sV)
+    max_err, mean_err = _err_stats(attention_baseline(Q_deq, K_deq, V_deq), out)
+
+    flops     = attention_flops(batch, heads, seq_len, head_dim)
+    peak_tops = A100_INT8_ATTN_TOPS
+
+    return _make_row(
+        batch, seq_len, d_model,
+        kernel_ms, naive_ms, flash_ms,
+        flops, peak_tops,
+        int8_attn_hbm_fused(batch, heads, seq_len, head_dim),
+        attn_hbm_unfused(batch, heads, seq_len, head_dim),
+        ref2_label="FlashAttn-2",
+        kernel_max_err=max_err, kernel_mean_err=mean_err,
+        ref3_ms=fp16k_ms, ref3_label="FP16 WMMA kernel",
     )
 
 
@@ -297,6 +423,8 @@ def _make_row(
     flops, peak_tops,
     hbm_fused, hbm_unfused,
     ref2_label,
+    kernel_max_err=None, kernel_mean_err=None,
+    ref3_ms=None, ref3_label="",
 ):
     def to_tops(ms):
         return flops / (ms * 1e-3) / 1e12
@@ -317,10 +445,13 @@ def _make_row(
         "naive_ms":            naive_ms,
         "ref2_ms":             ref2_ms,
         "ref2_label":          ref2_label,
+        "ref3_ms":             ref3_ms if ref3_ms is not None else "",
+        "ref3_label":          ref3_label,
         # throughput
         "kernel_tops":         kernel_tops,
         "naive_tops":          naive_tops,
         "ref2_tops":           to_tops(ref2_ms),
+        "ref3_tops":           to_tops(ref3_ms) if ref3_ms is not None else "",
         # A100 compute utilisation
         "kernel_util_pct":     kernel_tops / peak_tops * 100,
         "naive_util_pct":      naive_tops  / peak_tops * 100,
@@ -330,6 +461,10 @@ def _make_row(
         # speedups
         "speedup_vs_naive":    naive_ms  / kernel_ms,
         "speedup_vs_ref2":     ref2_ms   / kernel_ms,
+        "speedup_vs_ref3":     ref3_ms / kernel_ms if ref3_ms is not None else "",
+        # numerical accuracy vs FP16 reference
+        "kernel_max_err":      kernel_max_err if kernel_max_err is not None else "",
+        "kernel_mean_err":     kernel_mean_err if kernel_mean_err is not None else "",
     }
 
 
@@ -339,10 +474,12 @@ def _make_row(
 FIELDNAMES = [
     "batch", "seq_len", "d_model",
     "kernel_ms", "naive_ms", "ref2_ms", "ref2_label",
-    "kernel_tops", "naive_tops", "ref2_tops",
+    "ref3_ms", "ref3_label",
+    "kernel_tops", "naive_tops", "ref2_tops", "ref3_tops",
     "kernel_util_pct", "naive_util_pct",
     "kernel_bw_util_pct", "naive_bw_util_pct",
-    "speedup_vs_naive", "speedup_vs_ref2",
+    "speedup_vs_naive", "speedup_vs_ref2", "speedup_vs_ref3",
+    "kernel_max_err", "kernel_mean_err",
 ]
 
 def save_csv(rows, path):
@@ -356,7 +493,7 @@ def save_csv(rows, path):
 # ══════════════════════════════════════════════════════════════════════════
 #  Plots  (uniform style for all kernels)
 # ══════════════════════════════════════════════════════════════════════════
-def make_plots(rows, kernel_name, figures_dir, peak_tops):
+def make_plots(rows, kernel_name, figures_dir, peak_tops, dtype_label="FP16"):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -367,6 +504,8 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         return
 
     ref2_label = rows[0]["ref2_label"]
+    ref3_label = rows[0].get("ref3_label", "")
+    has_ref3   = ref3_label != "" and rows[0].get("ref3_ms", "") != ""
     kname      = kernel_name.upper()
 
     # Map our internal keys to display names for the legend
@@ -386,6 +525,10 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         "Naive PyTorch": MARKERS["Naive PyTorch"],
         ref2_label:      MARKERS["cuBLAS / Flash"],
     }
+    if has_ref3:
+        method_cols.append((ref3_label, "ref3_ms"))
+        col_map[ref3_label] = "#9333EA"
+        mrk_map[ref3_label] = "D"
 
     def group_by(rows, key):
         d = collections.defaultdict(list)
@@ -419,7 +562,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         ax.grid(True, alpha=0.3)
 
     fig.suptitle(f"{kname} Kernel: Latency vs Sequence Length  "
-                 f"(batch={BATCH}, FP16, A100)", fontsize=13, y=1.02)
+                 f"(batch={BATCH}, {dtype_label}, A100)", fontsize=13, y=1.02)
     fig.tight_layout()
     p = os.path.join(figures_dir, f"{kernel_name}_latency_vs_seqlen.png")
     fig.savefig(p, dpi=150, bbox_inches="tight")
@@ -433,10 +576,11 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
         for dm in D_MODELS
     }
     fig, ax = plt.subplots(figsize=(8, 4))
-    bw = 0.25
+    bw = 0.8 / len(method_cols)
     for i, (lbl, col) in enumerate(method_cols):
         vals = [maxseq_rows[dm][col] for dm in D_MODELS]
-        offs = [x + (i - 1) * bw for x in range(len(D_MODELS))]
+        offs = [x + (i - (len(method_cols) - 1) / 2) * bw
+                for x in range(len(D_MODELS))]
         bars = ax.bar(offs, vals, width=bw, label=lbl,
                       color=col_map[lbl], alpha=0.85)
         for bar, v in zip(bars, vals):
@@ -447,7 +591,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     ax.set_xticklabels([f"d_model={dm}\nd_ff={dm*4}" for dm in D_MODELS])
     ax.set_ylabel("Latency (ms)")
     ax.set_title(f"{kname} Latency by Hidden Size  "
-                 f"(seq_len={max_seq}, batch={BATCH}, FP16, A100)")
+                 f"(seq_len={max_seq}, batch={BATCH}, {dtype_label}, A100)")
     ax.legend(fontsize=9)
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
@@ -470,7 +614,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     ax.set_xticks(SEQ_LENS)
     ax.xaxis.set_major_formatter(
         ticker.FuncFormatter(lambda x, _: str(int(x))))
-    ax.set_title(f"{kname} Kernel Throughput  (batch={BATCH}, FP16)")
+    ax.set_title(f"{kname} Kernel Throughput  (batch={BATCH}, {dtype_label})")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -493,7 +637,7 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
     ax.set_xticks(SEQ_LENS)
     ax.xaxis.set_major_formatter(
         ticker.FuncFormatter(lambda x, _: str(int(x))))
-    ax.set_title(f"{kname} Speedup vs Naive  (batch={BATCH}, FP16)")
+    ax.set_title(f"{kname} Speedup vs Naive  (batch={BATCH}, {dtype_label})")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -535,24 +679,36 @@ def make_plots(rows, kernel_name, figures_dir, peak_tops):
 # ══════════════════════════════════════════════════════════════════════════
 KERNELS = {
     "mlp": {
-        "loader":    load_mlp_ext,
-        "bench_fn":  bench_mlp,
-        "peak_tops": A100_FP16_TFLOPS,
-        "owner":     "Shengjing",
+        "loader":      load_mlp_ext,
+        "bench_fn":    bench_mlp,
+        "peak_tops":   A100_FP16_TFLOPS,
+        "owner":       "Shengjing",
+        "dtype_label": "FP16",
     },
     "attention": {
-        "loader":    load_attention_ext,
-        "bench_fn":  bench_attention,
-        "peak_tops": A100_FP16_TFLOPS,
-        "owner":     "Jonathan",
+        "loader":      load_attention_ext,
+        "bench_fn":    bench_attention,
+        "peak_tops":   A100_FP16_TFLOPS,
+        "owner":       "Jonathan",
+        "dtype_label": "FP16",
     },
-    "int8": {
-        "loader":    load_int8_ext,
-        "bench_fn":  bench_int8,
-        "peak_tops": A100_INT8_TOPS,
-        "owner":     "Heling",
+    "int8_mlp": {
+        "loader":      load_int8_ext,
+        "bench_fn":    bench_int8,
+        "peak_tops":   A100_INT8_TOPS,
+        "owner":       "Heling",
+        "dtype_label": "INT8",
+    },
+    "int8_attn": {
+        "loader":      lambda: (load_int8_ext(), load_attention_ext()),
+        "bench_fn":    bench_int8_attn,
+        "peak_tops":   A100_INT8_ATTN_TOPS,
+        "owner":       "Heling",
+        "dtype_label": "INT8",
     },
 }
+# Backwards-compatible alias for the old --kernel int8 (MLP sweep).
+KERNELS["int8"] = KERNELS["int8_mlp"]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -603,7 +759,8 @@ def main():
             rows.append(row)
 
     save_csv(rows, csv_path)
-    make_plots(rows, args.kernel, figures_dir, cfg["peak_tops"])
+    make_plots(rows, args.kernel, figures_dir, cfg["peak_tops"],
+               cfg.get("dtype_label", "FP16"))
     print("\nSweep complete.")
 
 

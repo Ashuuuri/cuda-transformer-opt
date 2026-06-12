@@ -158,3 +158,67 @@ Benchmark scripts automatically measure these on the same GPU for apples-to-appl
 - **INT8 kernels**: `atol = 0.1`
 
 When a test fails, the checker prints diagnostics: worst error location, first 8 elements comparison, and percentage of elements exceeding tolerance.
+
+---
+
+## Continued INT8 Optimization (post-course, `opt-dev`)
+
+After the course wrapped, the INT8 kernels were further optimized on a
+dedicated A100-SXM4-40GB (CUDA 12.8). All numbers below are from that
+machine (batch=8 sweeps; see `results/*.csv` for full data).
+
+### Benchmark hardening
+
+- INT8 attention is now compared against **FlashAttention-2** and the
+  **FP16 WMMA kernel** (same engineering level, isolates the INT8 effect),
+  not just naive PyTorch.
+- INT8 MLP is compared against the **full cuBLAS INT8 pipeline**
+  (`_int_mm` + dequant/GELU/requant — the same work our kernel does), with
+  bare `2x _int_mm` kept as a GEMM-only lower bound.
+- Sweeps emit `kernel_max_err` / `kernel_mean_err` columns (accuracy vs the
+  FP16 reference) and use a blended INT8/FP16 peak (416 TOPS) for attention
+  utilization. New entries: `python sweep.py --kernel int8_attn | int8_mlp`.
+
+### INT8 attention: 1.6–2.2x (commit 9473d42)
+
+The WMMA kernel is now templated on `(TILE_KV, HEAD_DIM)`. With a runtime
+`head_dim`, the fragment arrays are dynamically indexed and nvcc spills them
+to local memory — every MMA and every online-softmax rescale paid a local
+load+store. Compile-time `HEAD_DIM` plus k-outer loop ordering (each Q /
+scores fragment loaded once per k-step instead of once per KV-group/slice)
+gives 1.6x at head_dim 64/128 and 2.0–2.2x at head_dim 256, closing the
+FlashAttention-2 gap from 0.30x to ~0.62x. Accuracy unchanged (~1e-3).
+
+Negative results (kept as ablation flags, both measured slower on A100):
+
+- `INT8_ATTN_DB=1` — cp.async double buffering. Fitting two K/V buffers
+  forces TILE_KV down (128→64); the doubled per-tile softmax/barrier
+  overhead outweighs the overlap (0.58–0.82x).
+- `INT8_ATTN_VPREFETCH=1` — V register prefetch. The extra block-wide
+  barrier before attn×V costs more than the hidden global latency
+  (0.75–0.9x). Warp parallelism already covers the loads.
+
+### INT8 MLP: dynamic quantization (commit 0db4387)
+
+The static hidden scale (`sx·sW1·d_model`) is a worst-case bound that is
+~sqrt(d_model) too conservative — max error grew 0.04 → 0.49 over d_model
+512 → 2048. Now: the GEMM1 epilogue gathers per-token row absmax (register
+accumulation + half-warp shuffle reduction, one atomic per row), hidden is
+requantized per-token, GEMM2 applies per-row scales from smem, and the
+output uses a dynamic per-tensor scale. `__launch_bounds__(256, 2)` is
+required to keep the epilogue at 128 registers (2 blocks/SM).
+
+| d_model | max err (static → dynamic) | mean err | latency |
+|---------|---------------------------|----------|---------|
+| 512     | 0.039 → 0.022             | 2.0x better | +5–14% |
+| 1024    | 0.124 → 0.052             | 4.3x better | +5–6%  |
+| 2048    | 0.49 → 0.107              | 9.2x better | +1%    |
+
+Static scales remain available via `INT8_MLP_DYNAMIC=0`.
+
+### Future work
+
+- `mma.sync` PTX path (m16n8k32 for INT8 QK^T, register-resident softmax
+  weights) — the structural ceiling of the `nvcuda::wmma` API is the
+  scores smem round-trip.
+- Per-token output scales for the MLP (needs a small interface extension).

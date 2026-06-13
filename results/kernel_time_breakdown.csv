@@ -1,0 +1,7 @@
+forward,category,self_us_total,pct
+int8_mlp,GEMM1/GEMM2 (INT8 WMMA),24683.103000000017,78.94483028979268
+int8_mlp,transpose W (B k-contig),3267.768999999984,10.451419707288993
+int8_mlp,quantize_rows (per-token),2299.2369999999955,7.353729989337708
+int8_mlp,other / elementwise,584.1309999999485,1.868246575886459
+int8_mlp,quantize_tensor,432.02900000000227,1.3817734376941584
+int8_attn,attention (INT8 WMMA),3212.4740000000033,100.0

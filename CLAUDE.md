@@ -97,9 +97,17 @@ python prepare_real_corpus.py         # one-time: fetch WikiText-2 for Gate 5
 python validate_int8.py               # all datasets × both kernels × 5 gates
 python validate_int8.py --dataset outlier --kernel mlp   # filters
 
-# Performance sweeps (refresh results/*.csv + figures/)
+# Performance sweeps (refresh results/*.csv; figures via the dashboard below)
 python sweep.py --kernel int8_attn
 python sweep.py --kernel int8_mlp
+
+# Consolidated figure: ONE dashboard (results/figures/int8_dashboard.png)
+# replaced the old 20 scattered per-kernel PNGs. Build it after the sweeps:
+python collect_profile.py     # torch.profiler per-kernel time split (no sudo)
+# (optional) ncu stall metrics for the profiling row — see §3 for the sudo cmd;
+#   save raw `ncu --csv` output to results/ncu_{mlp,attn}_raw.csv
+python make_dashboard.py      # -> results/figures/int8_dashboard.png
+#   (sweep.py --legacy-figs still emits the old per-kernel PNGs if needed)
 ```
 
 The torch extension rebuilds automatically after `.cu` edits; if the cache

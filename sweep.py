@@ -14,14 +14,11 @@ Usage:
 
 Each run produces:
     results/<kernel>_sweep.csv
-    results/figures/<kernel>_latency_vs_seqlen.png
-    results/figures/<kernel>_latency_bar_by_dmodel.png
-    results/figures/<kernel>_tflops_vs_seqlen.png
-    results/figures/<kernel>_speedup_vs_seqlen.png
-    results/figures/<kernel>_hbm_bw_utilisation.png
 
-All plots use the same colour scheme and layout so every kernel's
-results look identical in style on the poster.
+Figures: the per-kernel PNGs were replaced by a single consolidated dashboard
+(results/figures/int8_dashboard.png) — build it with `python make_dashboard.py`
+after the sweeps + `python collect_profile.py`. Pass `--legacy-figs` to also
+emit the old 5 per-kernel PNGs (results/figures/<kernel>_*.png).
 """
 
 import argparse
@@ -724,6 +721,12 @@ def main():
         required=True,
         help="Which kernel to sweep: mlp | attention | int8",
     )
+    parser.add_argument(
+        "--legacy-figs",
+        action="store_true",
+        help="Also emit the 5 old per-kernel PNGs. Off by default — the "
+             "consolidated dashboard (python make_dashboard.py) replaced them.",
+    )
     args = parser.parse_args()
 
     check_cuda()
@@ -759,8 +762,13 @@ def main():
             rows.append(row)
 
     save_csv(rows, csv_path)
-    make_plots(rows, args.kernel, figures_dir, cfg["peak_tops"],
-               cfg.get("dtype_label", "FP16"))
+    if args.legacy_figs:
+        make_plots(rows, args.kernel, figures_dir, cfg["peak_tops"],
+                   cfg.get("dtype_label", "FP16"))
+        print(f"Legacy per-kernel PNGs written to {figures_dir}/")
+    else:
+        print("CSV written. Build the consolidated figure with: "
+              "python make_dashboard.py  (use --legacy-figs for the old PNGs)")
     print("\nSweep complete.")
 
 

@@ -244,6 +244,14 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
      independent accumulator chains, but the 64-reg acc tile already maxes the
      register budget. **MLP perf is exhausted on both the occupancy and the
      denser-mma levers.** Do not re-attempt either.
+     - **Occupancy is now ALSO dead from the OTHER direction (iter 12,
+       `INT8_MLP_FINE_WARP`, do not re-attempt).** A finer 4×4 / 512-thread tile
+       (`acc[2][2][8]`=32 regs) DOES double occupancy (`warps_active` 23.8/21.5%
+       → 47.6/41.9%) and DOES halve `wait` (28.2%→14.5% GEMM2) — but shrinking the
+       acc forces `WARP_COL_TILES` 4→2, halving A/B-fragment reuse, so
+       `short_scoreboard` rises, `tensor_op_imma` NET FALLS (38→30%), and latency
+       regresses +15–28%. Occupancy and operand-reuse are coupled through the
+       acc-tile register cost: you cannot raise one without surrendering the other.
 2. The WMMA main loop in `int8_attention.cu` — **occupancy well is DRY; only a
    deep algorithmic change remains.** What is already DONE (do not re-attempt):
    the `INT8_ATTN_REGPV=1` default path keeps P in registers and uses `mma.sync`
@@ -828,3 +836,43 @@ After each optimization, append a section at the bottom of this file:
   static-weight transpose. The GEMM inner loop remains dry; the lesson is that
   the forward orchestration around it was not. Next: still the attention
   online-softmax dependency chain (§4 #2) for kernel-internal perf.
+
+### Iteration 12 - 2026-06-13  (NEGATIVE RESULT — kept behind OFF flag `INT8_MLP_FINE_WARP`, do not re-attempt)
+- **Change (flagged OFF)**: `kernels/int8_mlp.cu` tile defines — finer **4×4 warp
+  tiling**. `WARP_COL_TILES` 4→2 so each warp owns a 2×2 sub-grid of 16×16 tiles
+  (`acc[2][2][8]` = 32 s32 regs, was `acc[2][4][8]` = 64), making the 128×128
+  block a 16-warp / 512-thread grid (was 8-warp / 256-thread). `launch_bounds`
+  follows `THREADS_PER_BLOCK` → `(512,2)`. The smaller acc was the whole point:
+  it frees the registers that iters 8/10 proved you cannot free at 256 threads,
+  so occupancy can finally rise. Default path (flag off) is byte-identical to
+  iter 11 (256 thr, 128 regs, `acc[2][4][8]`).
+- **Target metric**: `sm__warps_active` up (break the 2-block/16-warp ceiling)
+  and the IMMA-result `wait` stall down → `tensor_op_imma` toward cuBLAS 60%+.
+- **Profiling results** (graded b=8 s=512 d_model=1024 d_ff=4096; ncu launch-2):
+  - `warps_active`: **23.8/21.5% → 47.6/41.9%** (GEMM1/GEMM2) — occupancy DID
+    double, exactly as designed (2 blocks × 512 thr = 32 warps/SM, regs=64).
+  - `wait` (IMMA-result dep, the top GEMM2 stall): **19.0/28.2% → 13.7/14.5%** —
+    **halved.** Confirms the hypothesis: more IMMA-issuing warps DO hide `wait`.
+  - **But `tensor_op_imma` NET FELL: 30.2/38.3% → 24.6/29.8%**, and **latency
+    regressed +15% to +28% across the full 12-pt sweep** (graded d1024/s512
+    0.51→0.60ms; d2048/s4096 9.79→12.49ms). Why: halving the acc forced
+    `WARP_COL_TILES` 4→2, which **halves A/B-fragment reuse** — `short_scoreboard`
+    (smem LDS) rose (GEMM2 0.66%→4.36%, GEMM1 3.76%→6.93%), per-warp arithmetic
+    intensity dropped, and a small 44–76 B spill appeared. The finer tile's lost
+    operand reuse more than cancels the occupancy/`wait` win.
+- **Accuracy validation** (default path, all 5 gates PASS, bit-identical to iter
+  11; flag-on path numerically correct via sweep's inline check):
+  - [x] Gate 1 (normal cos=1.00000)  [x] Gate 2  [x] Gate 3  [x] Gate 4
+  - [x] Gate 5 (real GPT-2, −0.068%)
+- **Conclusion**: NEGATIVE — reverted to OFF-by-default flag. **This closes the
+  occupancy lever from the OPPOSITE direction of iters 8/10.** Iters 8/10 showed
+  you *cannot* raise occupancy at 256 threads (the 64-reg acc blocks 3 blocks/SM).
+  Iter 12 shows you *can* raise it — to 47% warps_active, genuinely halving the
+  `wait` stall — by going to a finer tile, but the operand reuse you trade away to
+  shrink the acc costs more `tensor_op_imma` than the extra warps buy back. So the
+  `wait` stall is real and warp-count *does* relieve it, yet there is no
+  register-budget path that raises occupancy *without* surrendering the reuse that
+  feeds the IMMA pipe — the two are coupled through the acc-tile register cost.
+  **The MLP GEMM occupancy lever is now exhausted from both sides; do not
+  re-attempt finer warp tiling.** The only remaining kernel-internal perf lever in
+  the project stays the attention online-softmax dependency chain (§4 #2).

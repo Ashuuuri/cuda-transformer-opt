@@ -333,6 +333,27 @@ kernel-time panel shows the all-in-one (79% GEMM + 10% transpose) vs prepacked
 (88% GEMM, no transpose) split side by side. Lesson: the kernel well was dry, but
 the forward orchestration around it was not.
 
+**Negative result — finer warp tiling raises occupancy and halves `wait` but
+still regresses (2026-06-13, iter 12, `INT8_MLP_FINE_WARP`).** Iters 8/10 showed
+you cannot raise occupancy *at 256 threads* — the `acc[2][4][8]` = 64-register
+tile blocks a 3rd block per SM. Iter 12 attacked that from the other side: a
+finer 4×4 warp tile (`WARP_COL_TILES` 4→2 → each warp owns a 2×2 sub-grid,
+`acc[2][2][8]` = 32 regs) covers the 128×128 block with 16 warps / 512 threads
+instead of 8 / 256, and at `launch_bounds(512,2)` reaches 2 blocks × 512 threads
+= 32 warps/SM. It worked *as a diagnostic*: `warps_active` doubled (23.8/21.5% →
+**47.6/41.9%**) and the IMMA-result `wait` stall — the top GEMM2 stall — was
+genuinely **halved** (28.2% → 14.5%), confirming that more IMMA-issuing warps do
+relieve `wait`. **But latency regressed +15% to +28% across all 12 sweep shapes**
+(graded d1024/s512 0.51→0.60 ms). The cause: shrinking the acc to free the
+registers forces the finer tile, which **halves A/B-fragment reuse** —
+`short_scoreboard` (smem LDS) rose (GEMM2 0.66%→4.36%), per-warp arithmetic
+intensity dropped, a small 44–76 B spill appeared, and `tensor_op_imma` **net
+fell** (38.3%→29.8%). Occupancy and operand reuse are coupled through the
+acc-tile register cost: you cannot raise one without surrendering the other.
+Kept OFF behind `INT8_MLP_FINE_WARP` (default = the iter-11 8-warp/256-thread
+path, byte-identical). **This closes the MLP occupancy lever from both
+directions** — do not re-attempt finer warp tiling.
+
 ### INT8 MLP: real-model accuracy — per-channel/per-token quant (iter 9, 2026-06-13)
 
 The earlier accuracy story (per-tensor scales, "task-level ppl +0.011%") was

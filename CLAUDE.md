@@ -216,9 +216,20 @@ still-actionable conclusion only.
 > fixed a **+64%** real-GPT-2 perplexity regression that per-tensor output quant
 > had silently caused. When the perf levers below are exhausted (they nearly all
 > are), the right next move is usually an accuracy/granularity improvement, not
-> another inner-loop micro-opt. The remaining open accuracy target is **attention
-> K/V outliers** (per-channel / smoothing) — the one MLP-vs-attention XFAIL left
-> (README future work). Treat this as target **#0**.
+> another inner-loop micro-opt. ~~The remaining open accuracy target is **attention
+> K/V outliers** (per-channel / smoothing).~~ **Target #0 CLOSED (iter 16,
+> NEGATIVE):** SageAttention-style K/V smoothing has **no demonstrable
+> output-level benefit** for this project's attention — K channel-bias *cancels in
+> softmax* (shift-invariance), so it never reaches the output, and the residual
+> coarser-quant noise is gate-passing (plain output cos stays >0.998 even at
+> Dettmers-magnitude bias + peaky softmax). Smoothing moves only intermediate
+> metrics (K-MAE 5.8×, outlier_ratio) that don't reach the gate metric (output
+> cosine). The existing `outlier`/`stress` datasets use **zero-mean multiplicative
+> spikes**, where mean-subtraction is a literal no-op. **Do NOT re-attempt
+> attention smoothing** without a real-model distribution that first demonstrably
+> FAILs the output cosine gate. With both the perf track (§4 #1–#2) and this
+> accuracy track now exhausted, the next axis is **full-layer integration or
+> end-to-end wall-clock** (never actually measured), not another attention opt.
 
 > **STATUS 2026-06-13: the INT8 MLP GEMM kernels are perf-EXHAUSTED.** Every
 > internal ceiling is closed or proven structurally dead — do not re-open the

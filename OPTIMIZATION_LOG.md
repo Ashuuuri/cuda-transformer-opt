@@ -638,3 +638,46 @@ behind them. Append a new `### Iteration N` here after each optimization
   NSPLIT helps marginally; fundamentally batch×heads is just small). The
   prefill/square attention kernel remains perf-exhausted (only the online-softmax
   dependency chain, §4 #2, is left there).
+
+### Iteration 16 - 2026-06-13
+- **Change**: NEGATIVE RESULT (no code shipped). Investigated SageAttention-style
+  **K/V smoothing** (subtract per-(b,h) per-channel mean over seq before per-token
+  INT8 quantization) as target #0 (attention K/V outlier accuracy). Math: for K
+  the correction `Q·μ_K` is constant across keys for a fixed query, so softmax
+  (shift-invariant in the key dim) cancels it — nothing added back, kernel
+  unchanged; for V, `out = P@(V−ν_V) + ν_V` exactly (ΣP=1 per row), so ν_V is
+  added back after the kernel. Both expressible WITHOUT touching
+  `int8_attention.cu` (Python preprocessing only). Prototyped in `validate_int8.py`
+  (now reverted).
+- **Target metric**: attention OUTPUT cosine (the Gate-1 metric) on outlier/
+  channel-bias inputs — the only thing that counts.
+- **Profiling results** (synthetic probes, randn[2,8,512,64], fp32 reference):
+  - **Existing `outlier`/`stress` datasets: smoothing is a literal no-op.** They
+    inject **zero-mean multiplicative spikes** (per-token spikes on persistent
+    channels), not channel-mean bias. |mean|/absmax≈0.009; per-token quant MAE
+    plain 0.00917 == smoothed 0.00917 (identical).
+  - **Purpose-built channel-mean-bias K (Dettmers-grounded magnitudes m=4..20,
+    8–16 of 64 channels): plain does NOT FAIL.** Output cos stayed 0.9988–1.0000
+    at every magnitude — plain ≈ smoothed to within 1e-4. Two reasons: (1) K
+    channel-bias **cancels in softmax** (shift-invariance), so it never reaches the
+    output — only the mild residual coarser-quant noise on the other channels does;
+    (2) softmax is forgiving (other channels keep 6–19 codes). Even peaky softmax
+    (temp=6) only pushed plain cos to 0.99882 (still passes the >0.99 gate).
+  - The one metric smoothing *did* move: **outlier_ratio** (peaky temp=6: plain
+    0.137 → smooth 0.0005) and **K-quant MAE** (5.8× on channel-bias K). Neither
+    reaches the gate metric (output cosine) — the textbook "moved an intermediate
+    metric, not the result" trap (§4 iteration discipline).
+- **Accuracy validation**: N/A — no shippable change. The probe that *would* have
+  been the new dataset cannot satisfy the owner's constraint that "plain must
+  honestly FAIL"; constructing one anyway would be self-gaming the gate.
+- **Conclusion**: NEGATIVE / target #0 **CLOSED**. Smoothing has no demonstrable
+  output-level accuracy benefit for this project's attention, because softmax
+  cancels K channel-bias and the residual is gate-passing. (SageAttention reports
+  smoothing wins in FP8/specific real-model regimes; we could not reproduce an
+  output-level win on A100 INT8 with realistic synthetic distributions.) The only
+  non-cancelling lever would be **V channel-bias** (adds to output via P@V) — not
+  pursued, since V outliers post-LayerNorm are not a documented LLM failure mode
+  and would also need a literature-grounded magnitude to avoid self-gaming. **Do
+  not re-attempt attention K/V smoothing** without a real-model distribution that
+  demonstrably fails the OUTPUT cosine gate first. The attention accuracy track is
+  now exhausted alongside the perf track.

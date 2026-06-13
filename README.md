@@ -267,8 +267,16 @@ SOTA the prefill kernel is competitive.
   `ldmatrix → mma → exp/MUFU → pack → mma` + cross-KV-tile rescale chain; breaking
   it (cheaper/approximate exp, decoupling the per-tile rescale) is deep and
   high-risk. Both attention occupancy levers are already proven dead.
-- Per-channel / smoothing for **attention** K/V (the remaining outlier XFAIL is
-  attention-only; the MLP per-token output already shipped, iter 9).
+- **Do not retry: smoothing for attention K/V** — investigated and *closed* as a
+  NEGATIVE RESULT (iter 16). SageAttention-style per-channel mean subtraction has
+  no demonstrable **output-level** accuracy benefit here: K channel-bias *cancels
+  in softmax* (shift-invariance) so it never reaches the output, and the residual
+  coarser-quant noise is gate-passing (plain output cos stays >0.998 even at
+  Dettmers-magnitude bias + peaky softmax). It moves only intermediate metrics
+  (K-MAE 5.8×, outlier_ratio) that don't reach the gate metric. The `outlier`/
+  `stress` datasets inject *zero-mean* multiplicative spikes, where mean-subtraction
+  is a no-op. Re-attempt only with a real-model distribution that first
+  demonstrably FAILs the output cosine gate.
 - **Decode small-batch (B=8)** — the only decode shape still below 1.0× vs SDPA,
   from grid starvation (batch×heads too small for 108 SMs), a launch-shape limit
   not a kernel one. (head_dim=64's instruction-bound case was *closed* in iter 15

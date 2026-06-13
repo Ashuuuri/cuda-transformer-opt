@@ -240,6 +240,28 @@ required to keep the epilogue at 128 registers (2 blocks/SM).
 
 Static scales remain available via `INT8_MLP_DYNAMIC=0`.
 
+**MLP GEMM bottleneck = smem-read bank conflicts (profiled 2026-06-13).** On
+the graded MLP shape (b=8, s=512, d_model=1024, d_ff=4096) both GEMMs are
+**L1/smem-pipe bound** (`l1tex__throughput` 78%/67%), not DRAM (3–4%) or
+compute (`tensor_op_imma` 16–18%) bound, and **~46% of smem-load wavefronts are
+bank conflicts** (16.78M of 36.2M). The 16-byte `cp.async` loader forces every
+smem row stride to be a multiple of 16, which makes `A_SMEM_STRIDE/4` even and
+collides the 16 WMMA fragment rows period-8 (2-way). (So multi-stage cp.async
+is the *wrong* lever here — there is almost no DRAM latency to hide.)
+
+**Negative result — conflict-free stride via 4-byte cp.async is slower.** Setting
+`SMEM_SKEW` 16→4 (strides 36/132, `stride/4` odd → 16 distinct banks) and
+switching the loader to 4-byte `cp.async` cut bank conflicts **16.78M → 2.10M
+(−87%)** and dropped `l1tex__throughput` 78%→48% — but latency got **~30% WORSE**
+(d_model=1024: 0.86→1.09 ms) because the 4× more cp.async store instructions
+flooded the issue pipe (`smsp__inst_executed` →55%, `lg_throttle` →10%). So the
+read-conflict relief is real, but it must NOT come at the cost of 16-byte stores.
+Reverted. The viable fix is an **XOR-swizzled smem layout** (keep 16-byte
+`cp.async` stores, permute each 16B chunk's bank by XOR-ing the column offset
+with row bits, and read with manual `ldmatrix`/`mma.sync` since `load_matrix_sync`
+cannot follow a swizzle) — that keeps store efficiency while killing the read
+conflicts.
+
 ### Future work
 
 - `mma.sync` PTX path (m16n8k32 for INT8 QK^T, register-resident softmax

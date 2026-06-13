@@ -198,6 +198,30 @@ Negative results (kept as ablation flags, both measured slower on A100):
   barrier before attn×V costs more than the hidden global latency
   (0.75–0.9x). Warp parallelism already covers the loads.
 
+**Negative result — raising occupancy to 4 blocks/SM does not help (2026-06-13).**
+On the graded shape (b=8, head_dim=64, the only head_dim sweep.py grades) the
+default `<TILE_KV=128, HEAD_DIM=64>` kernel runs at **3 blocks/SM**, co-capped
+by *both* registers (164 regs → `occupancy_limit_registers`=3) and shared
+memory (`occupancy_limit_shared_mem`=3 at the 132 KB carveout). The fallback
+`<TILE_KV=64, HEAD_DIM=64>` config compiles to only **122 registers** and
+19.5 KB smem, so forcing the graded shape onto it reaches a genuine **4
+blocks/SM** (`occupancy_limit_registers`=4, `occupancy_limit_shared_mem`=4,
+`sm__maximum_warps_per_active_cycle_pct` 18.75%→25%, `sm__warps_active`
+~18%→23.5%). **Latency did not improve:** −0% to +1% across seq 1024–4096
+(within noise), +8% at seq=512 (more tiles → more loop/softmax overhead at
+small grids). `sm__pipe_tensor_cycles_active` stayed pinned at ~28% with 16
+warps, exactly as with 12. Conclusion: this kernel is **neither
+occupancy-bound nor smem-traffic-bound** — an earlier −24%-smem-traffic
+experiment also gave no speedup. The ~28% tensor-pipe ceiling is set by the
+**per-warp serial dependency chain** (`ldmatrix → mma → exp/MUFU → pack →
+mma`, plus the cross-KV-tile online-softmax rescale dependency), which more
+warps cannot hide and less smem traffic cannot relieve. Both occupancy levers
+are therefore exhausted for attention; the remaining angle is breaking the
+softmax dependency chain itself (deeper, higher-risk). Optimization effort
+moves to the MLP GEMMs (compute-bound, multi-stage cp.async pipelining
+unexplored). Probe was launch-policy only (no code path kept; the 64-tile
+config still serves seq % 128 ≠ 0).
+
 ### INT8 MLP: dynamic quantization (commit 0db4387)
 
 The static hidden scale (`sx·sW1·d_model`) is a worst-case bound that is

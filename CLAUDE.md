@@ -13,14 +13,14 @@ CUDA Transformer kernel optimization project (A100 / sm_80). Originally a
 | `kernels/attention.cu` | FP16 fused attention (WMMA split-Q + online softmax + cp.async) |
 | `kernels/mlp.cu` | FP16 MLP: two WMMA GEMMs, GELU fused into GEMM1 |
 | `kernels/int8_attention.cu` | **INT8 attention** (primary target): INT8 WMMA QK^T + FP16 WMMA PV, per-token scales, templated on `(TILE_KV, HEAD_DIM)` |
-| `kernels/int8_mlp.cu` | **INT8 MLP** (primary target): 128×128-tile INT8 WMMA ×2, dynamic quantization (per-token hidden scales) |
+| `kernels/int8_mlp.cu` | **INT8 MLP** (primary target): 128×128-tile INT8 WMMA ×2, dynamic quantization (per-token hidden scales). Two entry points: `int8_mlp_forward` (per-tensor scalar scales, legacy/unchanged) and `int8_mlp_forward_per_channel` (per-token act + per-channel weight + per-token output — the real-model accuracy path) |
 | `kernels/int8_common.cuh` | Shared device helpers: GELU, f32→i8, cp.async |
 | `kernels/quant_utils.cu` | Per-tensor quantize/dequantize utility kernels |
 | `kernels/*_ext.cu` | pybind11 bindings (for torch `cpp_extension.load`) |
 | `tests/cuda/test_*.cu` + `tests/gen_testdata.py` | Pure-CUDA correctness smoke tests (read `.bin` files) |
 | `tests/test_*.py` | Python correctness + benchmarks (vs FA2 / cuBLAS) |
 | `generate_test_data.py` | **8-distribution INT8 validation datasets** (see §6) |
-| `validate_int8.py` | **Five-gate accuracy validation** (see §5) |
+| `validate_int8.py` | **Five-gate accuracy validation** (see §5); Gate 5 = real GPT-2 perplexity on `testdata/real_corpus.txt` (WikiText-2) |
 | `sweep.py` | Parameter sweep → `results/*.csv` + figures; `--kernel int8_attn|int8_mlp|attention|mlp` |
 | `baseline.py` / `benchmark.py` / `correctness.py` | PyTorch references / timing / error checking |
 
@@ -91,6 +91,9 @@ python tests/test_int8.py             # + FA2 / FP16 kernel / cuBLAS baselines
 
 # INT8 five-gate accuracy validation (the gate for every optimization)
 python generate_test_data.py          # one-time: generate the 8 datasets
+python prepare_real_corpus.py         # one-time: fetch WikiText-2 for Gate 5
+                                      #   (needs `pip install --user datasets`;
+                                      #    Gate 5 SKIPs gracefully if absent)
 python validate_int8.py               # all datasets × both kernels × 5 gates
 python validate_int8.py --dataset outlier --kernel mlp   # filters
 
@@ -232,8 +235,16 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
 **Do not touch:**
 - LayerNorm and residual paths stay FP16 (in the `validate_int8.py` block
   harness and any future full-layer integration — never quantize them)
-- Public interface signatures (`int8_attention_forward` / `int8_mlp_forward`)
-- The `tests/cuda/` .bin flow (teammates' smoke-test compatibility)
+- Existing public interface signatures stay backward-compatible. The
+  no-interface-change rule was **relaxed by the owner (2026-06-13)** for the
+  accuracy track: new quantization granularities are added as *new* entry
+  points / overloads, never by breaking the old ones. Concretely: the per-tensor
+  `int8_mlp_forward` (scalar scales, scalar out_scale) is UNCHANGED; per-channel
+  work lives in `int8_mlp_forward_per_channel` (C++) and a tensor-scale
+  `int8_mlp_forward` pybind overload (returns a per-token out_scale tensor).
+  `int8_attention_forward` is untouched.
+- The `tests/cuda/` .bin flow (teammates' smoke-test compatibility) — guaranteed
+  by keeping the per-tensor `int8_mlp_forward` device signature intact
 - Do not retry known negative results: cp.async double-buffering
   (`INT8_ATTN_DB`) and V register prefetch (`INT8_ATTN_VPREFETCH`) both
   measured slower on A100 — reasons documented in README
@@ -287,7 +298,7 @@ must pass:
 | 2 Numeric stability | per-stage absmax ratio, per-stage NaN | ratio ∈ [1/1.5, 1.5]; offending stage names reported |
 | 3 Stage error trace | per-stage cosine must not drop >1% vs previous stage | on violation: stop and report the stage; worst-3 stages listed |
 | 4 Edge cases | short_seq / long_seq / zeros / constant | no NaN; cos>0.99 (zeros: output must be ≈0) |
-| 5 Task-level | full transformer block on `normal` | perplexity increase <2%, accuracy degradation <1% |
+| 5 Task-level | **real GPT-2 perplexity on real WikiText-2** (`testdata/real_corpus.txt`), MLP blocks patched with the kernel-faithful per-channel/per-token quant sim | perplexity increase <2% (SKIPs gracefully if `transformers`/corpus missing) |
 
 - **Any gate failure stops the optimization immediately.** Apply the repair
   suggestions printed by validate (in order: per-channel quantization →
@@ -297,6 +308,14 @@ must pass:
   (the fused kernels expose no intermediates); the simulation's final stage
   is cross-checked against the real kernel output (warns if max diff >
   0.05), so the simulation cannot silently diverge from the kernels.
+- **Gate 5 is the realistic gate (since iteration 8).** It measures real GPT-2
+  perplexity on WikiText-2 with each MLP block running `_kernel_faithful_mlp`
+  (the kernel's exact per-channel weight + per-token activation + **per-token
+  output** quant, with GPT-2's b1-before-GELU / b2-after that the fused epilogue
+  cannot host). The old random-weight self-consistency Gate 5 falsely reported
+  +0.011%; on real weights, per-tensor MLP output quant gives **+64%** perplexity
+  (it crushes output channel outliers) — only per-token output quant recovers it
+  (−0.07%). Do NOT revert Gate 5 to random weights.
 
 ## 6. Test Data
 
@@ -655,3 +674,44 @@ After each optimization, append a section at the bottom of this file:
   bottleneck is the `wait` MMA-dependency stall (`tensor_op_imma` 30%/38% vs
   cuBLAS 60%+) at structurally-fixed 2-block occupancy. Next: a denser-mma
   schedule that overlaps more independent IMMA chains.
+
+### Iteration 9 - 2026-06-13  (ACCURACY track, not perf)
+- **Change**: realistic INT8 MLP quantization + realistic validation, in two
+  coordinated parts (owner relaxed the no-interface-change rule for this):
+  - **Phase 2 — per-channel/per-token MLP quant.** `kernels/int8_mlp.cu`:
+    templated `gemm_int8_wmma_f16_kernel<apply_gelu, a_scale_per_row,
+    b_scale_per_col>` so the epilogue applies a per-ROW activation scale and a
+    per-COLUMN weight scale (gathered into `s_arow`/`s_bcol` smem); new entry
+    point `int8_mlp_forward_per_channel` does **per-token activation +
+    per-channel weight + per-token OUTPUT** quant (output now uses
+    `quantize_rows_kernel` + GEMM2 per-row absmax, not `quantize_tensor_kernel`),
+    returning the [T] per-row output scales. `int8_ext.cu`: tensor-scale
+    `int8_mlp_forward` overload (pybind dispatch by arg type) returning a
+    per-token `out_scale` tensor. The per-tensor scalar `int8_mlp_forward`
+    (device sig + `tests/cuda/` .bin flow + sweep/profile/test_int8) is
+    UNCHANGED.
+  - **Phase 1 — real Gate 5.** `validate_int8.py`: Gate 5 rewritten to real
+    GPT-2 perplexity on real WikiText-2 (`testdata/real_corpus.txt`) via the
+    kernel-faithful per-channel/per-token sim; `run_mlp_kernel`/`sim_mlp` updated
+    for per-token output dequant. `generate_test_data.py`: removed the now-XPASS
+    `outlier` MLP xfail.
+- **Target metric**: real-model accuracy (Gate 5 perplexity), NOT a perf metric
+  — this is the accuracy track. The graded per-tensor path (sweep.py) is
+  structurally untouched; sweep latency unchanged vs iteration 8 (within noise).
+- **Key finding**: per-tensor MLP *output* quant gives **+64.4%** GPT-2
+  perplexity (crushes output channel outliers); per-channel weights alone with
+  per-tensor output is still +64%. Per-token output quant is the fix → −0.07%.
+  The old random-weight Gate 5 masked all of this (falsely +0.011%).
+- **Profiling / accuracy results**:
+  - Gate 5: fp16 ppl=31.9462 → int8 ppl=31.9246 (**−0.068%**, well under 2%).
+  - `outlier`/`boundary`/`stress` MLP now PASS outright (outlier was the one
+    substantive XFAIL; cos 0.971 → >0.999).
+- **Accuracy validation** (all 5 gates PASS on all 8 datasets + real Gate 5):
+  - [x] Gate 1: math metrics (normal cos=1.00000)
+  - [x] Gate 2: numeric stability
+  - [x] Gate 3: stage error trace
+  - [x] Gate 4: edge cases
+  - [x] Gate 5: task-level (real GPT-2, −0.068%)
+- **Conclusion**: pass — the INT8 MLP is now accurate on a real model, validated
+  by a realistic gate. Perf targets (tensor_op_imma toward cuBLAS) unchanged and
+  still live.

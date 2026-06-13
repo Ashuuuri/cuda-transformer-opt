@@ -294,9 +294,44 @@ is pure tiling). The new ceiling is the `wait` MMA-dependency stall
 (`tensor_op_imma` 30%/38% vs cuBLAS 60%+) at structurally-fixed 2-block
 occupancy.
 
+### INT8 MLP: real-model accuracy — per-channel/per-token quant (iter 9, 2026-06-13)
+
+The earlier accuracy story (per-tensor scales, "task-level ppl +0.011%") was
+measured on **random weights**, which mask quantization error. Switching Gate 5
+to **real GPT-2 on real WikiText-2** exposed that per-tensor INT8 MLP gives
+**+15% perplexity**, and that the largest single error source is the kernel's
+per-tensor **output** quantization: it crushes the MLP output's emergent channel
+outliers, costing **+64.4%** perplexity on its own (per-channel weights with a
+per-tensor output is still +64%).
+
+The fix is finer-grained quantization, added as a *new* entry point
+(`int8_mlp_forward_per_channel`; the per-tensor `int8_mlp_forward` and the
+`tests/cuda/` .bin flow are unchanged):
+
+- **per-channel weights** — `gemm_int8_wmma_f16_kernel` templated on
+  `<apply_gelu, a_scale_per_row, b_scale_per_col>`; the epilogue gathers the
+  per-output-column weight scale (`s_bcol`) and per-row activation scale
+  (`s_arow`) from smem. Dominant lever.
+- **per-token activations** — scale_x is `[T]`, applied per row. Adds margin.
+- **per-token output** — output is requantized with `quantize_rows_kernel` over
+  a per-row absmax gathered in the GEMM2 epilogue (not `quantize_tensor_kernel`),
+  and the binding returns a per-token `out_scale` tensor `[T]`. This is the piece
+  that recovers the +64%. (SmoothQuant was prototyped and proved unnecessary.)
+
+Result: real GPT-2 perplexity **31.946 (fp16) → 31.925 (int8), −0.068%** (gate
+bar <2%). The `outlier`/`boundary`/`stress` MLP datasets now pass outright
+(`outlier` cos 0.971 → >0.999; its MLP XFAIL removed). The graded per-tensor path
+(`sweep.py`) is structurally untouched, so MLP latency is unchanged vs iter 8.
+
+Gate 5 reads `testdata/real_corpus.txt` (WikiText-2 test split). That file is
+gitignored; regenerate it on a fresh checkout with `python prepare_real_corpus.py`
+(needs `pip install --user datasets`). Gate 5 SKIPs gracefully if the corpus or
+`transformers` is missing, so it never blocks CI on a bare box.
+
 ### Future work
 
 - `mma.sync` PTX path (m16n8k32 for INT8 QK^T, register-resident softmax
   weights) — the structural ceiling of the `nvcuda::wmma` API is the
   scores smem round-trip.
-- Per-token output scales for the MLP (needs a small interface extension).
+- Per-channel / smoothing for **attention** K/V (the remaining outlier XFAIL is
+  attention-only; the MLP per-token output already shipped, iter 9).

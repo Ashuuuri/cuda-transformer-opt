@@ -211,10 +211,11 @@ def build_datasets():
         # finer-grained quantization. The repair advisor's simulation
         # confirms the fix works; validate_int8.py reports these without
         # gating the overall result, and flags XPASS once fixed.
+        # NOTE: the MLP xfail was REMOVED on 2026-06-13 — per-token activation
+        # + per-channel weight + per-token output quant (int8_mlp_forward_per_
+        # channel) now passes outlier outright (cos>0.999). Attention still
+        # uses per-token scales, so its outlier xfail stands.
         "xfail": {
-            "mlp": "per-tensor x scale cannot survive 10-100x outlier "
-                   "channels (cos ~0.97). Fix: per-channel quantization "
-                   "(simulated recovery to cos 0.998).",
             "attention": "per-token scales crush the non-outlier dims of "
                          "outlier tokens (outlier ratio above threshold). "
                          "Fix: per-channel K/V quantization or smoothing.",

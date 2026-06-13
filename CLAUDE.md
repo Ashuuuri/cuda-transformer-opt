@@ -113,36 +113,50 @@ users permanently with
 `torch.profiler` needs no privileges; registers/smem come from the ptxas
 report.
 
+**CRITICAL — profile the shape sweep.py grades, not `test_int8.py --quick`.**
+`--quick` is batch=2, seq=512, head_dim 64/128/256: a GRID-STARVED toy (128
+blocks / 108 SMs ≈ 1.18 blocks/SM → `warps_active` ~7.4%). sweep.py grades
+batch=8, **head_dim=64 only**, seq 512–4096: 512–4096 blocks → occupancy MAXED
+(3 blocks/SM, `warps_active` ~18% ≈ `sm__maximum_warps_per_active_cycle_pct`
+18.75%). They are different regimes; profiling the toy made earlier iterations
+chase an occupancy/register lever that does not exist in the graded config. Use
+`profile_kernel.py` (sweep-matched shapes) for any perf-relevant diagnosis.
+
 ```bash
-# The ncu metrics that matter most for this project's bottlenecks:
-sudo ncu --kernel-name regex:int8_wmma --launch-count 3 \
+# The ncu metrics that matter most for this project's bottlenecks.
+# profile_kernel.py runs batch=8 head_dim=64 (the graded shape), NOT --quick.
+sudo env "PATH=$PATH" HOME="$HOME" \
+    ncu --kernel-name regex:int8_wmma --launch-count 2 \
     --metrics sm__warps_active.avg.pct_of_peak_sustained_active,\
 sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,\
 l1tex__data_pipe_lsu_wavefronts_mem_shared.sum,\
 smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct,\
 smsp__warp_issue_stalled_barrier_per_warp_active.pct,\
-launch__registers_per_thread,launch__occupancy_limit_registers \
-    python tests/test_int8.py --quick 2>&1 | grep -A2 -E "Metric|int8_"
+launch__registers_per_thread,launch__occupancy_limit_registers,\
+launch__occupancy_limit_shared_mem,sm__maximum_warps_per_active_cycle_pct \
+    python3 profile_kernel.py attn 2>&1 | grep -A2 -E "Metric|int8_"
 # ^ ALWAYS filter with --kernel-name + grep — full ncu output floods context.
+# env PATH/HOME keeps the user JIT cache + ninja visible under sudo.
 ```
 
-Priorities and how to read them. **The real target is occupancy
-(`launch__occupancy_limit_registers` / `sm__warps_active`), not register count
-in isolation** — registers only matter through the blocks/SM they cost. It is
-explicitly OK for the headline P-in-registers rewrite to *raise* per-thread
-registers if it removes the smem scores round-trip and holds (or improves)
-blocks/SM; trade register layout for smem traffic freely as long as occupancy
-does not drop and there are no spills:
-1. **`launch__occupancy_limit_registers` + `sm__warps_active`** — what actually
-   gates throughput (currently 2–3 blocks/SM, warps_active stuck ~7.4%). The
-   attention kernel already runs at 160–236 regs/thread; the old "keep ≤128"
-   rule is a guideline for the *MLP epilogue*, not a hard cap on the attention
-   rewrite. Watch the block count, and watch for spills:
+Priorities and how to read them, measured on the **graded** shape (b=8,
+head_dim=64, s=2048):
+1. **Occupancy is already MAXED at 3 blocks/SM** — `warps_active` ~18% equals
+   the `sm__maximum_warps_per_active_cycle_pct` ceiling (18.75% = 12 warps),
+   and it is co-limited by BOTH `launch__occupancy_limit_registers`=3 AND
+   `launch__occupancy_limit_shared_mem`=3 (164 regs at `<128,64>`). A
+   registers-only cut is therefore a **NO-OP** here: smem still caps at 3.
+   Reaching 4 blocks/SM requires cutting BOTH per-thread registers AND
+   shared-memory-per-block below their 4-block thresholds **together**. (The
+   `<64,256>` head_dim=256 config IS register-limited at 2 blocks/SM / 236 regs
+   — but head_dim=256 is NEVER in the sweep, so do not optimize it.) Check
+   spills with:
    `nvcc -arch=sm_80 -O3 --std=c++17 --ptxas-options=-v -c kernels/int8_mlp.cu -o /dev/null 2>&1 | grep -E "registers|spill"`
-2. **MIO/smem stalls** (`stalled_mio_throttle`, `mem_shared wavefronts`) —
-   the wmma scores round-trip through smem is the structural bottleneck; this is
-   the metric the P-in-registers rewrite must drive down.
-3. **Tensor pipe active %** — currently ~10-15%; cuBLAS reaches 60%+.
+2. **MIO/smem stalls** (`stalled_mio_throttle`, `mem_shared wavefronts`) — with
+   only 12 warps/SM there are too few to hide the smem round-trip + MMA
+   latency; this gates the tensor pipe. Either cut the round-trip or raise
+   per-warp ILP.
+3. **Tensor pipe active %** — ~28% on the graded shape; cuBLAS reaches 60%+.
 
 Without ncu:
 
@@ -160,18 +174,25 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
 ## 4. Optimization Targets & Rules
 
 **Optimize first** (by expected return):
-1. The WMMA main loop in `int8_attention.cu`. The next real lever is the
-   **full `mma.sync` m16n8k32 rewrite with P kept in registers** — eliminating
-   the scores→smem→ldmatrix round-trip entirely, NOT just swapping the QK^T
-   input path. Iterations 1–3 (commits `e493da4`, `6d1dcdd`, `fc8642f`)
-   converted QK^T to `mma.sync`, folded the `sV` scale, and software-pipelined
-   the ldmatrix — all latency-neutral, and **ncu confirms the bottleneck never
-   moved** (warps_active stuck ~7.4%, tensor pipe ~13–16%, smem
-   `l1tex__...mem_shared` wavefronts unchanged). The supply of safe
-   loop-reordering micro-opts is **exhausted**; only restructuring P to live in
-   registers across the P@V MMA will move those metrics. Attempt it even though
-   it is a large, multi-step rewrite of one kernel's main loop — a bold rewrite
-   that targets a bottleneck metric beats another safe reorder that does not.
+1. The WMMA main loop in `int8_attention.cu`. **What is already DONE (do not
+   re-attempt):** the `INT8_ATTN_REGPV=1` default path already keeps P in
+   registers and uses `mma.sync` m16n8k32 QK^T + m16n8k16 P@V, eliminating the
+   scores→smem→ldmatrix round-trip. Iterations 1–6 built and refined exactly
+   this (QK^T → `mma.sync`, `sV` fold, ldmatrix software-pipeline, fused pack)
+   — all latency-neutral, because **they were profiled on a grid-starved toy
+   shape (§3); on the graded shape occupancy was already maxed the whole time.**
+   The "P in registers / mma.sync rewrite" is NOT a remaining lever.
+   **The real levers, on the graded shape (occupancy maxed at 3 blocks/SM,
+   tensor pipe ~28%, see §3):**
+   - **(a) Raise occupancy to 4 blocks/SM** — requires cutting BOTH per-thread
+     registers AND shared-memory-per-block below their 4-block thresholds
+     *together* (a registers-only cut is a no-op; smem co-caps at 3). E.g. a
+     smaller KV tile, or not staging full Q in smem.
+   - **(b) Hide latency at fixed 12 warps/SM** — cut the smem round-trip
+     (`l1tex__...mem_shared` is large) or raise per-warp ILP so the existing
+     warps cover more of the MMA/smem latency that pins tensor pipe at ~28%.
+   Either is a bold, coherent main-loop rewrite — pick one and prove it on the
+   graded shape with `profile_kernel.py`, not `--quick`.
 2. GEMM tiling/pipeline in `int8_mlp.cu` (already matches bare cuBLAS INT8
    GEMMs; beating FP16 cuBLAS needs a deeper pipeline)
 

@@ -27,13 +27,19 @@ PERF_IMPROVE="${PERF_IMPROVE:--2.0}"   # <= this  -> genuine improvement (commit
 PERF_REGRESS="${PERF_REGRESS:-5.0}"    # >  this  -> regression (revert)
 mkdir -p "$LOG_DIR"
 
-# CLAUDE.md §3 metrics, verbatim.
+# CLAUDE.md §3 metrics. occupancy_limit_{registers,shared_mem} +
+# maximum_warps_per_active_cycle are here so the diagnosis can see WHICH
+# resource caps blocks/SM: on the graded head_dim=64 shape both registers AND
+# shared mem cap at 3 blocks/SM and warps_active (~18%) already equals the
+# ceiling, so a registers-only cut is a no-op — only a JOINT reg+smem cut
+# reaches 4 blocks/SM.
 NCU_METRICS="sm__warps_active.avg.pct_of_peak_sustained_active,\
 sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,\
 l1tex__data_pipe_lsu_wavefronts_mem_shared.sum,\
 smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct,\
 smsp__warp_issue_stalled_barrier_per_warp_active.pct,\
-launch__registers_per_thread,launch__occupancy_limit_registers"
+launch__registers_per_thread,launch__occupancy_limit_registers,\
+launch__occupancy_limit_shared_mem,sm__maximum_warps_per_active_cycle_pct"
 
 PASS_COUNT=0
 declare -a ITER_RESULTS
@@ -144,16 +150,20 @@ for i in $(seq 1 "$MAX_ITER"); do
     NCU_OUT="$LOG_DIR/ncu_$i.txt"
 
     # a. Profile. Pre-warm the JIT cache so ncu doesn't profile the build.
-    python3 tests/test_int8.py --quick > /dev/null 2>&1
+    #    profile_kernel.py runs the SAME shapes sweep.py grades (batch=8,
+    #    head_dim=64) — NOT test_int8.py --quick (batch=2, grid-starved toy).
+    #    Profiling the toy is why prior iterations chased a phantom
+    #    occupancy/register bottleneck the graded workload does not have.
+    python3 profile_kernel.py both > /dev/null 2>&1
     if sudo -n true 2>/dev/null && command -v ncu >/dev/null; then
-        log "profiling with ncu ..."
+        log "profiling with ncu (sweep-matched shape: b=8 h=8 s=2048 d=64) ..."
         # env PATH/HOME: keep the user's JIT cache + ninja visible under sudo,
         # otherwise root rebuilds the extension inside the profiler (or fails).
         sudo env "PATH=$PATH" HOME="$HOME" \
-            ncu --kernel-name regex:int8_wmma --launch-count 3 \
+            ncu --kernel-name regex:int8_wmma --launch-count 2 \
             --metrics "$NCU_METRICS" \
-            python3 tests/test_int8.py --quick 2>&1 \
-            | grep -E "int8_|Metric Name|----|pct|registers|wavefronts|occupancy" \
+            python3 profile_kernel.py attn 2>&1 \
+            | grep -E "int8_|Metric Name|----|pct|registers|wavefronts|occupancy|maximum_warps" \
             > "$NCU_OUT" || true
     fi
     if ! grep -q "registers" "$NCU_OUT" 2>/dev/null; then
@@ -194,25 +204,42 @@ and follow §4 strictly. Profiling output for this iteration:
 
 $(cat "$NCU_OUT")
 
+The profiling above is from the SAME shape sweep.py grades (batch=8,
+head_dim=64, seq=2048). Read the actual numbers above — do NOT assume the old
+"warps_active ~7.4%" figure; that came from a grid-starved toy shape that is
+no longer profiled. On the graded shape the real picture is: warps_active ~18%
+which already EQUALS sm__maximum_warps_per_active_cycle_pct (~18.75%), i.e.
+occupancy is MAXED at 3 blocks/SM, co-limited by BOTH
+launch__occupancy_limit_registers=3 AND launch__occupancy_limit_shared_mem=3.
+tensor pipe is ~28% (cuBLAS reaches 60%+); the smem round-trip
+(l1tex__...mem_shared) is large.
+
 Make ONE coherent structural change (one idea) to kernels/int8_attention.cu or
 kernels/int8_mlp.cu (you may touch kernels/int8_common.cuh if shared). "One
 change" is NOT a size limit: a full rewrite of a kernel's main loop counts as
-one change. BE BOLD — the profiling above shows the bottleneck (warps_active
-~7.4%, tensor pipe ~13-16%, smem round-trip unchanged) has not moved across
-prior iterations of safe loop-reorderings. Pursue the §4 headline lever
-(mma.sync m16n8k32 with P kept IN REGISTERS, eliminating the
-scores->smem->ldmatrix round-trip) even if it is a large multi-step rewrite. A
-bold attempt that gets reverted by the gates is better than a latency-neutral
-no-op. Do NOT downgrade to a one-line reorder to play safe.
+one change. BE BOLD. A bold attempt that gets reverted by the gates is better
+than a latency-neutral no-op. Do NOT downgrade to a one-line reorder to play
+safe.
+
+Where the real headroom is (pick ONE, justify from the numbers above):
+- The kernel is occupancy-MAXED at 3 blocks/SM AND already runs P in registers
+  via the INT8_ATTN_REGPV=1 default path (mma.sync m16n8k32 QK^T + P@V is
+  ALREADY built — do NOT "add" it). With only ~12 warps/SM there are too few
+  warps to hide the smem-round-trip + MMA latency, so tensor pipe stalls at
+  ~28%. The two real levers are: (a) raise occupancy to 4 blocks/SM, which
+  requires cutting BOTH registers AND shared-memory-per-block below their
+  4-block thresholds TOGETHER (a registers-only cut is a NO-OP — smem still
+  caps at 3); or (b) cut the smem round-trip / raise per-warp ILP so the
+  existing 12 warps hide more latency.
 Hard rules:
 - Do NOT touch LayerNorm/residual handling, the public interface signatures,
   or anything outside kernels/.
 - Do NOT retry the known negative results: cp.async double-buffering
   (INT8_ATTN_DB) and V register prefetch (INT8_ATTN_VPREFETCH).
-- Registers: the target is OCCUPANCY (blocks/SM), not a fixed register cap. You
-  MAY raise per-thread registers if it removes smem traffic and holds blocks/SM
-  (the attention kernel already runs at 160-236 regs). No spills, and do not
-  drop blocks/SM below the current baseline. Check with ptxas.
+- Registers: the target is OCCUPANCY (blocks/SM), not a fixed register cap, and
+  on this shape occupancy is already maxed — a registers-only change that does
+  not also reduce shared memory will NOT add a block. No spills, and do not
+  drop blocks/SM below the current baseline. Check with ptxas AND re-profile.
 After editing, output exactly two lines:
 CHANGE: <files + what you changed>
 TARGET: <which metric you expect to improve and why>

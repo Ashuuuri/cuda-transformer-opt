@@ -594,3 +594,47 @@ behind them. Append a new `### Iteration N` here after each optimization
   only the split-KV path ships. This iteration opens the **decode regime** as the
   place the INT8 KV-cache byte advantage is realized (the prefill/square kernel's
   value is compute, not the cache); see `CLAUDE.md` §4 "What winning means".
+
+### Iteration 15 - 2026-06-13  (decode dp4a lane-per-position — WIN @ D=64)
+- **Change**: `kernels/int8_decode_attention.cu` — new partial kernel
+  `int8_decode_partial_dp4a_kernel<HEAD_DIM>` that flips the warp's intra-lane
+  division. The original `int8_decode_partial_kernel` gives each lane DPL=HEAD_DIM/32
+  *dims* → it needs a 6-step `__shfl` score reduction **per KV position** (the
+  fixed per-step overhead that left D=64 instruction-bound at ~25% HBM BW, iter
+  14). The dp4a variant gives each lane a whole KV **position** per 32-position
+  tile: lane L scores position (t+L) with a FULL HEAD_DIM dot via `__dp4a`
+  (HEAD_DIM/4 ops, NO per-position reduction), the warp reduces only **twice per
+  tile** (softmax max + sum via `__shfl_xor`). P·V flips back to dims-layout (lane
+  owns DPL acc dims, V read coalesced) and broadcasts each position's `p·sV` with a
+  single `__shfl`. Q stays resident as HEAD_DIM/4 int32 words. Barrier-free, no
+  smem, unchanged combine kernel. Selected per head_dim by the host (see below);
+  `INT8_DECODE_DP4A` (default 1) forces the original D=64 path off for A/B.
+- **Target metric**: decode-step latency / HBM BW at HEAD_DIM=64 (the iter-14
+  instruction-bound case); `bench_attn_decode.py`.
+- **Profiling results** (mean ms / decode step, vs FP16 SDPA; dp4a vs iter-14):
+  - **HEAD_DIM=64 — WIN.** B≥32 (serving scale) went **0.61–0.94× → 1.24–1.56×**
+    (e.g. B=32 S=4096 0.74×→1.56×; B=64 S=2048 0.67×→1.35×; B=128 S=4096
+    0.64×→1.26×). **HBM BW ~390 → up to 786 GB/s (≈2×, ~50% of peak)** — the
+    hypothesis held exactly: removing the per-position reduction moved D=64 from
+    instruction-bound back to bandwidth-bound. Tiny B=8 improved 0.46–0.66× →
+    0.80–1.04× (still grid-starved at batch×heads=64 on 108 SMs — a batch-size
+    limit, not a kernel one).
+  - **HEAD_DIM=128 — dp4a REGRESSES (0.86–0.93×).** NW=32 int32 Q words held in
+    registers cut occupancy; the original lane-per-dim split-KV (DPL=4 already
+    amortizes the reduction well) keeps its 1.23× win. So the host **dispatches the
+    empirically-best partial per head_dim**: D=64 → dp4a, D=128 → original. The
+    dp4a-128 path is left compiled-out of the default dispatch (a documented
+    negative; reachable for ablation but not shipped).
+- **Accuracy validation**: decode cos vs fp32 SDPA **0.99994–0.99995** across all
+  shapes (unchanged). 5-gate `validate_int8.py` **ALL PASS** (Gate 5 real GPT-2
+  −0.068%, unchanged) — dp4a is an isolated new decode kernel; the prefill MLP /
+  attention paths and the `tests/cuda/` .bin flow are untouched.
+- **Conclusion**: PASS / SHIPPED for HEAD_DIM=64. Decode attention now **beats
+  FP16 SDPA at every serving-scale shape (B≥32) for both head dims** (D=64
+  1.24–1.56× via dp4a, D=128 1.23–1.24× via split-KV), at half the KV-cache bytes.
+  This closes the iter-14 "D=64 instruction-bound" future-work item. **dp4a@D=128
+  is a do-not-retry** (reg-pressure regression). Remaining decode future work is
+  only the small-batch (B=8) grid-starvation, which is a launch-shape limit (more
+  NSPLIT helps marginally; fundamentally batch×heads is just small). The
+  prefill/square attention kernel remains perf-exhausted (only the online-softmax
+  dependency chain, §4 #2, is left there).

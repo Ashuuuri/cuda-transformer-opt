@@ -230,19 +230,24 @@ streamed per generated token). New entry point `int8_decode_attention_forward`
 NSPLIT warps cooperate per (b,h), each scanning one KV chunk into a partial
 online-softmax state, then a combine kernel merges them with log-sum-exp rescale
 (multiplies resident warps → fills the SMs → saturates HBM BW; a v1 one-warp-per-
-(b,h) version was grid-starved at ~34% BW and lost — superseded).
+(b,h) version was grid-starved at ~34% BW and lost — superseded). The host picks
+the best partial kernel per head_dim (iter 14–15):
 
-| Shape | ours/FP16-SDPA | HBM BW | KV bytes |
+| Shape (B≥32, serving scale) | ours/FP16-SDPA | HBM BW | partial kernel |
 |---|---|---|---|
-| **head_dim=128** (B=64 H=16, S=1024–4096) | **1.23×** (faster) | 757–826 GB/s (~52% peak) | **half** |
-| head_dim=64 | 0.46–0.94× (slower) | ~390 GB/s (~25% peak) | **half** |
+| **head_dim=64** | **1.24–1.56×** | up to 786 GB/s (~50% peak) | dp4a lane-per-position |
+| **head_dim=128** | **1.23–1.24×** | 757–826 GB/s (~52% peak) | split-KV lane-per-dim |
 
-At head_dim=128 (the common real-LLM head size — Llama/Mistral) the INT8 decode
-kernel **beats the FP16 SDPA decode path by 1.23× at half the KV-cache bytes**,
-cos 0.9999 vs fp32. head_dim=64 is *instruction-bound* (only 2 bytes/lane per KV
-step, so the fixed per-step `__shfl` reduction + `__expf` dominate) — the fix is a
-one-lane-per-KV-position `dp4a` layout (future work). Benchmark:
-`python bench_attn_decode.py`.
+Both at **half the KV-cache bytes**, cos 0.9999 vs fp32. **The INT8 decode kernel
+beats the FP16 SDPA decode path at every serving-scale shape** (head_dim=128 is
+the common real-LLM size — Llama/Mistral; head_dim=64 is GPT-2). head_dim=64 was
+*instruction-bound* under the original lane-per-dim layout (only 2 bytes/lane per
+KV step, so the fixed per-step `__shfl` reduction dominated, ~25% BW); the **dp4a
+lane-per-position** rewrite (iter 15 — each lane does a full HEAD_DIM `__dp4a` dot,
+the warp reduces twice per 32-position tile instead of 6× per position) doubled
+its bandwidth and flipped it to a win. Only tiny batches (B=8) stay below 1.0×
+(grid starvation: batch×heads too small for 108 SMs — a launch-shape limit, not a
+kernel one). Benchmark: `python bench_attn_decode.py`.
 
 ### SOTA comparison — vs SageAttention, not just FP16 peers
 
@@ -264,5 +269,10 @@ SOTA the prefill kernel is competitive.
   high-risk. Both attention occupancy levers are already proven dead.
 - Per-channel / smoothing for **attention** K/V (the remaining outlier XFAIL is
   attention-only; the MLP per-token output already shipped, iter 9).
-- **Decode head_dim=64** — one-lane-per-KV-position `dp4a` layout to remove the
-  per-step warp-shuffle reduction (currently instruction-bound at ~25% HBM BW).
+- **Decode small-batch (B=8)** — the only decode shape still below 1.0× vs SDPA,
+  from grid starvation (batch×heads too small for 108 SMs), a launch-shape limit
+  not a kernel one. (head_dim=64's instruction-bound case was *closed* in iter 15
+  by the dp4a lane-per-position rewrite — now 1.24–1.56×.)
+- **Do not retry: dp4a lane-per-position at head_dim=128** — it regresses to
+  0.86–0.93× there (NW=32 int32 Q words in registers cut occupancy); the original
+  lane-per-dim split-KV keeps the D=128 win. dp4a is dispatched for D=64 only.

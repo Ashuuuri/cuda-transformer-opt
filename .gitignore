@@ -11,3 +11,10 @@ testdata/
 test_attention
 test_mlp
 test_int8
+
+# Profiler raw streams / intermediates (regenerable; keep CSVs + figures only)
+*.qdstrm
+*.nsys-rep
+*.sqlite
+results/nsys_*_stats.txt
+results/ncu_*_report.txt

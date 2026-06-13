@@ -175,28 +175,40 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
 ## 4. Optimization Targets & Rules
 
 **Optimize first** (by expected return):
-1. **smem bank conflicts in the `int8_mlp.cu` GEMM fragment loads** — now the
-   PRIMARY target, profile-identified (2026-06-13). On the graded MLP shape
-   (b=8, s=512, d_model=1024, d_ff=4096) both GEMMs are **L1/smem-pipe bound,
-   NOT DRAM- or compute-bound**: `l1tex__throughput` 78%/67%, `dram__throughput`
-   only 3–4%, `tensor_op_imma` only 16–18%. **~46% of all smem-load wavefronts
-   are bank conflicts** (`l1tex__data_bank_conflicts_..._op_ld` 16.78M of 36.2M
-   `..._wavefronts_mem_shared_op_ld`). Root cause: `A_SMEM_STRIDE = STAGE_K +
-   SMEM_SKEW = 48` bytes → `stride/4 = 12` (even) → the 16 fragment-row starts
-   collide period-8 (2-way conflict). **A pure stride change CANNOT fix this:**
-   the 16B `cp.async` loader requires each smem row start to be 16-byte aligned,
-   so `A_SMEM_STRIDE % 16 == 0`, which forces `stride/4` even → ≥2-way conflict
-   for every legal stride (skew=16's 2-way is already the best stride option;
-   skew 0→4-way, 32→8-way). The correct fix is **XOR swizzling**: keep 16B-
-   aligned chunks but permute each chunk's bank by XOR-ing the smem column
-   offset with a function of the row (CUTLASS-style), and apply the SAME swizzle
-   to the `load_matrix_sync` fragment-read addressing. Verify the B-matrix
-   (`B_SMEM_STRIDE=144`) pattern too, and confirm with the bank-conflict metric
-   on `profile_kernel.py mlp`, not `--quick`. **NOTE: a
-   multi-stage cp.async pipeline is the WRONG lever here** — DRAM is 3–4% and
-   `long_scoreboard` only 12–16%, so there is almost no global-load latency to
-   hide (cp.async double-buffer was also a *negative on attention*,
-   `INT8_ATTN_DB`). Do not chase it; the smem pipe is the ceiling.
+1. **The `wait` (MMA dependency) stall in the `int8_mlp.cu` GEMMs** — the live
+   PRIMARY target after iters 7–8 cleared the two prior ceilings. History on the
+   graded MLP shape (b=8, s=512, d_model=1024, d_ff=4096):
+   - **smem bank conflicts: FIXED in iter 7** (do not re-attempt). Were
+     L1/smem-pipe bound (`l1tex` 78%/67%, `dram` 3–4%, ~46% of smem-load
+     wavefronts were conflicts, 16.78M). The fix was NOT XOR swizzle (proved
+     unnecessary) but the hand-rolled `mma.sync m16n8k32` k-contiguous load whose
+     per-instruction bank map `(stride/4·group + tid) mod 32` is a bijection over
+     the 32 lanes whenever `stride/4 = 4·odd` (stride 48→12=4·3 ✓, stride 80→
+     20=4·5 ✓); both keep the 16B `cp.async` alignment. Conflicts → ≈0,
+     `l1tex` → 39%/29%.
+   - **global-load latency (`long_scoreboard`): FIXED in iter 8** (do not
+     re-attempt deeper k-staging). After iter 7 removed the smem ceiling,
+     `long_scoreboard` rose to **18.7%/27.4%** (DRAM still 5–6% → pure latency,
+     not bandwidth — this is exactly what invalidated the old "multi-stage is the
+     wrong lever" note, which was measured at 12–16% pre-iter-7). Raising
+     `STAGE_K` 32→64 (each cp.async round carries 2× the data → half as many
+     global-load sync points) cut it to **5.5%/7.7%** and lifted `tensor_op_imma`
+     to 30%/38%; latency −6% to −17%, occupancy held at 2 blocks/SM (`launch_
+     bounds(256,2)` caps regs at 128 despite a small spill; smem 32→40 KB did NOT
+     cost a block — the SM smem budget is ≥80 KB). A *true 3-stage* cp.async
+     pipeline is now the dead end the old note warned about: STAGE_K=64 already
+     hides the latency, and a 3rd buffer would grow smem past the epilogue's
+     32 KB ceiling. (cp.async double-buffer was also a *negative on attention*,
+     `INT8_ATTN_DB`.)
+   - **NOW: `wait` (~21%/28%, the new top stall) = MMA-result dependency
+     latency.** `tensor_op_imma` is 30%/38% vs cuBLAS 60%+; the gap is the per-
+     warp serial chain feeding the IMMA pipe at fixed 2-block occupancy
+     (occupancy is structurally dead — the `acc[2][4][8]` register tile alone is
+     ~64 regs, so `launch_bounds(256,3)` would spill catastrophically). The
+     remaining lever is a denser-mma schedule that overlaps more independent IMMA
+     chains (e.g. reorder the rt×ct×{n8-halves} issue so back-to-back mma.sync hit
+     distinct accumulators, or restructure the warp output tile). Confirm with
+     `wait`/`tensor_op_imma` on `profile_kernel.py mlp`, not `--quick`.
 2. The WMMA main loop in `int8_attention.cu` — **occupancy well is DRY; only a
    deep algorithmic change remains.** What is already DONE (do not re-attempt):
    the `INT8_ATTN_REGPV=1` default path keeps P in registers and uses `mma.sync`
@@ -604,3 +616,42 @@ After each optimization, append a section at the bottom of this file:
 - **Conclusion**: pass — largest single-iteration MLP gain so far. Next: push
   `tensor_op_imma` (still ~28%) toward the cuBLAS 60%+ ceiling now that the
   smem-pipe bottleneck is gone — a deeper k-stage pipeline or denser-mma schedule.
+
+
+### Iteration 8 - 2026-06-13
+- **Change**: `kernels/int8_mlp.cu` — raised the cp.async K-stage depth
+  `INT8_MLP_STAGE_K` 32 → 64 (one-line default; the `mlp_int8_mainloop`
+  `for kk in 0..STAGE_K step 32` loop already handles it, now 2 `mma.sync
+  m16n8k32` per acc per cp.async round). smem strides grow `A/B_SMEM_STRIDE`
+  48 → 80; stride 80 stays conflict-free (`stride/4 = 20 = 4·5`, gcd(5,8)=1 →
+  the 8 ×4-multiple banks are all distinct, bijection over 32 lanes) and 16B-
+  aligned (80 = 5·16), so iter-7's conflict-free property is preserved.
+- **Target metric**: `smsp__warp_issue_stalled_long_scoreboard_per_warp_active`
+  down and `sm__pipe_tensor_op_imma_cycles_active` up — after iter 7 cleared the
+  smem-pipe ceiling, `long_scoreboard` (global-load latency, DRAM only 5–6% → pure
+  latency) became a top stall; a deeper k-stage carries 2× data per cp.async round
+  → half as many global-load sync points → less exposed latency + longer back-to-
+  back MMA runs.
+- **Profiling results** (graded shape b=8 s=512 d_model=1024 d_ff=4096):
+  - `long_scoreboard`: **18.7%/27.4% → 5.5%/7.7%** (GEMM1/GEMM2)
+  - `tensor_op_imma` active: **26.1%/30.9% → 29.7%/38.2%**
+  - `wait` (now the top stall): 19.5%/24.3% → 21.5%/28.2%
+  - `l1tex__throughput`: 39%/29% → 42%/34%; bank conflicts still ≈0 (8.4K/1.6K)
+  - registers 128 (launch_bounds-capped; small 48/52 B spill), 2 blocks/SM (held);
+    smem 32 → 40 KB, no occupancy loss (SM smem budget ≥ 80 KB)
+  - **latency: −6% to −17% across the full 12-point sweep**, reproducible across
+    two runs (d1024 s1024 1.03→0.89; s4096 3.50→3.02; d2048 s2048 6.20→5.18,
+    s4096 12.09→10.04). Speedup vs naive 0.55–0.79× → 0.59–0.97×.
+- **Accuracy validation** (all five gates PASS on all 8 datasets + task-level;
+  numerics bit-identical to iter 7 — STAGE_K is pure tiling, same int32
+  accumulation order):
+  - [x] Gate 1: math metrics (normal mlp cos=0.99966)
+  - [x] Gate 2: numeric stability
+  - [x] Gate 3: stage error trace
+  - [x] Gate 4: edge cases
+  - [x] Gate 5: task-level (ppl fp16=504.81 int8=504.87 +0.011%, top1 100%)
+- **Conclusion**: pass — second MLP win in a row. The two prior MLP ceilings
+  (smem bank conflicts, global-load latency) are now both exhausted; the new
+  bottleneck is the `wait` MMA-dependency stall (`tensor_op_imma` 30%/38% vs
+  cuBLAS 60%+) at structurally-fixed 2-block occupancy. Next: a denser-mma
+  schedule that overlaps more independent IMMA chains.

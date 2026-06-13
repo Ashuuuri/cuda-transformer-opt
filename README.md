@@ -278,6 +278,22 @@ blocks/SM). All five accuracy gates pass on all 8 datasets (task-level ppl
 change alone removes the conflicts while keeping `load_matrix_sync`'s 16-byte
 store efficiency.
 
+**Follow-up — deeper K-stage (2026-06-13, iter 8): a further −6% to −17%.** Once
+iter 7 cleared the smem-pipe ceiling, the dominant stall shifted to
+`long_scoreboard` (global-load latency: **18.7%/27.4%** on the two GEMMs, with
+DRAM still only 5–6% → pure latency, not bandwidth). Raising the cp.async K-stage
+depth `INT8_MLP_STAGE_K` 32 → 64 (each round carries 2× the data → half as many
+global-load sync points) cut `long_scoreboard` to **5.5%/7.7%** and lifted
+`tensor_op_imma` to **30%/38%**. The wider smem stride (48 → 80 B) stays
+conflict-free — `stride/4 = 20 = 4·5`, gcd(5,8)=1, so the bank map is still a
+bijection — and 16-byte aligned. Latency **−6% to −17% across the full sweep**
+(d_model=1024 s=4096: 3.50→3.02 ms; d_model=2048 s=4096: 12.09→10.04 ms),
+reproducible across two runs; occupancy held at 2 blocks/SM (128 regs, smem
+32→40 KB, no block lost). All five gates pass (numerics bit-identical — STAGE_K
+is pure tiling). The new ceiling is the `wait` MMA-dependency stall
+(`tensor_op_imma` 30%/38% vs cuBLAS 60%+) at structurally-fixed 2-block
+occupancy.
+
 ### Future work
 
 - `mma.sync` PTX path (m16n8k32 for INT8 QK^T, register-resident softmax

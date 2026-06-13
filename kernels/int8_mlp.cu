@@ -2,7 +2,7 @@
 // Owner: Heling
 //
 // Architecture:
-//   128×128 block tile, 8 warps, 16×16×16 WMMA, cp.async double-buffer (STAGE_K=32).
+//   128×128 block tile, 8 warps, mma.sync m16n8k32, cp.async double-buffer (STAGE_K=64).
 //   Each warp computes a 32×64 output sub-tile (2 row tiles × 4 col tiles).
 //   Arithmetic intensity: 2×128×128 / ((128+128)×1) = 128 ops/byte (was 64).
 //
@@ -11,7 +11,8 @@
 //     GEMM2: int8 hidden × int8 W2  →  INT32 acc × (scale_hidden·scale_W2) → INT8 out
 //
 // Ablation flags:
-//   INT8_MLP_STAGE_K=N   change K-stage depth (default 32)
+//   INT8_MLP_STAGE_K=N   change K-stage depth (default 64; deeper k-stage hides
+//                        global-load latency — see iter 8)
 //   INT8_MLP_DYNAMIC=0   static per-tensor scales (worst-case bound
 //                        sx*sW1*d_model). Default 1: dynamic quantization —
 //                        per-token hidden scales computed in the GEMM1
@@ -43,7 +44,7 @@ __device__ __forceinline__ void atomic_max_pos_f32(float* addr, float val) {
 #define WMMA_N  16
 #define WMMA_K  16
 #ifndef INT8_MLP_STAGE_K
-#define INT8_MLP_STAGE_K 32
+#define INT8_MLP_STAGE_K 64
 #endif
 #define STAGE_K          INT8_MLP_STAGE_K
 #define BLOCK_M          128                                    // was 64

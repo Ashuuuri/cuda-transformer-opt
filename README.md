@@ -163,239 +163,65 @@ When a test fails, the checker prints diagnostics: worst error location, first 8
 
 ## Continued INT8 Optimization (post-course, `opt-dev`)
 
-After the course wrapped, the INT8 kernels were further optimized on a
-dedicated A100-SXM4-40GB (CUDA 12.8). All numbers below are from that
-machine (batch=8 sweeps; see `results/*.csv` for full data).
+After the course, the INT8 kernels were optimized further on a dedicated
+A100-SXM4-40GB (CUDA 12.8). Headlines below; the **full iteration-by-iteration
+journey — before/after ncu numbers, validation traces, and negative results —
+is in [`OPTIMIZATION_LOG.md`](OPTIMIZATION_LOG.md)**, and the distilled
+"what's exhausted / do-not-retry" rules are in `CLAUDE.md` §3–§4.
 
 ### Benchmark hardening
 
-- INT8 attention is now compared against **FlashAttention-2** and the
-  **FP16 WMMA kernel** (same engineering level, isolates the INT8 effect),
-  not just naive PyTorch.
-- INT8 MLP is compared against the **full cuBLAS INT8 pipeline**
-  (`_int_mm` + dequant/GELU/requant — the same work our kernel does), with
-  bare `2x _int_mm` kept as a GEMM-only lower bound.
-- Sweeps emit `kernel_max_err` / `kernel_mean_err` columns (accuracy vs the
-  FP16 reference) and use a blended INT8/FP16 peak (416 TOPS) for attention
-  utilization. New entries: `python sweep.py --kernel int8_attn | int8_mlp`.
+- INT8 attention vs **FlashAttention-2** and the **FP16 WMMA kernel** (same
+  engineering level, isolates the INT8 effect), not just naive PyTorch.
+- INT8 MLP vs the **full cuBLAS INT8 pipeline** (`_int_mm` + dequant/GELU/requant
+  — the same work our kernel does), with bare `2× _int_mm` as a GEMM-only lower
+  bound.
+- Sweeps emit `kernel_max_err` / `kernel_mean_err` columns and use a blended
+  INT8/FP16 (416 TOPS) attention peak. `python sweep.py --kernel int8_attn | int8_mlp`.
 
-### INT8 attention: 1.6–2.2x (commit 9473d42)
+### Performance results (graded sweep, batch=8; see `results/*.csv`)
 
-The WMMA kernel is now templated on `(TILE_KV, HEAD_DIM)`. With a runtime
-`head_dim`, the fragment arrays are dynamically indexed and nvcc spills them
-to local memory — every MMA and every online-softmax rescale paid a local
-load+store. Compile-time `HEAD_DIM` plus k-outer loop ordering (each Q /
-scores fragment loaded once per k-step instead of once per KV-group/slice)
-gives 1.6x at head_dim 64/128 and 2.0–2.2x at head_dim 256, closing the
-FlashAttention-2 gap from 0.30x to ~0.62x. Accuracy unchanged (~1e-3).
+| Kernel | Result | Iter |
+|---|---|---|
+| INT8 attention | **1.6–2.2×** (templated `(TILE_KV, HEAD_DIM)`, k-outer loop, fragments compile-time-indexed); FA2 gap 0.30×→0.62× | 1 |
+| INT8 MLP GEMMs | **−26% to −40%** (k-contiguous `mma.sync m16n8k32`, conflict-free bank map) then a further **−6% to −17%** (`STAGE_K` 32→64) | 7–8 |
+| INT8 MLP forward | **−9% to −22%** at the graded s=512 (prepacked transpose-once for static weights: `int8_mlp_forward_prepacked`) | 11 |
 
-Negative results (kept as ablation flags, both measured slower on A100):
+Both kernels are now **perf-exhausted on every explored lever** — the MLP GEMM
+(smem bank conflicts, global-load latency, the `wait` stall, and occupancy from
+*both* directions) and attention occupancy. The only remaining kernel-internal
+lever is the attention online-softmax dependency chain (deep, high-risk). The
+proofs are in the log.
 
-- `INT8_ATTN_DB=1` — cp.async double buffering. Fitting two K/V buffers
-  forces TILE_KV down (128→64); the doubled per-tile softmax/barrier
-  overhead outweighs the overlap (0.58–0.82x).
-- `INT8_ATTN_VPREFETCH=1` — V register prefetch. The extra block-wide
-  barrier before attn×V costs more than the hidden global latency
-  (0.75–0.9x). Warp parallelism already covers the loads.
+### Accuracy — real-model, per-channel/per-token quant (iter 9)
 
-**Negative result — raising occupancy to 4 blocks/SM does not help (2026-06-13).**
-On the graded shape (b=8, head_dim=64, the only head_dim sweep.py grades) the
-default `<TILE_KV=128, HEAD_DIM=64>` kernel runs at **3 blocks/SM**, co-capped
-by *both* registers (164 regs → `occupancy_limit_registers`=3) and shared
-memory (`occupancy_limit_shared_mem`=3 at the 132 KB carveout). The fallback
-`<TILE_KV=64, HEAD_DIM=64>` config compiles to only **122 registers** and
-19.5 KB smem, so forcing the graded shape onto it reaches a genuine **4
-blocks/SM** (`occupancy_limit_registers`=4, `occupancy_limit_shared_mem`=4,
-`sm__maximum_warps_per_active_cycle_pct` 18.75%→25%, `sm__warps_active`
-~18%→23.5%). **Latency did not improve:** −0% to +1% across seq 1024–4096
-(within noise), +8% at seq=512 (more tiles → more loop/softmax overhead at
-small grids). `sm__pipe_tensor_cycles_active` stayed pinned at ~28% with 16
-warps, exactly as with 12. Conclusion: this kernel is **neither
-occupancy-bound nor smem-traffic-bound** — an earlier −24%-smem-traffic
-experiment also gave no speedup. The ~28% tensor-pipe ceiling is set by the
-**per-warp serial dependency chain** (`ldmatrix → mma → exp/MUFU → pack →
-mma`, plus the cross-KV-tile online-softmax rescale dependency), which more
-warps cannot hide and less smem traffic cannot relieve. Both occupancy levers
-are therefore exhausted for attention; the remaining angle is breaking the
-softmax dependency chain itself (deeper, higher-risk). Optimization effort
-moves to the MLP GEMMs (compute-bound, multi-stage cp.async pipelining
-unexplored). Probe was launch-policy only (no code path kept; the 64-tile
-config still serves seq % 128 ≠ 0).
+Gate 5 was switched from random weights to **real GPT-2 on real WikiText-2**,
+which exposed that per-tensor MLP *output* quant costs **+64%** perplexity (it
+crushes emergent output-channel outliers). Per-channel weights + per-token
+activations + **per-token output** quant — added as a *new* entry point
+`int8_mlp_forward_per_channel` (the per-tensor `int8_mlp_forward` and the
+`tests/cuda/` .bin flow are unchanged) — recovers it: real perplexity
+**31.946 → 31.925 (−0.068%)**, gate bar <2%. The `outlier`/`boundary`/`stress`
+MLP datasets now pass outright.
 
-### INT8 MLP: dynamic quantization (commit 0db4387)
+### Ablation flags (negative results, OFF by default — do not re-attempt)
 
-The static hidden scale (`sx·sW1·d_model`) is a worst-case bound that is
-~sqrt(d_model) too conservative — max error grew 0.04 → 0.49 over d_model
-512 → 2048. Now: the GEMM1 epilogue gathers per-token row absmax (register
-accumulation + half-warp shuffle reduction, one atomic per row), hidden is
-requantized per-token, GEMM2 applies per-row scales from smem, and the
-output uses a dynamic per-tensor scale. `__launch_bounds__(256, 2)` is
-required to keep the epilogue at 128 registers (2 blocks/SM).
+| Flag | Idea | Result |
+|---|---|---|
+| `INT8_ATTN_DB` | cp.async double-buffer (attention) | 0.58–0.82× (forces TILE_KV down) |
+| `INT8_ATTN_VPREFETCH` | V register prefetch (attention) | 0.75–0.9× (extra barrier) |
+| `INT8_MLP_FINE_WARP` | 4×4 / 512-thread finer tile (MLP) | +15–28% — doubles occupancy & halves `wait`, but halves operand reuse so `tensor_op_imma` net falls |
+| `INT8_MLP_DYNAMIC=0` | static (non-dynamic) MLP scales | lower accuracy; kept for the .bin flow |
 
-| d_model | max err (static → dynamic) | mean err | latency |
-|---------|---------------------------|----------|---------|
-| 512     | 0.039 → 0.022             | 2.0x better | +5–14% |
-| 1024    | 0.124 → 0.052             | 4.3x better | +5–6%  |
-| 2048    | 0.49 → 0.107              | 9.2x better | +1%    |
-
-Static scales remain available via `INT8_MLP_DYNAMIC=0`.
-
-**MLP GEMM bottleneck = smem-read bank conflicts (profiled 2026-06-13).** On
-the graded MLP shape (b=8, s=512, d_model=1024, d_ff=4096) both GEMMs are
-**L1/smem-pipe bound** (`l1tex__throughput` 78%/67%), not DRAM (3–4%) or
-compute (`tensor_op_imma` 16–18%) bound, and **~46% of smem-load wavefronts are
-bank conflicts** (16.78M of 36.2M). The 16-byte `cp.async` loader forces every
-smem row stride to be a multiple of 16, which makes `A_SMEM_STRIDE/4` even and
-collides the 16 WMMA fragment rows period-8 (2-way). (So multi-stage cp.async
-is the *wrong* lever here — there is almost no DRAM latency to hide.)
-
-**Negative result — conflict-free stride via 4-byte cp.async is slower.** Setting
-`SMEM_SKEW` 16→4 (strides 36/132, `stride/4` odd → 16 distinct banks) and
-switching the loader to 4-byte `cp.async` cut bank conflicts **16.78M → 2.10M
-(−87%)** and dropped `l1tex__throughput` 78%→48% — but latency got **~30% WORSE**
-(d_model=1024: 0.86→1.09 ms) because the 4× more cp.async store instructions
-flooded the issue pipe (`smsp__inst_executed` →55%, `lg_throttle` →10%). So the
-read-conflict relief is real, but it must NOT come at the cost of 16-byte stores.
-Reverted.
-
-**Resolution — hand-rolled `mma.sync m16n8k32` over a k-contiguous layout
-(2026-06-13, iter 7): 1.35–1.67× faster.** The conflicts come from
-`load_matrix_sync`'s internal int8 access pattern, not from the stride per se.
-Replacing both GEMM inner loops with native
-`mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32` (the attention QK^T path,
-operands loaded as plain 4-byte smem words) makes the per-instruction bank map
-`(12·group + tid) mod 32` a *bijection* over the 32 lanes — **conflict-free with
-the original 16-byte `cp.async` stores, no XOR swizzle needed**. The one
-prerequisite: int8 `mma.sync` needs its B operand k-contiguous, but the weights
-are `[K][N]` (n-contiguous) and there is no int8 `trans`-`ldmatrix`, so W1/W2 are
-**pre-transposed to `[N][K]`** once per forward (a ~1–2% bandwidth pass).
-Measured on the graded shape: bank conflicts **16.78M → ~3K (≈0)**,
-`l1tex__throughput` **78%/67% → 39%/29%**, and end-to-end latency **−26% to −40%
-across the full sweep** (d_model=1024 s=512: 0.89→0.64 ms; s=4096: 5.55→3.50 ms),
-reproducible across runs. Registers/occupancy unchanged (128 regs, 0 spills, 2
-blocks/SM). All five accuracy gates pass on all 8 datasets (task-level ppl
-+0.011%). The XOR swizzle turned out to be unnecessary — the access-pattern
-change alone removes the conflicts while keeping `load_matrix_sync`'s 16-byte
-store efficiency.
-
-**Follow-up — deeper K-stage (2026-06-13, iter 8): a further −6% to −17%.** Once
-iter 7 cleared the smem-pipe ceiling, the dominant stall shifted to
-`long_scoreboard` (global-load latency: **18.7%/27.4%** on the two GEMMs, with
-DRAM still only 5–6% → pure latency, not bandwidth). Raising the cp.async K-stage
-depth `INT8_MLP_STAGE_K` 32 → 64 (each round carries 2× the data → half as many
-global-load sync points) cut `long_scoreboard` to **5.5%/7.7%** and lifted
-`tensor_op_imma` to **30%/38%**. The wider smem stride (48 → 80 B) stays
-conflict-free — `stride/4 = 20 = 4·5`, gcd(5,8)=1, so the bank map is still a
-bijection — and 16-byte aligned. Latency **−6% to −17% across the full sweep**
-(d_model=1024 s=4096: 3.50→3.02 ms; d_model=2048 s=4096: 12.09→10.04 ms),
-reproducible across two runs; occupancy held at 2 blocks/SM (128 regs, smem
-32→40 KB, no block lost). All five gates pass (numerics bit-identical — STAGE_K
-is pure tiling). The new ceiling is the `wait` MMA-dependency stall
-(`tensor_op_imma` 30%/38% vs cuBLAS 60%+) at structurally-fixed 2-block
-occupancy.
-
-**Negative result — denser-mma reschedule does not help; the MLP is now
-perf-exhausted (2026-06-13, iter 10).** The `wait` ceiling above looked
-addressable by a denser warp-level mma schedule. Tested: hoist both row tiles'
-A fragments per kk and make the col-tile loop outer, so each weight (B) fragment
-loads once and is reused across row tiles, with the 4 mma per col tile issuing
-back-to-back into 4 distinct accumulators. Result: **+1.5% to +3.0% latency
-regression across all 12 sweep shapes** (median of 5 runs), reverted. Two
-reasons it cannot work: (1) GEMM2's `tensor_op_imma` (38.25→38.24%) and `wait`
-(28.17→28.18%) were **byte-identical** under the reorder — `ptxas` already
-common-subexpression-eliminates the "redundant" B loads, so the warp-level mma
-order is already at the compiler's optimum; the load redundancy was a phantom.
-(2) The `wait` stall is structural: hiding MMA-result latency needs more
-independent accumulator chains in flight, but the `acc[2][4][8]` tile is already
-64 registers and any more spills at the fixed 2-block/SM occupancy. Both MLP
-perf levers — occupancy and denser-mma — are now empirically dead; the only
-remaining *kernel-internal* perf lever in the project is the attention
-online-softmax dependency chain.
-
-**End-to-end win — prepacked (transpose-once) MLP for static-weight inference
-(2026-06-13, iter 11).** The GEMM *kernel* is exhausted, but the MLP *forward*
-was not: the m16n8k32 B fragment needs the weights staged k-contiguous, so
-`int8_mlp_forward` re-transposes W1/W2 to `[N][K]` on **every** call. The
-torch.profiler kernel-time breakdown showed this transpose is **~10% of MLP
-forward time** at the graded shape (b=8 s=512 d_model=1024). Weights are constant
-across forwards, so iter 11 adds a static-weight path that transposes once at
-load: `transpose_int8_weights(W1,W2) → (W1T,W2T)` plus
-`int8_mlp_forward_prepacked` (per-tensor scales, takes the pre-transposed
-weights, skips the internal pass). It is a *new* entry point — the per-tensor
-`int8_mlp_forward`, `int8_mlp_forward_per_channel`, and the `tests/cuda/` .bin
-flow are all unchanged — and its output is `torch.equal` bit-identical to
-`int8_mlp_forward` on every sweep shape. `sweep.py` now transposes once outside
-the timed loop and grades this path (the realistic deployment pattern). Result
-(median of 5): MLP forward latency **−22% (d_model=512), −9% (d_model=1024),
-−12% (d_model=2048)** at the graded s=512; the win shrinks with seq_len as the
-GEMM dwarfs the fixed transpose (−1.5% to −3% at s=4096). The dashboard's
-kernel-time panel shows the all-in-one (79% GEMM + 10% transpose) vs prepacked
-(88% GEMM, no transpose) split side by side. Lesson: the kernel well was dry, but
-the forward orchestration around it was not.
-
-**Negative result — finer warp tiling raises occupancy and halves `wait` but
-still regresses (2026-06-13, iter 12, `INT8_MLP_FINE_WARP`).** Iters 8/10 showed
-you cannot raise occupancy *at 256 threads* — the `acc[2][4][8]` = 64-register
-tile blocks a 3rd block per SM. Iter 12 attacked that from the other side: a
-finer 4×4 warp tile (`WARP_COL_TILES` 4→2 → each warp owns a 2×2 sub-grid,
-`acc[2][2][8]` = 32 regs) covers the 128×128 block with 16 warps / 512 threads
-instead of 8 / 256, and at `launch_bounds(512,2)` reaches 2 blocks × 512 threads
-= 32 warps/SM. It worked *as a diagnostic*: `warps_active` doubled (23.8/21.5% →
-**47.6/41.9%**) and the IMMA-result `wait` stall — the top GEMM2 stall — was
-genuinely **halved** (28.2% → 14.5%), confirming that more IMMA-issuing warps do
-relieve `wait`. **But latency regressed +15% to +28% across all 12 sweep shapes**
-(graded d1024/s512 0.51→0.60 ms). The cause: shrinking the acc to free the
-registers forces the finer tile, which **halves A/B-fragment reuse** —
-`short_scoreboard` (smem LDS) rose (GEMM2 0.66%→4.36%), per-warp arithmetic
-intensity dropped, a small 44–76 B spill appeared, and `tensor_op_imma` **net
-fell** (38.3%→29.8%). Occupancy and operand reuse are coupled through the
-acc-tile register cost: you cannot raise one without surrendering the other.
-Kept OFF behind `INT8_MLP_FINE_WARP` (default = the iter-11 8-warp/256-thread
-path, byte-identical). **This closes the MLP occupancy lever from both
-directions** — do not re-attempt finer warp tiling.
-
-### INT8 MLP: real-model accuracy — per-channel/per-token quant (iter 9, 2026-06-13)
-
-The earlier accuracy story (per-tensor scales, "task-level ppl +0.011%") was
-measured on **random weights**, which mask quantization error. Switching Gate 5
-to **real GPT-2 on real WikiText-2** exposed that per-tensor INT8 MLP gives
-**+15% perplexity**, and that the largest single error source is the kernel's
-per-tensor **output** quantization: it crushes the MLP output's emergent channel
-outliers, costing **+64.4%** perplexity on its own (per-channel weights with a
-per-tensor output is still +64%).
-
-The fix is finer-grained quantization, added as a *new* entry point
-(`int8_mlp_forward_per_channel`; the per-tensor `int8_mlp_forward` and the
-`tests/cuda/` .bin flow are unchanged):
-
-- **per-channel weights** — `gemm_int8_wmma_f16_kernel` templated on
-  `<apply_gelu, a_scale_per_row, b_scale_per_col>`; the epilogue gathers the
-  per-output-column weight scale (`s_bcol`) and per-row activation scale
-  (`s_arow`) from smem. Dominant lever.
-- **per-token activations** — scale_x is `[T]`, applied per row. Adds margin.
-- **per-token output** — output is requantized with `quantize_rows_kernel` over
-  a per-row absmax gathered in the GEMM2 epilogue (not `quantize_tensor_kernel`),
-  and the binding returns a per-token `out_scale` tensor `[T]`. This is the piece
-  that recovers the +64%. (SmoothQuant was prototyped and proved unnecessary.)
-
-Result: real GPT-2 perplexity **31.946 (fp16) → 31.925 (int8), −0.068%** (gate
-bar <2%). The `outlier`/`boundary`/`stress` MLP datasets now pass outright
-(`outlier` cos 0.971 → >0.999; its MLP XFAIL removed). The graded per-tensor path
-(`sweep.py`) is structurally untouched, so MLP latency is unchanged vs iter 8.
-
-Gate 5 reads `testdata/real_corpus.txt` (WikiText-2 test split). That file is
-gitignored; regenerate it on a fresh checkout with `python prepare_real_corpus.py`
-(needs `pip install --user datasets`). Gate 5 SKIPs gracefully if the corpus or
-`transformers` is missing, so it never blocks CI on a bare box.
+The denser-mma reschedule (iter 10) and the attention 4-blocks/SM raise were
+reverted outright (byte-identical / no speedup); see the log.
 
 ### Future work
 
-- **Attention online-softmax dependency chain (the only remaining perf lever).**
-  With the MLP now perf-exhausted (occupancy + denser-mma both dead, iter 10),
-  attention's ~28% `tensor_pipe` ceiling — pinned by the per-warp
-  `ldmatrix → mma → exp/MUFU → pack → mma` + cross-KV-tile rescale chain — is the
-  last perf target. Breaking it (cheaper/approximate exp, decoupling the per-tile
-  rescale) is deep and high-risk; both occupancy levers there are already proven
-  dead (see "4 blocks/SM does not help").
+- **Attention online-softmax dependency chain** — the only remaining perf lever.
+  The ~28% `tensor_pipe` ceiling is pinned by the per-warp
+  `ldmatrix → mma → exp/MUFU → pack → mma` + cross-KV-tile rescale chain; breaking
+  it (cheaper/approximate exp, decoupling the per-tile rescale) is deep and
+  high-risk. Both attention occupancy levers are already proven dead.
 - Per-channel / smoothing for **attention** K/V (the remaining outlier XFAIL is
   attention-only; the MLP per-token output already shipped, iter 9).

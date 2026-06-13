@@ -3,7 +3,7 @@
 #
 # Each iteration: profile (ncu) -> let claude make ONE rule-compliant change
 # -> compile-check -> 5-gate accuracy validation -> perf sweep vs baseline
-# -> commit + append the CLAUDE.md iteration record. Any failed check
+# -> commit + append the OPTIMIZATION_LOG.md iteration record. Any failed check
 # restores the tree and moves on.
 #
 # Usage:
@@ -409,7 +409,7 @@ EOF
             # Preserve as a documented negative (behind an OFF flag). Do NOT update
             # the perf baseline (default unchanged) and do NOT count it as a PASS.
             log "committing as NEGATIVE RESULT (preserved behind OFF flag; not a speedup)"
-            git add kernels/ README.md CLAUDE.md 2>/dev/null
+            git add kernels/ README.md OPTIMIZATION_LOG.md CLAUDE.md 2>/dev/null
             git commit -m "evolve iter $i (negative result): ${CHANGE_DESC#CHANGE: }
 
 ${NEG_DESC}
@@ -429,18 +429,19 @@ Co-Authored-By: Claude (evolve.sh) <noreply@anthropic.com>" >/dev/null
 
     # f. Record + commit. New baseline = this iteration's numbers.
     run_claude "$LOG_DIR/claude_record_$i.log" <<EOF
-Append an iteration record to the bottom of CLAUDE.md following §7 exactly
-(next iteration number after the existing ones, today's date). Facts:
+Append an iteration record to the bottom of OPTIMIZATION_LOG.md following the
+CLAUDE.md §7 format exactly (next iteration number after the existing ones,
+today's date). Facts:
 - $CHANGE_DESC
 - $TARGET_DESC
 - Latency vs previous baseline: int8_attn $ATTN_DELTA, int8_mlp $MLP_DELTA
 - All five validation gates passed (see below for gate-1 numbers)
 $(grep -E "Gate1|SUMMARY|PASS" "$LOG_DIR/validate_${i}_0.log" | head -25)
-Mark all five gate checkboxes as checked. Conclusion: pass. Only edit CLAUDE.md.
+Mark all five gate checkboxes as checked. Conclusion: pass. Only edit OPTIMIZATION_LOG.md.
 EOF
     cp results/int8_attn_sweep.csv /tmp/baseline_attn.csv
     cp results/int8_mlp_sweep.csv  /tmp/baseline_mlp.csv
-    git add kernels/ results/ CLAUDE.md
+    git add kernels/ results/ OPTIMIZATION_LOG.md
     git commit -m "evolve iter $i: ${CHANGE_DESC#CHANGE: }
 
 ${TARGET_DESC}
@@ -471,7 +472,7 @@ echo "  final latency vs last-accepted baseline: attn $TOTAL_ATTN, mlp $TOTAL_ML
 
 log "asking claude for the next recommended direction ..."
 run_claude "$LOG_DIR/claude_summary.log" <<EOF
-Read the Iteration Log at the bottom of CLAUDE.md and the latest ncu output:
+Read the Iteration Log in OPTIMIZATION_LOG.md and the latest ncu output:
 $(tail -30 "$LOG_DIR/ncu_$MAX_ITER.txt" 2>/dev/null)
 In 5 lines or fewer, state the single most promising next optimization
 direction and why, consistent with CLAUDE.md §4. Do not edit any files.

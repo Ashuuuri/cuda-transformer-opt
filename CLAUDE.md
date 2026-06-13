@@ -175,15 +175,28 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
 ## 4. Optimization Targets & Rules
 
 **Optimize first** (by expected return):
-1. **GEMM tiling/pipeline in `int8_mlp.cu`** — now the PRIMARY target. The two
-   128×128-tile INT8 WMMA GEMMs already match *bare* cuBLAS INT8 GEMMs; beating
-   FP16 cuBLAS needs a deeper software pipeline. **Unexplored and the highest-
-   return lever left:** a multi-stage (3–4 stage) cp.async pipeline on the K
-   loop (the standard CUTLASS technique) to raise tensor-pipe utilization on
-   this compute-bound GEMM. NOTE: cp.async double-buffering was a *negative on
-   attention* (`INT8_ATTN_DB`), but the MLP is a different regime — a long-K
-   128×128 GEMM is exactly where multi-stage pipelining pays — so this is NOT a
-   banned retry. Prove it on the graded MLP shape with `profile_kernel.py mlp`.
+1. **smem bank conflicts in the `int8_mlp.cu` GEMM fragment loads** — now the
+   PRIMARY target, profile-identified (2026-06-13). On the graded MLP shape
+   (b=8, s=512, d_model=1024, d_ff=4096) both GEMMs are **L1/smem-pipe bound,
+   NOT DRAM- or compute-bound**: `l1tex__throughput` 78%/67%, `dram__throughput`
+   only 3–4%, `tensor_op_imma` only 16–18%. **~46% of all smem-load wavefronts
+   are bank conflicts** (`l1tex__data_bank_conflicts_..._op_ld` 16.78M of 36.2M
+   `..._wavefronts_mem_shared_op_ld`). Root cause: `A_SMEM_STRIDE = STAGE_K +
+   SMEM_SKEW = 48` bytes → `stride/4 = 12` (even) → the 16 fragment-row starts
+   collide period-8 (2-way conflict). **A pure stride change CANNOT fix this:**
+   the 16B `cp.async` loader requires each smem row start to be 16-byte aligned,
+   so `A_SMEM_STRIDE % 16 == 0`, which forces `stride/4` even → ≥2-way conflict
+   for every legal stride (skew=16's 2-way is already the best stride option;
+   skew 0→4-way, 32→8-way). The correct fix is **XOR swizzling**: keep 16B-
+   aligned chunks but permute each chunk's bank by XOR-ing the smem column
+   offset with a function of the row (CUTLASS-style), and apply the SAME swizzle
+   to the `load_matrix_sync` fragment-read addressing. Verify the B-matrix
+   (`B_SMEM_STRIDE=144`) pattern too, and confirm with the bank-conflict metric
+   on `profile_kernel.py mlp`, not `--quick`. **NOTE: a
+   multi-stage cp.async pipeline is the WRONG lever here** — DRAM is 3–4% and
+   `long_scoreboard` only 12–16%, so there is almost no global-load latency to
+   hide (cp.async double-buffer was also a *negative on attention*,
+   `INT8_ATTN_DB`). Do not chase it; the smem pipe is the ceiling.
 2. The WMMA main loop in `int8_attention.cu` — **occupancy well is DRY; only a
    deep algorithmic change remains.** What is already DONE (do not re-attempt):
    the `INT8_ATTN_REGPV=1` default path keeps P in registers and uses `mma.sync`

@@ -43,9 +43,44 @@ INT8 MLP (dynamic-quant path, INT8_MLP_DYNAMIC=1 default):
 
 ## 2. Build & Run
 
+### 2.0 Environment setup — run FIRST in a fresh environment
+
+The system PyTorch 2.7 (`/usr/lib/python3/dist-packages/torch`) JIT-builds the
+INT8 extension with `cpp_extension.load`, which needs **ninja** and the
+**pybind11 C++ headers on the system include path**. A fresh box (or a new
+container) usually ships with neither, and the failures are non-obvious
+(`RuntimeError: Ninja is required...`, then `fatal error: pybind11/pybind11.h:
+No such file or directory`). Before running anything else — `evolve.sh`,
+`validate_int8.py`, `sweep.py`, `tests/test_int8.py` — verify/install these **in
+this order**:
+
+```bash
+# 1. ninja (provides ~/.local/bin/ninja + the python module). Required by
+#    torch cpp_extension.load. Check first; pip-install only if missing.
+command -v ninja || pip3 install --user ninja
+
+# 2. pybind11 C++ headers ON THE SYSTEM INCLUDE PATH (/usr/include/pybind11).
+#    The system torch does NOT add the pip pybind11 package's include dir to
+#    the nvcc command line, so `pip install pybind11` alone does NOT fix the
+#    build — you need the apt -dev package (passwordless sudo is available).
+ls /usr/include/pybind11/pybind11.h 2>/dev/null || sudo apt-get install -y pybind11-dev
+
+# 3. Sanity-check the toolchain end to end (JIT-compiles both kernels, ~2 min):
+rm -rf ~/.cache/torch_extensions/py312_cu128/int8_ext
+python3 -c "from torch.utils.cpp_extension import load; \
+  ext=load(name='int8_ext', sources=['kernels/int8_attention.cu','kernels/int8_mlp.cu',\
+  'kernels/quant_utils.cu','kernels/int8_ext.cu'], \
+  extra_cuda_cflags=['-arch=sm_80','--std=c++17','-O3']); print('BUILD OK')"
+```
+
+Only once "BUILD OK" prints is the environment ready. (`ncu`/`nsys` for §3 are
+apt-installed separately; profiling counters also need sudo — see §3.)
+
+### 2.1 Commands
+
 ```bash
 # Environment: local A100-SXM4-40GB, CUDA 12.8, system PyTorch 2.7
-# Deps: ninja, pybind11-dev (both installed); no module load (not Perlmutter)
+# Deps: ninja + pybind11-dev — see §2.0; install before first build
 
 # Pure-CUDA smoke test (run `python tests/gen_testdata.py` once for .bin data)
 make test_int8 && ./test_int8

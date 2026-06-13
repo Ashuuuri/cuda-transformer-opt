@@ -24,16 +24,19 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Patch
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 RES = os.path.join(ROOT, "results")
 FIGDIR = os.path.join(RES, "figures")
 os.makedirs(FIGDIR, exist_ok=True)
 
-C_OURS  = "#2563EB"   # our INT8 fused kernel
-C_FP16  = "#DC2626"   # FP16 cuBLAS / manual reference
-C_SOTA  = "#16A34A"   # cuBLAS INT8 pipeline / FlashAttn-2
-C_LOWER = "#F59E0B"   # bare 2xGEMM / FP16 WMMA kernel
+# Consistent colour roles across the whole sheet:
+C_OURS  = "#2563EB"   # blue  — ALWAYS our INT8 fused kernel
+C_SOTA  = "#16A34A"   # green — the INT8 SOTA peer (cuBLAS INT8 pipeline / SageAttention)
+C_FP16  = "#DC2626"   # red   — primary FP16 baseline (cuBLAS FP16 / FP16 manual)
+C_FA2   = "#6B7280"   # gray  — FlashAttn-2 (FP16, well-tuned reference floor)
+C_LOWER = "#F59E0B"   # amber — secondary floor (INT8 2×GEMM / FP16 WMMA kernel)
 REP_DM  = 1024        # representative d_model for the line panels
 BATCH   = 8           # graded batch (matches sweep.py)
 HEADS   = 8           # graded heads (matches sweep.py)
@@ -319,7 +322,7 @@ def panel_sota_prefill(ax, rows):
     x = [int(r["seq_len"]) for r in rows]
     series = [("ours_ms", "INT8 fused (ours)", C_OURS),
               ("sage_ms", "SageAttention (INT8 SOTA)", C_SOTA),
-              ("fa2_ms",  "FlashAttn-2 (FP16 ref)", C_FP16)]
+              ("fa2_ms",  "FlashAttn-2 (FP16 ref)", C_FA2)]
     for col, lbl, color in series:
         y = [r[col] for r in rows if isinstance(r.get(col), float)]
         if len(y) == len(x):
@@ -370,6 +373,9 @@ def panel_decode_speedup(ax, rows, S):
     ax.set_ylabel("decode speedup vs FP16 SDPA (>1 = ours faster)")
     ax.set_title(f"Decode vs FP16 SDPA (S={S}) — INT8 KV cache",
                  fontweight="bold", fontsize=11)
+    ax.legend(handles=[Patch(color=C_SOTA, label="faster than FP16 SDPA (>1×)"),
+                       Patch(color=C_FP16, label="slower (<1×)")],
+              fontsize=8, loc="upper right")
     ax.grid(axis="y", alpha=0.25)
     ax.text(0.5, -0.30,
             "Serving scale (B≥32) wins 1.2–1.6×; tiny B=8 is grid-starved\n"
@@ -437,12 +443,12 @@ def main():
     # Row 2 — INT8 attention
     at_lat = [("kernel_ms", "INT8 fused (ours)", C_OURS),
               ("naive_ms",  "FP16 manual attn", C_FP16),
-              ("ref2_ms",   "FlashAttn-2 (SDPA)", C_SOTA),
+              ("ref2_ms",   "FlashAttn-2 (SDPA)", C_FA2),
               ("ref3_ms",   "FP16 WMMA kernel (team)", C_LOWER)]
     panel_latency(fig.add_subplot(gs[1, 0]), attn, at_lat,
                   "INT8 attention — latency (d_model=1024, batch=8)")
     at_bytes = [("FP16 manual (writes S×S)", C_FP16, attn_bytes_fp16_unfused),
-                ("FlashAttn-2 (FP16, fused)", C_SOTA, attn_bytes_fp16_fused),
+                ("FlashAttn-2 (FP16, fused)", C_FA2, attn_bytes_fp16_fused),
                 ("INT8 fused (ours)", C_OURS, attn_bytes_int8_fused)]
     panel_bytes(fig.add_subplot(gs[1, 1]), attn, at_bytes,
                 "INT8 attention — HBM bytes moved  (memory-bound)",
@@ -450,7 +456,7 @@ def main():
                 "prefill latency → not bandwidth-bound here; INT8's byte win pays off\n"
                 "in the KV-cache (decode) & footprint, not prefill vs FA2.")
     at_sp = [("speedup_vs_naive", "vs FP16 manual", C_FP16),
-             ("speedup_vs_ref2",  "vs FlashAttn-2", C_SOTA),
+             ("speedup_vs_ref2",  "vs FlashAttn-2", C_FA2),
              ("speedup_vs_ref3",  "vs FP16 WMMA kernel", C_LOWER)]
     panel_speedup(fig.add_subplot(gs[1, 2]), attn, at_sp,
                   "INT8 attention — speedup vs each reference")

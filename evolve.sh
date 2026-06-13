@@ -67,6 +67,62 @@ compile_check() {  # syntax + ptxas check of both INT8 kernels
     return 0
 }
 
+# Profile the attention kernel on the SWEEP-matched shape (batch=8, head_dim=64)
+# into $1. Pre-warms the JIT cache first so ncu profiles the kernel, not the
+# build. Returns 0 only if ncu metric data was written (1 if sudo/ncu absent).
+run_ncu() {  # run_ncu <outfile>
+    local out="$1"
+    python3 profile_kernel.py both > /dev/null 2>&1     # pre-warm JIT cache
+    sudo -n true 2>/dev/null && command -v ncu >/dev/null || return 1
+    # env PATH/HOME: keep the user's JIT cache + ninja visible under sudo,
+    # otherwise root rebuilds the extension inside the profiler (or fails).
+    sudo env "PATH=$PATH" HOME="$HOME" \
+        ncu --kernel-name regex:int8_wmma --launch-count 2 \
+        --metrics "$NCU_METRICS" \
+        python3 profile_kernel.py attn 2>&1 \
+        | grep -E "int8_|Metric Name|----|pct|registers|wavefronts|occupancy|maximum_warps" \
+        > "$out"
+    grep -q "registers" "$out" 2>/dev/null
+}
+
+# Did a bottleneck metric move beyond run-to-run noise between two ncu reports?
+# Prints a human description ("mem_shared -24.3%, tensor_pipe +2.1pp") and exits
+# 0 if any moved; prints nothing and exits 1 otherwise. Used to catch a
+# latency-neutral change that nonetheless SHIFTED the bottleneck — a negative
+# result worth recording (per CLAUDE.md §4) instead of silently reverting.
+metric_moved() {  # metric_moved <baseline_ncu.txt> <after_ncu.txt>
+    python3 - "$1" "$2" <<'EOF'
+import re, sys
+KEYS = ("l1tex__data_pipe_lsu_wavefronts_mem_shared.sum",
+        "sm__warps_active.avg.pct_of_peak_sustained_active",
+        "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active")
+def grab(path):
+    m = {}
+    for line in open(path):
+        for k in KEYS:
+            if k in line:
+                nums = re.findall(r"[-+]?\d+\.?\d*", line.split(k, 1)[1])
+                if nums: m.setdefault(k, []).append(float(nums[-1]))
+    return {k: sum(v)/len(v) for k, v in m.items()}   # avg the 2 launches
+try:
+    b, a = grab(sys.argv[1]), grab(sys.argv[2])
+except Exception:
+    sys.exit(1)
+moved = []
+ms = KEYS[0]   # wavefront sum: relative %
+if b.get(ms, 0) > 0 and ms in a:
+    d = (a[ms] - b[ms]) / b[ms] * 100
+    if abs(d) >= 5.0: moved.append(f"mem_shared {d:+.1f}%")
+for k, label, thr in ((KEYS[1], "warps_active", 1.0),
+                      (KEYS[2], "tensor_pipe", 2.0)):   # percentages: pp
+    if k in b and k in a and abs(a[k] - b[k]) >= thr:
+        moved.append(f"{label} {a[k]-b[k]:+.1f}pp")
+if moved:
+    print(", ".join(moved)); sys.exit(0)
+sys.exit(1)
+EOF
+}
+
 # Run sweep.py SWEEP_REPS times and write the per-config MEDIAN kernel_ms back
 # into results/<kernel>_sweep.csv (so the median is what gets compared and, on a
 # committed iteration, what gets committed). Cuts the ~2% run-to-run noise that
@@ -149,24 +205,12 @@ for i in $(seq 1 "$MAX_ITER"); do
     echo; log "════════ ITERATION $i / $MAX_ITER ════════"
     NCU_OUT="$LOG_DIR/ncu_$i.txt"
 
-    # a. Profile. Pre-warm the JIT cache so ncu doesn't profile the build.
-    #    profile_kernel.py runs the SAME shapes sweep.py grades (batch=8,
-    #    head_dim=64) — NOT test_int8.py --quick (batch=2, grid-starved toy).
-    #    Profiling the toy is why prior iterations chased a phantom
-    #    occupancy/register bottleneck the graded workload does not have.
-    python3 profile_kernel.py both > /dev/null 2>&1
-    if sudo -n true 2>/dev/null && command -v ncu >/dev/null; then
-        log "profiling with ncu (sweep-matched shape: b=8 h=8 s=2048 d=64) ..."
-        # env PATH/HOME: keep the user's JIT cache + ninja visible under sudo,
-        # otherwise root rebuilds the extension inside the profiler (or fails).
-        sudo env "PATH=$PATH" HOME="$HOME" \
-            ncu --kernel-name regex:int8_wmma --launch-count 2 \
-            --metrics "$NCU_METRICS" \
-            python3 profile_kernel.py attn 2>&1 \
-            | grep -E "int8_|Metric Name|----|pct|registers|wavefronts|occupancy|maximum_warps" \
-            > "$NCU_OUT" || true
-    fi
-    if ! grep -q "registers" "$NCU_OUT" 2>/dev/null; then
+    # a. Profile on the SAME shape sweep.py grades (batch=8, head_dim=64) — NOT
+    #    test_int8.py --quick (batch=2, grid-starved toy). Profiling the toy is
+    #    why prior iterations chased a phantom occupancy/register bottleneck the
+    #    graded workload does not have.
+    log "profiling (sweep-matched shape: b=8 h=8 s=2048 d=64) ..."
+    if ! run_ncu "$NCU_OUT"; then
         log "ncu unavailable/empty — falling back to torch.profiler"
         python3 - > "$NCU_OUT" 2>&1 <<'EOF'
 import torch, sys; sys.path.insert(0, ".")
@@ -324,12 +368,47 @@ EOF
         continue
     fi
     if [ "$ATTN_CODE" -ne 0 ] && [ "$MLP_CODE" -ne 0 ]; then
+        # Latency-neutral. Keep ONLY as a documented negative result, via either:
+        #  (1) claude declared NEGATIVE_RESULT upfront (change already behind an
+        #      OFF flag, default path neutral BY DESIGN), or
+        #  (2) the change MOVED a bottleneck metric beyond noise despite neutral
+        #      latency — re-profile to confirm, then give claude ONE chance to
+        #      gate it behind an OFF flag + document it. This is exactly the
+        #      "-24% smem but no speedup proves the warp-count ceiling, not smem
+        #      traffic, is the bottleneck" kind of insight that must not be lost
+        #      to a silent git-reset.
+        if [ -z "$NEG_DESC" ]; then
+            log "latency-neutral — re-profiling to check whether a bottleneck metric moved ..."
+            NCU_AFTER="$LOG_DIR/ncu_${i}_after.txt"
+            if run_ncu "$NCU_AFTER" && MOVE=$(metric_moved "$NCU_OUT" "$NCU_AFTER"); then
+                log "bottleneck moved despite neutral latency ($MOVE) — offering negative-result keep"
+                run_claude "$LOG_DIR/claude_negkeep_$i.log" <<EOF
+Your change is latency-neutral (median sweep: attn $ATTN_DELTA, mlp $MLP_DELTA)
+but it MOVED a bottleneck metric beyond run-to-run noise: $MOVE. Per CLAUDE.md
+§4 that is a valuable NEGATIVE RESULT — a metric moved without translating to a
+speedup, which RULES OUT a direction and must be recorded, not silently
+reverted.
+
+If (and only if) it is worth keeping: put your ENTIRE change behind an
+OFF-by-default \`#define\` so the default compiled path is byte-identical to
+before — the ablation flag preserves the experiment without changing the
+default — append a one-line note to README.md explaining the negative result
+(what moved, what it rules out), and output exactly:
+NEGATIVE_RESULT: <which metric moved, and what direction it rules out>
+Only touch kernels/ and README.md. If you judge it not worth keeping, change
+nothing and output nothing — it will be reverted as a no-op.
+EOF
+                NEG_DESC=$(grep -E "^NEGATIVE_RESULT:" "$LOG_DIR/claude_negkeep_$i.log" | tail -1)
+                # The now-flag-gated default path must still build.
+                if [ -n "$NEG_DESC" ] && ! compile_check >/dev/null 2>&1; then
+                    log "negative-result refactor broke the build — discarding it"; NEG_DESC=""
+                fi
+            fi
+        fi
         if [ -n "$NEG_DESC" ]; then
-            # Declared negative result: default-path latency is neutral BY DESIGN
-            # (the new code is behind an OFF flag). Preserve it — the value is the
-            # ablation flag + documented negative, not a speedup. Do NOT update the
-            # perf baseline (default unchanged) and do NOT count it as a PASS.
-            log "latency-neutral, but claude declared a NEGATIVE RESULT — committing to preserve it (not a speedup)"
+            # Preserve as a documented negative (behind an OFF flag). Do NOT update
+            # the perf baseline (default unchanged) and do NOT count it as a PASS.
+            log "committing as NEGATIVE RESULT (preserved behind OFF flag; not a speedup)"
             git add kernels/ README.md CLAUDE.md 2>/dev/null
             git commit -m "evolve iter $i (negative result): ${CHANGE_DESC#CHANGE: }
 
@@ -342,7 +421,7 @@ Co-Authored-By: Claude (evolve.sh) <noreply@anthropic.com>" >/dev/null
             ITER_RESULTS[$i]="KEPT (negative result: ${NEG_DESC#NEGATIVE_RESULT: })"
             continue
         fi
-        log "latency-neutral (within ~2% noise) — no real improvement, reverting as no-op"
+        log "latency-neutral (within ~2% noise) and no bottleneck moved — reverting as no-op"
         restore_tree
         ITER_RESULTS[$i]="SKIP (no-op: attn $ATTN_DELTA mlp $MLP_DELTA — within noise)"
         continue

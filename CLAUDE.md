@@ -225,6 +225,14 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
   `NEGATIVE_RESULT:` line, which makes the otherwise-neutral change commit
   (preserving the flag + note) instead of being wiped by `git reset --hard`.
   This is the ONLY way a latency-neutral change should be committed.
+  **`evolve.sh` also offers this proactively:** when a change is
+  latency-neutral but the post-change `ncu` re-profile shows a bottleneck
+  metric *moved* beyond noise (mem_shared rel |Δ|≥5%, warps_active |Δ|≥1.0pp,
+  or tensor_pipe |Δ|≥2.0pp — e.g. "−24% smem traffic that did not speed
+  anything up"), the gate asks the inner claude to gate it behind an OFF flag
+  and record what the moved-but-no-speedup metric *rules out*, before falling
+  back to reverting. Such empirical dead-ends are exactly what must not be
+  silently lost.
 - Treat sweep latency as the **median of ≥5 runs**; run-to-run noise on this
   box is ~2%, so any |delta| < 2% is noise, not a result. Never claim a speedup
   from a single sweep.

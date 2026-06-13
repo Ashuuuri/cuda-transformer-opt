@@ -126,13 +126,22 @@ launch__registers_per_thread,launch__occupancy_limit_registers \
 # ^ ALWAYS filter with --kernel-name + grep — full ncu output floods context.
 ```
 
-Priorities and how to read them:
-1. **`launch__registers_per_thread`** — this project's recurring silent
-   killer: >128 regs (at 256 threads/block) drops 2 blocks/SM to 1, an
-   instant -35%. Check after every epilogue change:
+Priorities and how to read them. **The real target is occupancy
+(`launch__occupancy_limit_registers` / `sm__warps_active`), not register count
+in isolation** — registers only matter through the blocks/SM they cost. It is
+explicitly OK for the headline P-in-registers rewrite to *raise* per-thread
+registers if it removes the smem scores round-trip and holds (or improves)
+blocks/SM; trade register layout for smem traffic freely as long as occupancy
+does not drop and there are no spills:
+1. **`launch__occupancy_limit_registers` + `sm__warps_active`** — what actually
+   gates throughput (currently 2–3 blocks/SM, warps_active stuck ~7.4%). The
+   attention kernel already runs at 160–236 regs/thread; the old "keep ≤128"
+   rule is a guideline for the *MLP epilogue*, not a hard cap on the attention
+   rewrite. Watch the block count, and watch for spills:
    `nvcc -arch=sm_80 -O3 --std=c++17 --ptxas-options=-v -c kernels/int8_mlp.cu -o /dev/null 2>&1 | grep -E "registers|spill"`
 2. **MIO/smem stalls** (`stalled_mio_throttle`, `mem_shared wavefronts`) —
-   the wmma scores round-trip through smem is the structural bottleneck.
+   the wmma scores round-trip through smem is the structural bottleneck; this is
+   the metric the P-in-registers rewrite must drive down.
 3. **Tensor pipe active %** — currently ~10-15%; cuBLAS reaches 60%+.
 
 Without ncu:
@@ -151,8 +160,18 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
 ## 4. Optimization Targets & Rules
 
 **Optimize first** (by expected return):
-1. The WMMA main loop in `int8_attention.cu` (~1.6x gap to FA2 remains;
-   next big lever: `mma.sync` m16n8k32 with P kept in registers)
+1. The WMMA main loop in `int8_attention.cu`. The next real lever is the
+   **full `mma.sync` m16n8k32 rewrite with P kept in registers** — eliminating
+   the scores→smem→ldmatrix round-trip entirely, NOT just swapping the QK^T
+   input path. Iterations 1–3 (commits `e493da4`, `6d1dcdd`, `fc8642f`)
+   converted QK^T to `mma.sync`, folded the `sV` scale, and software-pipelined
+   the ldmatrix — all latency-neutral, and **ncu confirms the bottleneck never
+   moved** (warps_active stuck ~7.4%, tensor pipe ~13–16%, smem
+   `l1tex__...mem_shared` wavefronts unchanged). The supply of safe
+   loop-reordering micro-opts is **exhausted**; only restructuring P to live in
+   registers across the P@V MMA will move those metrics. Attempt it even though
+   it is a large, multi-step rewrite of one kernel's main loop — a bold rewrite
+   that targets a bottleneck metric beats another safe reorder that does not.
 2. GEMM tiling/pipeline in `int8_mlp.cu` (already matches bare cuBLAS INT8
    GEMMs; beating FP16 cuBLAS needs a deeper pipeline)
 
@@ -166,7 +185,21 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
   measured slower on A100 — reasons documented in README
 
 **Iteration discipline:**
-- **One change per iteration** (one structural change to one kernel)
+- **One change per iteration = one COHERENT structural change to one kernel.**
+  This is NOT a size limit. A single change may rewrite an entire main loop,
+  introduce a new smem/register layout, and touch `int8_common.cuh`, as long as
+  it is *one idea*. Do not downgrade an ambitious idea into a one-line reorder
+  to play it safe — the validation gates + perf gate are the safety net, so a
+  failed bold attempt that gets reverted is a better iteration than a committed
+  no-op.
+- **A change only counts as progress if it MOVES an ncu bottleneck metric**
+  beyond run-to-run noise — `sm__warps_active`,
+  `sm__pipe_tensor_cycles_active`, or `l1tex__data_pipe_lsu_wavefronts_mem_shared`.
+  A latency-neutral micro-opt (no metric moved) is a no-op: report it as such
+  and revert it rather than committing, even though it passes the gates.
+- Treat sweep latency as the **median of ≥5 runs**; run-to-run noise on this
+  box is ~2%, so any |delta| < 2% is noise, not a result. Never claim a speedup
+  from a single sweep.
 - Before changing anything, run `python validate_int8.py` and
   `python sweep.py --kernel int8_*` to establish the baseline; record numbers
 - After the change: correctness (validate) → performance (sweep) → commit

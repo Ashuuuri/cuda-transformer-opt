@@ -19,6 +19,12 @@ cd "$(dirname "$0")"
 MAX_ITER="${MAX_ITER:-5}"
 LOG_DIR="${LOG_DIR:-/tmp/evolve_logs}"
 CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-1800}"
+# Sweeps are noisy (~2% run-to-run); take the per-config median of this many
+# runs so the accept/reject gate doesn't fire on noise. Raise for less noise.
+SWEEP_REPS="${SWEEP_REPS:-3}"
+# Latency thresholds (percent) for the 3-way perf gate, see compare_sweep.
+PERF_IMPROVE="${PERF_IMPROVE:--2.0}"   # <= this  -> genuine improvement (commit)
+PERF_REGRESS="${PERF_REGRESS:-5.0}"    # >  this  -> regression (revert)
 mkdir -p "$LOG_DIR"
 
 # CLAUDE.md §3 metrics, verbatim.
@@ -55,19 +61,53 @@ compile_check() {  # syntax + ptxas check of both INT8 kernels
     return 0
 }
 
-# Mean kernel_ms ratio: new vs baseline CSV. Prints "+X.X%"; exit 1 if >5% worse.
+# Run sweep.py SWEEP_REPS times and write the per-config MEDIAN kernel_ms back
+# into results/<kernel>_sweep.csv (so the median is what gets compared and, on a
+# committed iteration, what gets committed). Cuts the ~2% run-to-run noise that
+# otherwise makes the perf gate fire randomly.
+median_sweep() {  # median_sweep <int8_attn|int8_mlp> <logprefix>
+    local kernel="$1" logpfx="$2" r
+    local -a csvs=()
+    for r in $(seq 1 "$SWEEP_REPS"); do
+        python3 sweep.py --kernel "$kernel" > "${logpfx}_$r.log" 2>&1 || return 1
+        cp "results/${kernel}_sweep.csv" "${logpfx}_$r.csv"
+        csvs+=("${logpfx}_$r.csv")
+    done
+    python3 - "results/${kernel}_sweep.csv" "${csvs[@]}" <<'EOF'
+import csv, sys, statistics
+out, paths = sys.argv[1], sys.argv[2:]
+runs = []
+for p in paths:
+    with open(p) as f:
+        runs.append({(r["seq_len"], r["d_model"]): r for r in csv.DictReader(f)})
+base = runs[0]
+fields = list(next(iter(base.values())).keys())
+with open(out, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
+    for k, r0 in base.items():
+        vals = [float(run[k]["kernel_ms"]) for run in runs if k in run]
+        row = dict(r0); row["kernel_ms"] = f"{statistics.median(vals):.6f}"
+        w.writerow(row)
+EOF
+}
+
+# Median kernel_ms ratio: new vs baseline CSV. Prints "+X.X%". 3-way exit code:
+#   2 = regression  (> PERF_REGRESS%)        -> caller reverts
+#   0 = improvement (<= PERF_IMPROVE%)       -> counts as real progress
+#   1 = neutral     (within noise, in between) -> caller reverts as a no-op
 compare_sweep() {  # compare_sweep <baseline.csv> <new.csv>
-    python3 - "$1" "$2" <<'EOF'
-import csv, sys
+    PERF_IMPROVE="$PERF_IMPROVE" PERF_REGRESS="$PERF_REGRESS" python3 - "$1" "$2" <<'EOF'
+import csv, os, sys
 def ms(p):
     with open(p) as f:
         return {(r["seq_len"], r["d_model"]): float(r["kernel_ms"])
                 for r in csv.DictReader(f)}
 old, new = ms(sys.argv[1]), ms(sys.argv[2])
 ratios = [new[k] / old[k] for k in old if k in new]
-mean = sum(ratios) / len(ratios)
-print(f"{(mean-1)*100:+.1f}%")
-sys.exit(1 if mean > 1.05 else 0)
+d = (sum(ratios) / len(ratios) - 1) * 100
+print(f"{d:+.1f}%")
+imp = float(os.environ["PERF_IMPROVE"]); reg = float(os.environ["PERF_REGRESS"])
+sys.exit(2 if d > reg else (0 if d <= imp else 1))
 EOF
 }
 
@@ -88,9 +128,9 @@ python3 validate_int8.py > /tmp/baseline.txt 2>&1 || {
     log "ERROR: baseline validation FAILED — fix before evolving."
     tail -20 /tmp/baseline.txt; exit 1; }
 
-log "establishing perf baseline (sweep int8_attn + int8_mlp) ..."
-python3 sweep.py --kernel int8_attn > "$LOG_DIR/sweep_attn_base.log" 2>&1 || exit 1
-python3 sweep.py --kernel int8_mlp  > "$LOG_DIR/sweep_mlp_base.log"  2>&1 || exit 1
+log "establishing perf baseline (median of $SWEEP_REPS sweeps, int8_attn + int8_mlp) ..."
+median_sweep int8_attn "$LOG_DIR/sweep_attn_base" || exit 1
+median_sweep int8_mlp  "$LOG_DIR/sweep_mlp_base"  || exit 1
 cp results/int8_attn_sweep.csv /tmp/baseline_attn.csv
 cp results/int8_mlp_sweep.csv  /tmp/baseline_mlp.csv
 git checkout -- results/ 2>/dev/null   # keep committed CSVs canonical
@@ -154,14 +194,25 @@ and follow §4 strictly. Profiling output for this iteration:
 
 $(cat "$NCU_OUT")
 
-Make exactly ONE structural change to kernels/int8_attention.cu or
-kernels/int8_mlp.cu (you may touch kernels/int8_common.cuh if shared).
+Make ONE coherent structural change (one idea) to kernels/int8_attention.cu or
+kernels/int8_mlp.cu (you may touch kernels/int8_common.cuh if shared). "One
+change" is NOT a size limit: a full rewrite of a kernel's main loop counts as
+one change. BE BOLD — the profiling above shows the bottleneck (warps_active
+~7.4%, tensor pipe ~13-16%, smem round-trip unchanged) has not moved across
+prior iterations of safe loop-reorderings. Pursue the §4 headline lever
+(mma.sync m16n8k32 with P kept IN REGISTERS, eliminating the
+scores->smem->ldmatrix round-trip) even if it is a large multi-step rewrite. A
+bold attempt that gets reverted by the gates is better than a latency-neutral
+no-op. Do NOT downgrade to a one-line reorder to play safe.
 Hard rules:
 - Do NOT touch LayerNorm/residual handling, the public interface signatures,
   or anything outside kernels/.
 - Do NOT retry the known negative results: cp.async double-buffering
   (INT8_ATTN_DB) and V register prefetch (INT8_ATTN_VPREFETCH).
-- Keep registers <= 128 per thread at 256 threads/block (check with ptxas).
+- Registers: the target is OCCUPANCY (blocks/SM), not a fixed register cap. You
+  MAY raise per-thread registers if it removes smem traffic and holds blocks/SM
+  (the attention kernel already runs at 160-236 regs). No spills, and do not
+  drop blocks/SM below the current baseline. Check with ptxas.
 After editing, output exactly two lines:
 CHANGE: <files + what you changed>
 TARGET: <which metric you expect to improve and why>
@@ -217,17 +268,26 @@ EOF
         ITER_RESULTS[$i]="FAIL (accuracy gates)"; continue
     fi
 
-    # e. Perf sweep vs baseline (>5% regression on either kernel -> revert).
-    log "perf sweep ..."
-    python3 sweep.py --kernel int8_attn > "$LOG_DIR/sweep_attn_$i.log" 2>&1
-    python3 sweep.py --kernel int8_mlp  > "$LOG_DIR/sweep_mlp_$i.log"  2>&1
-    ATTN_DELTA=$(compare_sweep /tmp/baseline_attn.csv results/int8_attn_sweep.csv); ATTN_OK=$?
-    MLP_DELTA=$(compare_sweep /tmp/baseline_mlp.csv results/int8_mlp_sweep.csv);   MLP_OK=$?
+    # e. Perf gate (median of SWEEP_REPS sweeps). 3-way per kernel:
+    #    regression (>PERF_REGRESS%) -> revert; latency-neutral no-op -> revert;
+    #    commit ONLY if at least one kernel genuinely improves (<=PERF_IMPROVE%)
+    #    and neither regresses. This is what stops the loop committing noise.
+    log "perf sweep (median of $SWEEP_REPS) ..."
+    median_sweep int8_attn "$LOG_DIR/sweep_attn_$i"
+    median_sweep int8_mlp  "$LOG_DIR/sweep_mlp_$i"
+    ATTN_DELTA=$(compare_sweep /tmp/baseline_attn.csv results/int8_attn_sweep.csv); ATTN_CODE=$?
+    MLP_DELTA=$(compare_sweep /tmp/baseline_mlp.csv results/int8_mlp_sweep.csv);   MLP_CODE=$?
     log "latency vs baseline: attn $ATTN_DELTA, mlp $MLP_DELTA"
-    if [ "$ATTN_OK" -ne 0 ] || [ "$MLP_OK" -ne 0 ]; then
-        log "latency regressed >5% — restoring"
+    if [ "$ATTN_CODE" -eq 2 ] || [ "$MLP_CODE" -eq 2 ]; then
+        log "latency regressed >${PERF_REGRESS}% — restoring"
         restore_tree
         ITER_RESULTS[$i]="FAIL (perf regression: attn $ATTN_DELTA mlp $MLP_DELTA)"
+        continue
+    fi
+    if [ "$ATTN_CODE" -ne 0 ] && [ "$MLP_CODE" -ne 0 ]; then
+        log "latency-neutral (within ~2% noise) — no real improvement, reverting as no-op"
+        restore_tree
+        ITER_RESULTS[$i]="SKIP (no-op: attn $ATTN_DELTA mlp $MLP_DELTA — within noise)"
         continue
     fi
 
@@ -266,8 +326,8 @@ for i in $(seq 1 "$MAX_ITER"); do
 done
 echo "  passed: $PASS_COUNT / $MAX_ITER"
 
-python3 sweep.py --kernel int8_attn > /dev/null 2>&1
-python3 sweep.py --kernel int8_mlp  > /dev/null 2>&1
+median_sweep int8_attn "$LOG_DIR/sweep_attn_final" || true
+median_sweep int8_mlp  "$LOG_DIR/sweep_mlp_final"  || true
 TOTAL_ATTN=$(compare_sweep /tmp/baseline_attn.csv results/int8_attn_sweep.csv || true)
 TOTAL_MLP=$(compare_sweep /tmp/baseline_mlp.csv results/int8_mlp_sweep.csv || true)
 git checkout -- results/ 2>/dev/null

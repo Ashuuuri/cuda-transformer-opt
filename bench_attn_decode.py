@@ -32,7 +32,11 @@ CSV_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # (batch, heads, head_dim) — small to serving-scale; one warp per (b,h), so
 # batch*heads is the parallelism (small b*h is grid-starved on 108 SMs).
 CONFIGS = [(8, 8, 64), (32, 8, 64), (64, 16, 64), (128, 16, 64), (64, 16, 128)]
-SEQS = [1024, 2048, 4096]
+# Long-context grid: decode re-reads the WHOLE KV cache per token, so this is
+# the regime that matters today. The FP16 SDPA reference OOMs at the largest
+# (config, seq) on a 40 GB card — that is itself the point (INT8 KV = half the
+# bytes), and those rows are skipped gracefully.
+SEQS = [1024, 2048, 4096, 8192, 16384, 32768]
 
 
 def _load():
@@ -49,28 +53,52 @@ def _qpt(t):
 
 
 def run(ext, B, H, D, S):
-    torch.manual_seed(0)
-    Q = torch.randn(B, H, D, device="cuda", dtype=torch.float16)
-    K = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)
-    V = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)
-    Qi, sQ = _qpt(Q); Ki, sK = _qpt(K); Vi, sV = _qpt(V)
-
-    ours_ms = benchmark(ext.int8_decode_attention_forward, Qi, Ki, Vi, sQ, sK, sV)
-
-    Q4 = Q.unsqueeze(2)  # (B,H,1,D) for SDPA decode
-    sdpa_ms = benchmark(F.scaled_dot_product_attention, Q4, K, V)
-
-    # accuracy vs fp32 ground truth on the original inputs
-    out = ext.int8_decode_attention_forward(Qi, Ki, Vi, sQ, sK, sV)
-    ref = F.scaled_dot_product_attention(Q.float().unsqueeze(2), K.float(), V.float()).squeeze(2)
-    cos = F.cosine_similarity(out.float().flatten(), ref.flatten(), dim=0).item()
-
+    """OOM-safe. Footprint is analytical (always); the FP16 SDPA reference and
+    the fp32 accuracy ref are each guarded — at the largest (config, seq) the
+    FP16 path OOMs on 40 GB while the INT8 path still runs (that contrast is the
+    point), so sdpa_ms/cos come back empty and the row is INT8-only."""
+    OOM = torch.cuda.OutOfMemoryError
     kv_int8_mb = B * H * S * D * 2 / 1e6        # K+V, 1 byte each
     kv_fp16_mb = kv_int8_mb * 2
-    # bytes our kernel streams from the KV cache per decode step (≈ the whole cache)
-    ours_gbps = (B * H * S * D * 2) / (ours_ms * 1e-3) / 1e9
-    return dict(B=B, H=H, D=D, S=S, ours_ms=ours_ms, sdpa_ms=sdpa_ms, cos=cos,
-                kv_int8_mb=kv_int8_mb, kv_fp16_mb=kv_fp16_mb, ours_gbps=ours_gbps)
+    row = dict(B=B, H=H, D=D, S=S, ours_ms="", sdpa_ms="", cos="",
+               kv_int8_mb=kv_int8_mb, kv_fp16_mb=kv_fp16_mb, ours_gbps="")
+    torch.manual_seed(0)
+    # Build + quantize each tensor, then free its fp16 copy immediately. A real
+    # serving system stores the KV cache as int8 and never materializes fp16, so
+    # the INT8 path must run where holding fp16 K,V would not even fit. Only Q's
+    # fp16 is kept (tiny: seq_q==1) for the SDPA reference / accuracy check.
+    Q = torch.randn(B, H, D, device="cuda", dtype=torch.float16)
+    Qi, sQ = _qpt(Q)
+    K = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)
+    Ki, sK = _qpt(K); del K; torch.cuda.empty_cache()
+    V = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)
+    Vi, sV = _qpt(V); del V; torch.cuda.empty_cache()
+
+    ours_ms = benchmark(ext.int8_decode_attention_forward, Qi, Ki, Vi, sQ, sK, sV)
+    row["ours_ms"] = ours_ms
+    row["ours_gbps"] = (B * H * S * D * 2) / (ours_ms * 1e-3) / 1e9
+
+    out = ext.int8_decode_attention_forward(Qi, Ki, Vi, sQ, sK, sV)
+    # FP16 reference: rebuild K,V in fp16. At the largest (config, seq) this is
+    # where the FP16 KV cache does not fit on 40 GB — that OOM IS the result.
+    try:
+        torch.manual_seed(0)
+        _ = torch.randn(B, H, D, device="cuda", dtype=torch.float16)  # match RNG stream
+        K = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)
+        V = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)
+        Q4 = Q.unsqueeze(2)  # (B,H,1,D) for SDPA decode
+        row["sdpa_ms"] = benchmark(F.scaled_dot_product_attention, Q4, K, V)
+        try:
+            ref = F.scaled_dot_product_attention(
+                Q.float().unsqueeze(2), K.float(), V.float()).squeeze(2)
+        except OOM:
+            torch.cuda.empty_cache()
+            ref = F.scaled_dot_product_attention(Q.unsqueeze(2), K, V).squeeze(2).float()
+        row["cos"] = F.cosine_similarity(out.float().flatten(), ref.flatten(), dim=0).item()
+        del K, V
+    except OOM:
+        torch.cuda.empty_cache()  # FP16 reference does not fit — INT8-only row
+    return row
 
 
 def main():
@@ -85,10 +113,16 @@ def main():
     for (B, H, D) in CONFIGS:
         for S in SEQS:
             r = run(ext, B, H, D, S)
-            spd = r["sdpa_ms"] / r["ours_ms"]
-            print(f"{B:>4} {H:>3} {D:>4} {S:>5} | {r['ours_ms']:8.4f} {r['sdpa_ms']:8.4f} "
-                  f"{spd:8.2f}x | {r['cos']:8.5f} | {r['kv_int8_mb']:8.1f}M {r['kv_fp16_mb']:8.1f}M "
-                  f"{r['ours_gbps']:9.1f}")
+            if r["sdpa_ms"] == "":   # FP16 reference OOM'd — INT8-only row
+                spd = ""
+                print(f"{B:>4} {H:>3} {D:>4} {S:>5} | {r['ours_ms']:8.4f} {'OOM':>8} "
+                      f"{'--':>8}  | {'--':>8} | {r['kv_int8_mb']:8.1f}M {r['kv_fp16_mb']:8.1f}M "
+                      f"{r['ours_gbps']:9.1f}   <- FP16 KV does not fit on 40 GB")
+            else:
+                spd = r["sdpa_ms"] / r["ours_ms"]
+                print(f"{B:>4} {H:>3} {D:>4} {S:>5} | {r['ours_ms']:8.4f} {r['sdpa_ms']:8.4f} "
+                      f"{spd:8.2f}x | {r['cos']:8.5f} | {r['kv_int8_mb']:8.1f}M {r['kv_fp16_mb']:8.1f}M "
+                      f"{r['ours_gbps']:9.1f}")
             r["speedup_vs_sdpa"] = spd
             rows.append(r)
     with open(CSV_OUT, "w", newline="") as f:

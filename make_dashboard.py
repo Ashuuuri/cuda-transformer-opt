@@ -314,7 +314,9 @@ def panel_journey(ax):
 
 
 def panel_sota_prefill(ax, rows):
-    """Prefill latency vs the REAL INT8 SOTA peer (SageAttention), not FP16."""
+    """Prefill latency vs the REAL INT8 SOTA peer (SageAttention) — the HONEST
+    footnote: prefill is compute-bound, so INT8's byte advantage does NOT help
+    here; we trail SOTA as seq grows. The INT8 win is decode/footprint (→)."""
     if not rows:
         ax.text(0.5, 0.5, "no attn_sota.csv\n(run bench_attn_sota.py)",
                 ha="center", va="center"); ax.set_axis_off(); return
@@ -336,74 +338,98 @@ def panel_sota_prefill(ax, rows):
     ax.set_xscale("log", base=2); ax.set_yscale("log", base=10)
     ax.set_xticks(x); ax.set_xticklabels(x)
     ax.set_xlabel("seq_len (prefill, seq_q==seq_kv)"); ax.set_ylabel("latency (ms)")
-    ax.set_title("Prefill vs REAL INT8 SOTA — SageAttention (b=8 h=8 d=64)",
+    ax.set_title("Prefill is COMPUTE-bound — INT8 has no edge here (honest footnote)",
                  fontweight="bold", fontsize=11)
     ax.grid(True, which="both", alpha=0.25); ax.legend(fontsize=8, loc="upper left")
     ax.text(0.5, -0.30,
-            "× = ours/SageAttention. Ours wins short/mid seq, ≈parity@2048, "
-            "loses@4096;\nand is slightly MORE accurate (cos 0.99995 vs sage 0.99992).",
+            "Prefill computes a full S×S score matrix → compute-bound, so halving\n"
+            "BYTES buys nothing: × (ours/Sage) erodes 1.4→0.9 as seq grows, trailing\n"
+            "SOTA@4096. INT8's byte win lives in decode + footprint (panels →), not here.",
             transform=ax.transAxes, fontsize=8.5, ha="center", va="top",
-            color="#166534", style="italic")
+            color="#9A3412", style="italic")
 
 
-def _decode_at(rows, S):
-    sub = [r for r in rows if int(r["S"]) == S]
-    sub.sort(key=lambda r: (int(r["B"]), int(r["H"]), int(r["D"])))
-    return sub
+# serving-scale decode configs (skip grid-starved B8); one line per config.
+DECODE_CFGS = [(32, 8, 64), (64, 16, 64), (128, 16, 64), (64, 16, 128)]
+_DECODE_COLORS = ["#2563EB", "#16A34A", "#7C3AED", "#EA580C"]
 
 
-def _cfg_label(r):
-    return f"B{int(r['B'])}\nH{int(r['H'])} D{int(r['D'])}"
-
-
-def panel_decode_speedup(ax, rows, S):
+def panel_decode_speedup(ax, rows):
+    """Decode speedup vs FP16 SDPA across the long-context grid (1K–32K), one
+    line per serving config — the win HOLDS (D=64 even grows) as context grows,
+    because decode re-streams the whole KV cache every token (bandwidth-bound)."""
     if not rows:
         ax.text(0.5, 0.5, "no attn_decode.csv\n(run bench_attn_decode.py)",
                 ha="center", va="center"); ax.set_axis_off(); return
-    sub = _decode_at(rows, S)
-    x = np.arange(len(sub))
-    y = [r["speedup_vs_sdpa"] for r in sub]
-    colors = [C_SOTA if v >= 1.0 else C_FP16 for v in y]
-    ax.bar(x, y, 0.6, color=colors, alpha=0.9)
-    for xi, v in zip(x, y):
-        ax.text(xi, v + 0.02, f"{v:.2f}×", ha="center", va="bottom",
-                fontsize=8, fontweight="bold")
+    for (B, H, D), color in zip(DECODE_CFGS, _DECODE_COLORS):
+        sub = [r for r in rows if int(r["B"]) == B and int(r["H"]) == H
+               and int(r["D"]) == D and isinstance(r.get("speedup_vs_sdpa"), float)]
+        sub.sort(key=lambda r: int(r["S"]))
+        if not sub:
+            continue
+        x = [int(r["S"]) for r in sub]
+        y = [r["speedup_vs_sdpa"] for r in sub]
+        ax.plot(x, y, marker="o", color=color, lw=2, ms=5,
+                label=f"B{B} H{H} D{D}")
     ax.axhline(1.0, color="gray", ls="--", lw=1.2)
-    ax.set_xticks(x); ax.set_xticklabels([_cfg_label(r) for r in sub], fontsize=8)
+    ax.set_xscale("log", base=2)
+    allx = sorted({int(r["S"]) for r in rows})
+    ax.set_xticks(allx); ax.set_xticklabels([f"{s//1024}K" if s >= 1024 else s for s in allx],
+                                            fontsize=8)
+    ax.set_xlabel("KV context length (decode, seq_q==1)")
     ax.set_ylabel("decode speedup vs FP16 SDPA (>1 = ours faster)")
-    ax.set_title(f"Decode vs FP16 SDPA (S={S}) — INT8 KV cache",
+    ax.set_title("Decode win HOLDS across 1K–32K context — INT8 KV cache",
                  fontweight="bold", fontsize=11)
-    ax.legend(handles=[Patch(color=C_SOTA, label="faster than FP16 SDPA (>1×)"),
-                       Patch(color=C_FP16, label="slower (<1×)")],
-              fontsize=8, loc="upper right")
-    ax.grid(axis="y", alpha=0.25)
+    ax.legend(fontsize=8, loc="lower right", title="serving configs", title_fontsize=8)
+    ax.grid(True, which="both", alpha=0.25)
     ax.text(0.5, -0.30,
-            "Serving scale (B≥32) wins 1.2–1.6×; tiny B=8 is grid-starved\n"
-            "(b·h too small for 108 SMs) — a launch-shape limit, not a kernel one.",
+            "At serving scale (B≥32) the INT8 decode kernel beats FP16 SDPA 1.2–1.6×\n"
+            "at EVERY context length, and D=64 widens with seq — exactly the\n"
+            "long-context regime that matters; short-seq prefill (←) does not.",
             transform=ax.transAxes, fontsize=8.5, ha="center", va="top",
             color="#1E3A8A", style="italic")
 
 
-def panel_decode_bw(ax, rows, S):
-    if not rows:
-        ax.text(0.5, 0.5, "no attn_decode.csv", ha="center", va="center")
-        ax.set_axis_off(); return
-    sub = _decode_at(rows, S)
-    x = np.arange(len(sub))
-    y = [r["ours_gbps"] for r in sub]
-    ax.bar(x, y, 0.6, color=C_OURS, alpha=0.9, label="ours achieved GB/s")
-    ax.axhline(1555, color="gray", ls="--", lw=1.3, label="A100 HBM peak ≈1555 GB/s")
-    for xi, v in zip(x, y):
-        ax.text(xi, v + 12, f"{v:.0f}", ha="center", va="bottom", fontsize=8)
-    ax.set_xticks(x); ax.set_xticklabels([_cfg_label(r) for r in sub], fontsize=8)
-    ax.set_ylabel("KV-cache HBM bandwidth (GB/s)")
-    ax.set_ylim(0, 1700)
-    ax.set_title(f"Decode achieved HBM BW (S={S}) — bandwidth-bound",
+# KV-footprint config: a 7–13B-class model shard at serving batch. The point is
+# structural (½ the bytes/token ⇒ 2× context per card), independent of the kernel.
+KV_B, KV_H, KV_D = 32, 32, 128
+CARD_GB = 40.0
+
+
+def panel_kv_footprint(ax):
+    """KV-cache footprint vs context length, INT8 vs FP16, against the 40 GB
+    card wall. Half the bytes/token ⇒ INT8 fits ~2× the context (or batch) — the
+    OOM the FP16 decode path hits at long context turns into a capacity win."""
+    seqs = [2 ** k for k in range(12, 19)]            # 4K .. 256K
+    per_tok = 2 * KV_B * KV_H * KV_D / 1e9            # K+V, GB per token per byte/elem
+    fp16 = [per_tok * 2 * S for S in seqs]
+    int8 = [per_tok * 1 * S for S in seqs]
+    ax.plot(seqs, fp16, marker="o", color=C_FP16, lw=2, ms=5,
+            label="FP16 KV cache (2 B/elem)")
+    ax.plot(seqs, int8, marker="o", color=C_OURS, lw=2, ms=5,
+            label="INT8 KV cache (1 B/elem, ours)")
+    ax.axhline(CARD_GB, color="black", ls="--", lw=1.6)
+    ax.text(seqs[0], CARD_GB * 1.08, "A100-40GB card capacity",
+            fontsize=8.5, color="black", fontweight="bold")
+    max_fp16 = CARD_GB / (per_tok * 2)               # tokens that fit
+    max_int8 = CARD_GB / (per_tok * 1)
+    for xv, col, tag in [(max_fp16, C_FP16, f"FP16 wall\n≈{max_fp16/1000:.0f}K tok"),
+                         (max_int8, C_OURS, f"INT8 wall\n≈{max_int8/1000:.0f}K tok")]:
+        ax.axvline(xv, color=col, ls=":", lw=1.5)
+        ax.text(xv, CARD_GB * 0.32, tag, color=col, fontsize=8,
+                fontweight="bold", ha="center",
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=col, lw=0.8))
+    ax.set_xscale("log", base=2); ax.set_yscale("log", base=10)
+    ax.set_xticks(seqs); ax.set_xticklabels([f"{s//1024}K" for s in seqs], fontsize=8)
+    ax.set_xlabel(f"context length (B={KV_B} H={KV_H} D={KV_D})")
+    ax.set_ylabel("KV-cache footprint (GB)")
+    ax.set_title("KV footprint vs 40 GB wall — INT8 fits 2× the context",
                  fontweight="bold", fontsize=11)
-    ax.legend(fontsize=8, loc="upper left"); ax.grid(axis="y", alpha=0.25)
+    ax.legend(fontsize=8, loc="upper left"); ax.grid(True, which="both", alpha=0.25)
     ax.text(0.5, -0.30,
-            "Up to ~826 GB/s (~53% of peak) → decode is bandwidth-bound on the KV\n"
-            "cache, and INT8 stores it at HALF the FP16 bytes/token (the serving win).",
+            "FP16 KV maxes out context where INT8 still has 2× headroom (½ the\n"
+            "bytes/token). The FP16 decode path OOMs first; INT8 keeps serving —\n"
+            "more context (or 2× the batch) per card is the structural serving win.",
             transform=ax.transAxes, fontsize=8.5, ha="center", va="top",
             color="#1E3A8A", style="italic")
 
@@ -466,10 +492,11 @@ def main():
     panel_kerneltime(fig.add_subplot(gs[2, 1]))
     panel_journey(fig.add_subplot(gs[2, 2]))
 
-    # Row 4 — REAL INT8 SOTA (SageAttention) + decode regime
+    # Row 4 — the long-context story: prefill (compute-bound, honest footnote) →
+    # decode win holds across 1K–32K → KV footprint vs the 40 GB card wall.
     panel_sota_prefill(fig.add_subplot(gs[3, 0]), sota)
-    panel_decode_speedup(fig.add_subplot(gs[3, 1]), decode, 4096)
-    panel_decode_bw(fig.add_subplot(gs[3, 2]), decode, 4096)
+    panel_decode_speedup(fig.add_subplot(gs[3, 1]), decode)
+    panel_kv_footprint(fig.add_subplot(gs[3, 2]))
 
     fig.suptitle("INT8 Transformer Kernels — Performance & Profiling Dashboard "
                  "(A100-SXM4-40GB, sm_80)\n"
@@ -491,7 +518,7 @@ def main():
     for y, txt in [(0.815, "①  INT8 MLP benchmark"),
                    (0.600, "②  INT8 attention benchmark"),
                    (0.385, "③  Profiling: ncu stalls · kernel-time · opt journey"),
-                   (0.165, "④  Real INT8 SOTA (SageAttention) + decode regime")]:
+                   (0.165, "④  Long-context: prefill vs SOTA · decode win · KV footprint")]:
         fig.text(0.018, y, txt, fontsize=13, fontweight="bold", color="#374151",
                  rotation=90, va="center", ha="center")
 

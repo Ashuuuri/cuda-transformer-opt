@@ -563,7 +563,8 @@ def main():
     from torch.utils.cpp_extension import load
     print("Compiling INT8 kernels ...")
     ext = load(name="int8_ext",
-               sources=["kernels/int8_attention.cu", "kernels/int8_mlp.cu",
+               sources=["kernels/int8_attention.cu", "kernels/int8_decode_attention.cu",
+                        "kernels/int8_mlp.cu",
                         "kernels/quant_utils.cu", "kernels/int8_ext.cu"],
                extra_cuda_cflags=["-arch=sm_80", "--std=c++17", "-O3"],
                verbose=False)

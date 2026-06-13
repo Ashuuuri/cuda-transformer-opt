@@ -536,3 +536,61 @@ behind them. Append a new `### Iteration N` here after each optimization
   `INT8_MLP_FUSE_QUANT` (OFF) so the experiment + the "GEMM2 can't absorb on-load
   convert" finding are preserved. **The MLP forward orchestration is now also
   exhausted** (transpose amortized iter 11; quantize_rows fusion negative iter 13).
+
+### Iteration 14 - 2026-06-13  (NEW REGIME — decode / INT8 KV-cache attention)
+- **Change**: new kernel `kernels/int8_decode_attention.cu` (+ pybind entry
+  `int8_decode_attention_forward` in `int8_ext.cu`) for the **decode** regime
+  (seq_q == 1), which the square WMMA kernel cannot serve (it tiles Q into 16-row
+  WMMA fragments — 15/16 padding when seq_q==1). Decode is a GEMV (Q·Kᵀ) +
+  weighted sum (P·V), **bandwidth-bound on streaming the KV cache**, which is
+  exactly where an INT8 KV cache pays off (K,V at 1 byte vs FP16's 2 → half the
+  bytes streamed per token). Two structural sub-versions, both this iteration:
+  - **v1 (one warp per (b,h))**: each of the 32 lanes owns DPL=HEAD_DIM/32 head
+    dims, streams the whole KV cache, int8×int8 partial dot + warp-shuffle reduce
+    + online softmax, barrier-free / no smem. Correct but **lost to FP16 SDPA
+    (0.04–0.90×, ~34% HBM BW)**: decode's parallelism is only batch*heads, so few
+    warps are resident and memory latency is not hidden (grid-starved at small
+    b*h; serial single-warp KV scan at large S).
+  - **v2 (split-KV / flash-decoding, the shipped path)**: also split the KV
+    dimension — NSPLIT warps cooperate per (b,h), each scanning one KV chunk into
+    a PARTIAL online-softmax state (m, l, unnormalized Σexp(score−m)·V); a second
+    `int8_decode_combine_kernel` merges the NSPLIT partials per (b,h) with the
+    standard log-sum-exp rescale. Multiplies resident warps by NSPLIT → fills the
+    SMs → saturates BW and cures grid starvation. NSPLIT chosen by the host
+    (MIN_CHUNK=128, TARGET_UNITS=4096, MAX_SPLIT=128). Partials live in a cached
+    `cudaMalloc` scratch (grows; no per-step malloc). HEAD_DIM ∈ {64,128}.
+- **Target metric**: decode-step latency vs FP16 SDPA, and HBM bandwidth
+  (ours GB/s vs the A100-SXM4 ~1555 GB/s peak). Benchmarked by
+  `bench_attn_decode.py` (CONFIGS grid × SEQS 1024/2048/4096).
+- **Profiling results** (mean ms / decode step over 50 iters; `bench_attn_decode.py`):
+  - **HEAD_DIM=128 (B=64 H=16): ours 1.23× FASTER than FP16 SDPA across all seq
+    lens** (S=1024 0.354 vs 0.436 ms; S=2048 0.669 vs 0.824; S=4096 1.300 vs
+    1.602), **757–826 GB/s ≈ 52% of HBM peak** — the INT8-KV-cache latency win,
+    at half the KV bytes.
+  - **HEAD_DIM=64: still loses (0.46–0.94×)**, plateaus at **~390 GB/s ≈ 25% of
+    peak** — *instruction-bound, not bandwidth-bound*: DPL=2 (only 2 bytes/lane
+    per KV step) so the fixed per-step overhead (6-step `__shfl` reduction +
+    2× `__expf` + broadcast) dominates the tiny load. More splits cannot fix an
+    instruction-bound loop; cuBLAS/cuDNN's tuned GEMV handles small-D better.
+  - v2 vs v1: substantial improvement (v1 maxed 0.90× / 531 GB/s; v2 best
+    1.23× / 826 GB/s; small-batch B=8 H=8 went 0.04×→0.57×).
+  - KV-cache footprint (structural, all shapes): INT8 is **half** the FP16 bytes
+    (e.g. B=128 H=16 S=4096 D=64: 1074 MB vs 2147 MB) — more context / bigger
+    batch per card, half the bytes streamed per token.
+- **Accuracy validation**: decode kernel cos vs fp32 SDPA ground truth
+  **0.99994–0.99995** across every shape (incl. ragged S). The 5-gate
+  `validate_int8.py` (prefill MLP + attention paths) still **ALL PASS** after the
+  build change — Gate 5 real GPT-2 −0.068% unchanged — confirming the new source
+  + the `int8_ext.cu` binding did not perturb the existing kernels. (The decode
+  kernel is a separate entry point; the square `int8_attention_forward`,
+  `int8_mlp_forward`, and the `tests/cuda/` .bin flow are untouched.)
+- **Conclusion**: PASS / SHIPPED for HEAD_DIM=128 (a real "beats FP16 SDPA"
+  decode result, 1.23×, the common real-LLM head size). HEAD_DIM=64 is left as
+  documented instruction-bound future work — the fix is a different lane layout
+  (**one lane per KV position**: each lane does a full 64-dim dot via `dp4a`, no
+  per-j shuffle reduction → one reduction per 32 positions instead of per
+  position), a separate coherent iteration. v1 (one-warp-per-(b,h)) is **not**
+  kept as a flag — it was strictly superseded by v2 within the same iteration, so
+  only the split-KV path ships. This iteration opens the **decode regime** as the
+  place the INT8 KV-cache byte advantage is realized (the prefill/square kernel's
+  value is compute, not the cache); see `CLAUDE.md` §4 "What winning means".

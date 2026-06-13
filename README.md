@@ -17,7 +17,8 @@ cuda-transformer-opt/
 ├── kernels/                    # CUDA kernel source code
 │   ├── attention.cu            # FP16 fused attention
 │   ├── mlp.cu                  # FP16 fused MLP
-│   ├── int8_attention.cu       # INT8 quantized attention
+│   ├── int8_attention.cu       # INT8 quantized attention (prefill / square)
+│   ├── int8_decode_attention.cu # INT8 decode attention (seq_q=1, split-KV)
 │   ├── int8_mlp.cu             # INT8 quantized MLP
 │   └── quant_utils.cu          # Shared quantization helpers
 ├── tests/
@@ -218,12 +219,50 @@ MLP datasets now pass outright.
 The denser-mma reschedule (iter 10) and the attention 4-blocks/SM raise were
 reverted outright (byte-identical / no speedup); see the log.
 
+### Decode regime — INT8 KV-cache attention (iter 14)
+
+The square WMMA kernel is **prefill-only** (seq_q == seq_kv); it cannot serve
+autoregressive **decode** (seq_q == 1), where 15/16 of every Q-tile would be
+padding. Decode is a GEMV that is **bandwidth-bound on streaming the KV cache** —
+exactly where an INT8 cache pays off (K,V at 1 byte vs FP16's 2 → half the bytes
+streamed per generated token). New entry point `int8_decode_attention_forward`
+(`kernels/int8_decode_attention.cu`) is a **split-KV flash-decoding** kernel:
+NSPLIT warps cooperate per (b,h), each scanning one KV chunk into a partial
+online-softmax state, then a combine kernel merges them with log-sum-exp rescale
+(multiplies resident warps → fills the SMs → saturates HBM BW; a v1 one-warp-per-
+(b,h) version was grid-starved at ~34% BW and lost — superseded).
+
+| Shape | ours/FP16-SDPA | HBM BW | KV bytes |
+|---|---|---|---|
+| **head_dim=128** (B=64 H=16, S=1024–4096) | **1.23×** (faster) | 757–826 GB/s (~52% peak) | **half** |
+| head_dim=64 | 0.46–0.94× (slower) | ~390 GB/s (~25% peak) | **half** |
+
+At head_dim=128 (the common real-LLM head size — Llama/Mistral) the INT8 decode
+kernel **beats the FP16 SDPA decode path by 1.23× at half the KV-cache bytes**,
+cos 0.9999 vs fp32. head_dim=64 is *instruction-bound* (only 2 bytes/lane per KV
+step, so the fixed per-step `__shfl` reduction + `__expf` dominate) — the fix is a
+one-lane-per-KV-position `dp4a` layout (future work). Benchmark:
+`python bench_attn_decode.py`.
+
+### SOTA comparison — vs SageAttention, not just FP16 peers
+
+The honest peer for an INT8 attention kernel is another *INT8* kernel, not FP16.
+On A100 (sm_80) that is **SageAttention v1** (Triton; INT8 QKᵀ, FP16 PV — the same
+idea, production-tuned; FlashAttention-3 FP8 is Hopper-only and excluded).
+`python bench_attn_sota.py` (graded prefill grid): ours **wins at short/medium
+seq** (3.6× @512, 1.63× @1024), parity @2048, loses @4096 (0.74×); accuracy at
+parity (ours cos 0.99994 vs sage 0.99992). The earlier "loses to FA2" framing
+conflated the INT8 algorithm with the engineering level — against the real INT8
+SOTA the prefill kernel is competitive.
+
 ### Future work
 
-- **Attention online-softmax dependency chain** — the only remaining perf lever.
+- **Attention online-softmax dependency chain** — the only remaining prefill perf lever.
   The ~28% `tensor_pipe` ceiling is pinned by the per-warp
   `ldmatrix → mma → exp/MUFU → pack → mma` + cross-KV-tile rescale chain; breaking
   it (cheaper/approximate exp, decoupling the per-tile rescale) is deep and
   high-risk. Both attention occupancy levers are already proven dead.
 - Per-channel / smoothing for **attention** K/V (the remaining outlier XFAIL is
   attention-only; the MLP per-token output already shipped, iter 9).
+- **Decode head_dim=64** — one-lane-per-KV-position `dp4a` layout to remove the
+  per-step warp-shuffle reduction (currently instruction-bound at ~25% HBM BW).

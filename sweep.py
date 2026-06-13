@@ -108,6 +108,7 @@ def load_int8_ext():
         name="int8_ext",
         sources=[
             os.path.join(kdir, "int8_attention.cu"),
+            os.path.join(kdir, "int8_decode_attention.cu"),
             os.path.join(kdir, "int8_mlp.cu"),
             os.path.join(kdir, "quant_utils.cu"),
             os.path.join(kdir, "int8_ext.cu"),

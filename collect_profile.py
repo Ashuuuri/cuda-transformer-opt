@@ -21,7 +21,8 @@ def load_int8_ext():
     return load(
         name="int8_ext",
         sources=[os.path.join(kdir, f) for f in
-                 ("int8_attention.cu", "int8_mlp.cu", "quant_utils.cu", "int8_ext.cu")],
+                 ("int8_attention.cu", "int8_decode_attention.cu", "int8_mlp.cu",
+                  "quant_utils.cu", "int8_ext.cu")],
         extra_cuda_cflags=["-O2", "--std=c++17", "-arch=sm_80"],
         verbose=False,
     )

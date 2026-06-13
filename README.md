@@ -256,11 +256,27 @@ switching the loader to 4-byte `cp.async` cut bank conflicts **16.78M → 2.10M
 (d_model=1024: 0.86→1.09 ms) because the 4× more cp.async store instructions
 flooded the issue pipe (`smsp__inst_executed` →55%, `lg_throttle` →10%). So the
 read-conflict relief is real, but it must NOT come at the cost of 16-byte stores.
-Reverted. The viable fix is an **XOR-swizzled smem layout** (keep 16-byte
-`cp.async` stores, permute each 16B chunk's bank by XOR-ing the column offset
-with row bits, and read with manual `ldmatrix`/`mma.sync` since `load_matrix_sync`
-cannot follow a swizzle) — that keeps store efficiency while killing the read
-conflicts.
+Reverted.
+
+**Resolution — hand-rolled `mma.sync m16n8k32` over a k-contiguous layout
+(2026-06-13, iter 7): 1.35–1.67× faster.** The conflicts come from
+`load_matrix_sync`'s internal int8 access pattern, not from the stride per se.
+Replacing both GEMM inner loops with native
+`mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32` (the attention QK^T path,
+operands loaded as plain 4-byte smem words) makes the per-instruction bank map
+`(12·group + tid) mod 32` a *bijection* over the 32 lanes — **conflict-free with
+the original 16-byte `cp.async` stores, no XOR swizzle needed**. The one
+prerequisite: int8 `mma.sync` needs its B operand k-contiguous, but the weights
+are `[K][N]` (n-contiguous) and there is no int8 `trans`-`ldmatrix`, so W1/W2 are
+**pre-transposed to `[N][K]`** once per forward (a ~1–2% bandwidth pass).
+Measured on the graded shape: bank conflicts **16.78M → ~3K (≈0)**,
+`l1tex__throughput` **78%/67% → 39%/29%**, and end-to-end latency **−26% to −40%
+across the full sweep** (d_model=1024 s=512: 0.89→0.64 ms; s=4096: 5.55→3.50 ms),
+reproducible across runs. Registers/occupancy unchanged (128 regs, 0 spills, 2
+blocks/SM). All five accuracy gates pass on all 8 datasets (task-level ppl
++0.011%). The XOR swizzle turned out to be unnecessary — the access-pattern
+change alone removes the conflicts while keeping `load_matrix_sync`'s 16-byte
+store efficiency.
 
 ### Future work
 

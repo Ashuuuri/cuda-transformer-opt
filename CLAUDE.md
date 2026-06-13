@@ -563,3 +563,44 @@ After each optimization, append a section at the bottom of this file:
   Gate1 math     : cos=0.99997 top10=0.991 outlier=0.0000 nan_ok=True  -> PASS
   ```
 - **Conclusion**: pass.
+
+
+### Iteration 7 - 2026-06-13
+- **Change**: `kernels/int8_mlp.cu` — replaced the WMMA `load_matrix_sync` +
+  `mma_sync(m16n16k16)` inner loop of BOTH GEMM kernels with hand-rolled native
+  `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32` (new `mlp_mma_m16n8k32_s8`,
+  shared `mlp_int8_mainloop`), operands loaded as plain 4-byte k-contiguous smem
+  words like the attention QK^T path. The B operand (weights) is staged
+  k-contiguous, which int8 `mma.sync` requires, by **pre-transposing W1/W2 to
+  `[N][K]`** each forward (`transpose_int8_kernel`, ~1-2% bandwidth pass — no
+  pointer-keyed cache, to stay correct across validation datasets that reuse
+  freed weight addresses). s32 accumulators are scattered back to the row-major
+  c_smem tile (`mlp_store_acc16`) so both epilogues are unchanged. B smem layout
+  `[k][n] stride 144` -> `[n][k] stride 48`; smem total unchanged (epilogue
+  dominated, 32 KB -> still 2 blocks/SM).
+- **Target metric**: `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum`
+  and `l1tex__throughput` down — the hand-rolled load's per-instruction bank map
+  `(12*group + tid_grp) mod 32` is a bijection over the 32 lanes (conflict-free),
+  unlike `load_matrix_sync`'s int8 pattern which collided period-8 (2-way) and
+  made ~46% of smem-load wavefronts conflicts. (XOR swizzle proved unnecessary —
+  the access-pattern change alone fixes it while keeping the 16-byte `cp.async`
+  stores; the iter-6 README 4-byte-store probe was the negative result that ruled
+  out the stride route.)
+- **Profiling results** (graded shape b=8 s=512 d_model=1024 d_ff=4096):
+  - bank conflicts (ld.sum): **16.78M -> ~3.0K / 1.2K (≈0, -99.98%)**
+  - `l1tex__throughput`: **78%/67% -> 39%/29%** (L1/smem no longer the ceiling)
+  - smem-load wavefronts: **36.2M -> 10.0M / 8.1M**
+  - `tensor_op_imma` active: 26%/31% (≈unchanged)
+  - registers 128, 0 spills, 2 blocks/SM (unchanged)
+  - **latency: -26% to -40% across the full 12-point sweep**, reproducible across
+    two runs (d512 s512 0.42->0.31; d1024 s512 0.89->0.64, s4096 5.55->3.50;
+    d2048 s4096 20.18->12.09). Speedup vs naive 0.41-0.48x -> 0.55-0.79x.
+- **Accuracy validation** (all five gates PASS on all 8 datasets + task-level):
+  - [x] Gate 1: math metrics (normal cos=1.00000)
+  - [x] Gate 2: numeric stability
+  - [x] Gate 3: stage error trace
+  - [x] Gate 4: edge cases
+  - [x] Gate 5: task-level (ppl fp16=504.81 int8=504.87 +0.011%, top1 100%)
+- **Conclusion**: pass — largest single-iteration MLP gain so far. Next: push
+  `tensor_op_imma` (still ~28%) toward the cuBLAS 60%+ ceiling now that the
+  smem-pipe bottleneck is gone — a deeper k-stage pipeline or denser-mma schedule.

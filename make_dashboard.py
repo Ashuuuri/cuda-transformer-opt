@@ -184,11 +184,16 @@ def panel_kerneltime(ax):
     path = os.path.join(RES, "kernel_time_breakdown.csv")
     if not os.path.exists(path):
         ax.text(0.5, 0.5, "no breakdown data", ha="center"); return
-    data = {"int8_mlp": [], "int8_attn": []}
+    from collections import defaultdict
+    data = defaultdict(list)
     with open(path) as f:
         for r in csv.DictReader(f):
             data[r["forward"]].append((r["category"], float(r["pct"])))
-    fwds = ["int8_mlp", "int8_attn"]
+    # Show MLP all-in-one vs MLP prepacked (transpose hoisted out) vs attn.
+    fwds   = [f for f in ["int8_mlp", "int8_mlp_prepacked", "int8_attn"] if f in data]
+    labels = {"int8_mlp": "MLP forward\n(transpose/call)",
+              "int8_mlp_prepacked": "MLP forward\n(prepacked W)",
+              "int8_attn": "attn forward"}
     x = np.arange(len(fwds))
     cats = []
     for fw in fwds:
@@ -197,19 +202,17 @@ def panel_kerneltime(ax):
     cmap = plt.get_cmap("Set2")
     bottoms = np.zeros(len(fwds))
     for i, cat in enumerate(cats):
-        vals = []
-        for fw in fwds:
-            d = dict(data[fw]); vals.append(d.get(cat, 0.0))
-        vals = np.array(vals)
+        vals = np.array([dict(data[fw]).get(cat, 0.0) for fw in fwds])
         ax.bar(x, vals, 0.5, bottom=bottoms, label=cat, color=cmap(i % 8))
         for xi, (b, v) in enumerate(zip(bottoms, vals)):
             if v >= 6:
                 ax.text(xi, b + v / 2, f"{v:.0f}%", ha="center", va="center",
                         fontsize=8, fontweight="bold")
         bottoms += vals
-    ax.set_xticks(x); ax.set_xticklabels(["MLP forward", "attn forward"])
+    ax.set_xticks(x); ax.set_xticklabels([labels.get(f, f) for f in fwds], fontsize=8)
     ax.set_ylabel("% of forward CUDA time")
-    ax.set_title("Where the GPU time goes (torch.profiler, nsys-style)",
+    ax.set_title("Where the GPU time goes (torch.profiler, nsys-style)\n"
+                 "prepacking W removes the per-call transpose",
                  fontweight="bold", fontsize=11)
     ax.legend(fontsize=7, loc="lower center", bbox_to_anchor=(0.5, -0.02))
     ax.set_ylim(0, 105); ax.grid(axis="y", alpha=0.25)

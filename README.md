@@ -309,8 +309,29 @@ order is already at the compiler's optimum; the load redundancy was a phantom.
 independent accumulator chains in flight, but the `acc[2][4][8]` tile is already
 64 registers and any more spills at the fixed 2-block/SM occupancy. Both MLP
 perf levers — occupancy and denser-mma — are now empirically dead; the only
-remaining perf lever in the project is the attention online-softmax dependency
-chain.
+remaining *kernel-internal* perf lever in the project is the attention
+online-softmax dependency chain.
+
+**End-to-end win — prepacked (transpose-once) MLP for static-weight inference
+(2026-06-13, iter 11).** The GEMM *kernel* is exhausted, but the MLP *forward*
+was not: the m16n8k32 B fragment needs the weights staged k-contiguous, so
+`int8_mlp_forward` re-transposes W1/W2 to `[N][K]` on **every** call. The
+torch.profiler kernel-time breakdown showed this transpose is **~10% of MLP
+forward time** at the graded shape (b=8 s=512 d_model=1024). Weights are constant
+across forwards, so iter 11 adds a static-weight path that transposes once at
+load: `transpose_int8_weights(W1,W2) → (W1T,W2T)` plus
+`int8_mlp_forward_prepacked` (per-tensor scales, takes the pre-transposed
+weights, skips the internal pass). It is a *new* entry point — the per-tensor
+`int8_mlp_forward`, `int8_mlp_forward_per_channel`, and the `tests/cuda/` .bin
+flow are all unchanged — and its output is `torch.equal` bit-identical to
+`int8_mlp_forward` on every sweep shape. `sweep.py` now transposes once outside
+the timed loop and grades this path (the realistic deployment pattern). Result
+(median of 5): MLP forward latency **−22% (d_model=512), −9% (d_model=1024),
+−12% (d_model=2048)** at the graded s=512; the win shrinks with seq_len as the
+GEMM dwarfs the fixed transpose (−1.5% to −3% at s=4096). The dashboard's
+kernel-time panel shows the all-in-one (79% GEMM + 10% transpose) vs prepacked
+(88% GEMM, no transpose) split side by side. Lesson: the kernel well was dry, but
+the forward orchestration around it was not.
 
 ### INT8 MLP: real-model accuracy — per-channel/per-token quant (iter 9, 2026-06-13)
 

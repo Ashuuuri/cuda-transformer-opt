@@ -186,12 +186,21 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
 ## 4. Optimization Targets & Rules
 
 **Optimize first** (by expected return):
-> **STATUS 2026-06-13: the INT8 MLP is now perf-EXHAUSTED.** All three of its
-> ceilings — smem bank conflicts (iter 7), global-load latency (iter 8), and the
-> `wait` MMA-dependency stall (iter 10) — are closed or proven structurally dead.
-> The single remaining perf lever in the project is target #2 below (attention
-> online-softmax dependency chain), which is deep and high-risk. The MLP entry
-> #1 is kept as history; **do not re-open it.**
+> **STATUS 2026-06-13: the INT8 MLP GEMM kernels are perf-EXHAUSTED.** All three
+> of their internal ceilings — smem bank conflicts (iter 7), global-load latency
+> (iter 8), and the `wait` MMA-dependency stall (iter 10) — are closed or proven
+> structurally dead. The single remaining *kernel-internal* perf lever in the
+> project is target #2 below (attention online-softmax dependency chain), deep and
+> high-risk. The MLP GEMM entry #1 is kept as history; **do not re-open it.**
+>
+> **But the MLP *forward* (not the GEMM) still had a non-kernel win (iter 11):**
+> the per-forward W transpose was ~10% of MLP forward time on the graded shape
+> (torch.profiler). Weights are static across forwards, so iter 11 added a
+> prepacked entry point (`int8_mlp_forward_prepacked` + `transpose_int8_weights`)
+> that transposes once at load — realistic static-weight inference. Bit-identical
+> output; sweep now grades the transpose-once path. The lesson: the *kernel* well
+> was dry, but the forward *orchestration* around it was not. Look there next, not
+> at the GEMM inner loop.
 
 1. ~~**The `wait` (MMA dependency) stall in the `int8_mlp.cu` GEMMs**~~ —
    **CLOSED (iter 10): the denser-mma lever is a proven dead end (see the
@@ -775,3 +784,47 @@ After each optimization, append a section at the bottom of this file:
   well is now dry for both the occupancy AND the denser-mma levers.** The ONLY
   remaining perf lever in the whole project is the attention online-softmax
   dependency chain (§4 #2) — deep and high-risk.
+
+### Iteration 11 - 2026-06-13
+- **Change**: `kernels/int8_mlp.cu` + `int8_ext.cu` — added a **prepacked
+  (transpose-once) MLP entry point** for static-weight inference, WITHOUT
+  touching the (exhausted) GEMM internals. The all-in-one `int8_mlp_forward`
+  re-transposes W1/W2 to `[N][K]` (k-contiguous, required by the m16n8k32 B
+  fragment) on **every** forward; weights are constant across forwards, so this
+  is pure per-call overhead. New: `transpose_int8_weights(W1,W2)->(W1T,W2T)`
+  (the same one-shot pass, callable once at load) + `int8_mlp_forward_prepacked`
+  (per-tensor scales, takes already-transposed weights, `weights_prepacked=true`
+  skips the internal transpose). Both old device signatures (`int8_mlp_forward`,
+  `int8_mlp_forward_per_channel`) and the `tests/cuda/` .bin flow are UNCHANGED;
+  this is a NEW path per the relaxed-interface rule. `sweep.py` now transposes
+  once outside the timed loop and grades the prepacked path (realistic static-
+  weight inference); `collect_profile.py` profiles both so the dashboard shows
+  the transpose removed.
+- **Target metric**: per-forward transpose share of MLP forward time
+  (torch.profiler kernel-time breakdown) → 0, and end-to-end MLP forward latency.
+  This is a forward-orchestration win, NOT a GEMM-internal ncu-metric move (the
+  GEMM kernels are byte-identical — output bit-identical, verified).
+- **Profiling results** (graded grid, median of 5 runs; bench_prepacked.py):
+  - torch.profiler MLP forward split (b=8 s=512 d_model=1024): all-in-one =
+    79.0% GEMM + **10.4% transpose W** + 7.4% quantize_rows + 3.3% other;
+    prepacked = **88.3% GEMM + 0% transpose** + 8.0% quantize_rows + 3.7% other.
+  - end-to-end latency vs all-in-one, transpose-once: **−22.1% (d512 s512),
+    −9.3% (d1024 s512), −11.9% (d2048 s512)** at the graded s=512; the win
+    shrinks with seq_len as the GEMM dwarfs the fixed transpose (−1.5% to −3%
+    at s=4096). All deltas reproducible (median of 5); s≤2048 all beyond the
+    2% noise floor.
+  - GEMM absolute time unchanged (24.69k→24.60k µs, within noise); output
+    `torch.equal` bit-identical to `int8_mlp_forward` on all 12 sweep shapes.
+- **Accuracy validation** (all 5 gates PASS on all 8 datasets + real Gate 5;
+  the prepacked path is bit-identical to the validated per-tensor path, and the
+  per-channel/per-tensor entry points it shares are untouched):
+  - [x] Gate 1: math metrics (normal cos=1.00000)
+  - [x] Gate 2: numeric stability
+  - [x] Gate 3: stage error trace
+  - [x] Gate 4: edge cases
+  - [x] Gate 5: task-level (real GPT-2, −0.068%)
+- **Conclusion**: pass — a real end-to-end MLP-forward win (largest at the
+  graded s=512: ~9–22%) found OUTSIDE the perf-exhausted GEMM, by amortizing the
+  static-weight transpose. The GEMM inner loop remains dry; the lesson is that
+  the forward orchestration around it was not. Next: still the attention
+  online-softmax dependency chain (§4 #2) for kernel-internal perf.

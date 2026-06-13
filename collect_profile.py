@@ -85,6 +85,8 @@ def main():
     W1 = torch.randn(DM, DFF, device="cuda", dtype=torch.float16) * 0.02
     W2 = torch.randn(DFF, DM, device="cuda", dtype=torch.float16) * 0.02
     x_i8, sx = q_tensor(x); W1_i8, sW1 = q_tensor(W1); W2_i8, sW2 = q_tensor(W2)
+
+    # (a) all-in-one int8_mlp_forward — re-transposes the weights every call.
     total, rows = profile_forward(
         lambda: ext.int8_mlp_forward(x_i8, W1_i8, W2_i8, sx, sW1, sW2))
     agg = {}
@@ -92,7 +94,19 @@ def main():
         agg[classify(k)] = agg.get(classify(k), 0.0) + v
     for cat, us in sorted(agg.items(), key=lambda kv: -kv[1]):
         out_rows.append(("int8_mlp", cat, us, 100.0 * us / total))
-        print(f"  MLP  {cat:34s} {us:10.1f} us  {100*us/total:5.1f}%")
+        print(f"  MLP        {cat:34s} {us:10.1f} us  {100*us/total:5.1f}%")
+
+    # (b) prepacked path — weights transposed ONCE at load (static-weight
+    # inference, what sweep.py grades): the per-forward transpose is gone.
+    W1T, W2T = ext.transpose_int8_weights(W1_i8, W2_i8)
+    total, rows = profile_forward(
+        lambda: ext.int8_mlp_forward_prepacked(x_i8, W1T, W2T, sx, sW1, sW2))
+    agg = {}
+    for k, v in rows.items():
+        agg[classify(k)] = agg.get(classify(k), 0.0) + v
+    for cat, us in sorted(agg.items(), key=lambda kv: -kv[1]):
+        out_rows.append(("int8_mlp_prepacked", cat, us, 100.0 * us / total))
+        print(f"  MLP(prepack) {cat:32s} {us:10.1f} us  {100*us/total:5.1f}%")
 
     # ---- INT8 attention forward ----
     Q = torch.randn(B, HEADS, S, HEAD_DIM, device="cuda", dtype=torch.float16)

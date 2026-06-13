@@ -681,3 +681,56 @@ behind them. Append a new `### Iteration N` here after each optimization
   not re-attempt attention K/V smoothing** without a real-model distribution that
   demonstrably fails the OUTPUT cosine gate first. The attention accuracy track is
   now exhausted alongside the perf track.
+
+### Iteration 17 - 2026-06-13  (FULL-LAYER INTEGRATION — first end-to-end block wall-clock)
+- **Change**: NEW `bench_block.py` — assembles a pre-LN transformer block
+  (`h = x + Wo·Attn(split(LN1(x)·Wqkv)); y = h + MLP(LN2(h))`) and times it end
+  to end, INT8 vs FP16. The INT8 kernels cover ONLY the attention CORE and the
+  MLP; LayerNorm, both residual adds, and the QKV/output projections stay FP16
+  and are byte-identical in both paths, so the wall-clock delta isolates exactly
+  the attention-core + MLP INT8 swap. MLP uses the per-channel/per-token path
+  (real-model accuracy path). No kernel changed — this is the never-measured
+  end-to-end number CLAUDE.md §4 flagged as the only remaining axis.
+- **Target metric**: end-to-end block latency (ms), INT8 vs FP16; cos(INT8,FP16).
+- **Profiling results** (b=8 prefill / b=128 decode, d_model=1024 H=16 Dh=64 d_ff=4096):
+  - prefill S=512/1024/2048: **0.52 / 0.54 / 0.55×** (INT8 SLOWER), cos 0.99994.
+  - decode Skv=2K/4K/8K/16K/32K: **0.83 / 0.92 / 1.05 / 1.12 / 1.19×**, cos
+    0.99857→0.99985. Crosses 1.0 at ~8K and the win GROWS with context.
+  - Prefill component decomposition (S=512, INT8 ≈1.70 vs FP16 ≈0.81 ms):
+    LN+proj 0.26 (shared) · **quant Q,K,V 0.45** (pure eager glue, FP16 pays 0) ·
+    int8 attn 0.13 vs SDPA 0.10 (we lose attn at prefill) · MLP int8 0.86
+    (= quant-in 0.14 + kernel+transpose 0.66 + dequant 0.09) vs FP16 MLP 0.45.
+  - Prepacked per-tensor MLP (0.62) ≈ per-channel (0.66): the per-call transpose
+    is only ~0.03 ms, NOT the cause — the INT8 MLP kernel itself is ~0.7× FP16
+    cuBLAS at this shape.
+- **Reconciliation (important)**: this is NOT a contradiction of the "3.8–4.8×
+  MLP" headline. That headline is `speedup_vs_ref2` — vs the INT8 `_int_mm` +
+  dequant/GELU/requant PIPELINE. `int8_mlp_sweep.csv` `speedup_vs_naive` is
+  **0.71–0.88** (INT8 GEMM < FP16 cuBLAS) and always was. The project's win is
+  vs a naive INT8 deployment and in the KV-cache memory/bandwidth (decode), NOT
+  vs FP16 GEMM throughput — exactly the memory-bound thesis.
+- **Accuracy validation**: cos(INT8 block, FP16 block) ≥ 0.9994 (prefill) /
+  ≥ 0.9986 (decode) — end-to-end quantization error is negligible. (Gate 1–5 in
+  validate_int8.py unchanged; no kernel/quant math changed.)
+- **Conclusion**: end-to-end, INT8 wins ONLY in the bandwidth-bound long-context
+  DECODE regime (>8K, growing to 1.19× @ 32K), and LOSES in compute-bound prefill
+  — fully consistent with every per-kernel result and the dashboard. The
+  integration surfaced a NEW, real, actionable cost the per-kernel benchmarks hid:
+  the eager-mode **quant/dequant glue at the inter-op boundaries** (~0.68 ms of
+  the prefill block: 0.45 to quant Q,K,V + 0.23 around the MLP). This is the one
+  fusion lever per-kernel work could never reach — fuse the quantize into the
+  PRODUCER (LayerNorm→int8 emit; attention-out→int8+scale emit) so the consumer
+  reads int8 directly with no extra HBM round-trip. It needs NEW fused entry
+  points (allowed), not a change to the exhausted GEMM/softmax inner loops.
+- **Fairness bracket (is the comparison fair?)**: the INT8 path is handicapped two
+  ways the FP16 path is not — (1) eager-mode quant glue (~0.68 ms, an integration
+  artifact, removable by producer-fusion), and (2) hand-written INT8 kernels vs
+  NVIDIA cuBLAS/SDPA for the FP16 reference (an engineering-level gap, not an
+  algorithmic one). Removing artifact (1) — the optimistic "glue fully fused"
+  bound — puts prefill at ≈1.13 ms vs FP16 0.93 = **0.82×, STILL a loss**: prefill
+  INT8 loses even with perfect fusion, because the kernels themselves run ~0.7–0.8×
+  cuBLAS at prefill (int8 attn 0.13 > SDPA 0.10; int8 MLP 0.62 > FP16 0.45). So
+  glue-fusion would help DECODE (push its >8K crossover earlier, widen the 1.19×)
+  but will NOT rescue prefill. The decode long-context win is the ROBUST signal —
+  it survives both handicaps; the prefill loss is partly artifact but holds even
+  when the artifact is removed.

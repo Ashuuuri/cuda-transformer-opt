@@ -434,6 +434,122 @@ def panel_kv_footprint(ax):
             color="#1E3A8A", style="italic")
 
 
+# ────────────────────────────────────────────────────────────────────────
+#  Row 5 — END-TO-END BLOCK (the first full-layer integration measurement).
+#  LN + residual + QKV/out projections are FP16 & identical in both paths; the
+#  delta is purely the attention-core + MLP INT8 swap (bench_block.py).
+# ────────────────────────────────────────────────────────────────────────
+def _block_rows(rows, regime):
+    sub = [r for r in rows if r["regime"] == regime
+           and isinstance(r.get("fp16_ms"), float)]
+    sub.sort(key=lambda r: int(r["seq"]))
+    return sub
+
+
+def panel_block_prefill(ax, rows):
+    sub = _block_rows(rows, "prefill")
+    if not sub:
+        ax.text(0.5, 0.5, "no block.csv\n(run bench_block.py)",
+                ha="center", va="center"); ax.set_axis_off(); return
+    x = [int(r["seq"]) for r in sub]
+    ax.plot(x, [r["int8_ms"] for r in sub], marker="o", color=C_OURS, lw=2, ms=5,
+            label="INT8 block (eager quant glue)")
+    ax.plot(x, [r["fp16_ms"] for r in sub], marker="o", color=C_FP16, lw=2, ms=5,
+            label="FP16 block (cuBLAS + SDPA)")
+    for r in sub:
+        ax.annotate(f"{r['fp16_ms']/r['int8_ms']:.2f}×",
+                    (int(r["seq"]), r["int8_ms"]), textcoords="offset points",
+                    xytext=(0, 8), fontsize=8, fontweight="bold", color=C_OURS, ha="center")
+    ax.set_xscale("log", base=2); ax.set_yscale("log", base=10)
+    ax.set_xticks(x); ax.set_xticklabels(x)
+    ax.set_xlabel("seq_len (prefill)"); ax.set_ylabel("block latency (ms)")
+    ax.set_title("End-to-end PREFILL block — INT8 loses (compute-bound)",
+                 fontweight="bold", fontsize=11)
+    ax.grid(True, which="both", alpha=0.25); ax.legend(fontsize=8, loc="upper left")
+    ax.text(0.5, -0.30,
+            "× = FP16/INT8. INT8 loses ~0.52–0.55× — but part is removable eager\n"
+            "quant glue, not algorithm. The decompose panel (→) brackets how much.",
+            transform=ax.transAxes, fontsize=8.5, ha="center", va="top",
+            color="#9A3412", style="italic")
+
+
+def panel_block_decode(ax, rows):
+    sub = _block_rows(rows, "decode")
+    if not sub:
+        ax.text(0.5, 0.5, "no block.csv", ha="center", va="center")
+        ax.set_axis_off(); return
+    x = [int(r["seq"]) for r in sub]
+    y = [r["fp16_ms"] / r["int8_ms"] for r in sub]
+    ax.plot(x, y, marker="o", color=C_OURS, lw=2, ms=6,
+            label="INT8 block / FP16 block")
+    for xi, v in zip(x, y):
+        ax.annotate(f"{v:.2f}×", (xi, v), textcoords="offset points",
+                    xytext=(0, 8), fontsize=8, fontweight="bold",
+                    color=(C_SOTA if v >= 1 else C_FP16), ha="center")
+    ax.axhline(1.0, color="gray", ls="--", lw=1.2)
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(x); ax.set_xticklabels([f"{s//1024}K" for s in x], fontsize=8)
+    ax.set_xlabel("KV context length (decode, seq_q==1, B=128)")
+    ax.set_ylabel("end-to-end speedup vs FP16 block")
+    ax.set_title("End-to-end DECODE block — INT8 wins past ~8K, grows with context",
+                 fontweight="bold", fontsize=11)
+    ax.grid(True, which="both", alpha=0.25); ax.legend(fontsize=8, loc="upper left")
+    ax.text(0.5, -0.30,
+            "The ROBUST signal: even carrying the eager quant glue AND hand-kernel\n"
+            "vs-cuBLAS handicap, the INT8 block crosses 1.0 at ~8K and reaches\n"
+            "1.19× @ 32K — the bandwidth-bound regime where ½ the KV bytes pay off.",
+            transform=ax.transAxes, fontsize=8.5, ha="center", va="top",
+            color="#1E3A8A", style="italic")
+
+
+# Measured prefill component split (S=512, bench_block.py diagnostic). The
+# "quant glue" slice is the removable integration artifact; "other" folds the
+# Wo proj + LN2 + residual not separately timed (closes each bar to its total).
+_BLK_DECOMP = {  # (shared, quant_glue, attn, mlp)  -> sums to measured total
+    "INT8 block": [0.38, 0.68, 0.13, 0.62],   # = 1.81 ms
+    "FP16 block": [0.38, 0.00, 0.10, 0.45],   # = 0.93 ms
+}
+_DECOMP_CATS = [("shared LN+proj+resid (FP16, both)", "#94A3B8"),
+                ("quant/dequant glue (REMOVABLE)",    C_LOWER),
+                ("attention core",                    C_SOTA),
+                ("MLP",                               C_OURS)]
+
+
+def panel_block_decompose(ax):
+    labels = list(_BLK_DECOMP.keys())
+    x = np.arange(len(labels))
+    bottoms = np.zeros(len(labels))
+    for i, (cat, color) in enumerate(_DECOMP_CATS):
+        vals = np.array([_BLK_DECOMP[l][i] for l in labels])
+        hatch = "//" if "REMOVABLE" in cat else None
+        ax.bar(x, vals, 0.5, bottom=bottoms, label=cat, color=color,
+               hatch=hatch, edgecolor="white")
+        for xi, (b, v) in enumerate(zip(bottoms, vals)):
+            if v >= 0.08:
+                ax.text(xi, b + v / 2, f"{v:.2f}", ha="center", va="center",
+                        fontsize=8, fontweight="bold", color="white")
+        bottoms += vals
+    # glue-fused optimistic bound for INT8 = total - glue
+    fused = _BLK_DECOMP["INT8 block"][0] + _BLK_DECOMP["INT8 block"][2] + _BLK_DECOMP["INT8 block"][3]
+    fp16_total = sum(_BLK_DECOMP["FP16 block"])
+    ax.axhline(fused, color=C_OURS, ls=":", lw=1.6)
+    ax.text(1.02, fused, f"INT8 glue-fused bound ≈{fused:.2f} ms\n(still {fused/fp16_total:.2f}× FP16 → still loses)",
+            transform=ax.get_yaxis_transform(), fontsize=8, color=C_OURS,
+            va="center", ha="left", fontweight="bold")
+    ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("prefill block latency (ms), S=512")
+    ax.set_ylim(0, 2.1)
+    ax.set_title("Is it fair? — where the prefill time goes",
+                 fontweight="bold", fontsize=11)
+    ax.legend(fontsize=7.5, loc="upper right"); ax.grid(axis="y", alpha=0.25)
+    ax.text(0.5, -0.30,
+            "Honest bracket: removing the eager quant glue (hatched, an integration\n"
+            "artifact) still leaves INT8 > FP16 — the kernels run ~0.7–0.8× cuBLAS at\n"
+            "prefill. Glue-fusion helps DECODE, not prefill. (FP16 ref = cuBLAS/SDPA.)",
+            transform=ax.transAxes, fontsize=8.5, ha="center", va="top",
+            color="#9A3412", style="italic")
+
+
 def main():
     mlp = read_sweep("int8_mlp_sweep.csv")
     attn = read_sweep("int8_attn_sweep.csv")
@@ -441,10 +557,11 @@ def main():
     ncu_attn = read_ncu("ncu_attn_raw.csv")
     sota   = read_sweep("attn_sota.csv")   if os.path.exists(os.path.join(RES, "attn_sota.csv"))   else []
     decode = read_sweep("attn_decode.csv") if os.path.exists(os.path.join(RES, "attn_decode.csv")) else []
+    block  = read_sweep("block.csv")       if os.path.exists(os.path.join(RES, "block.csv"))       else []
 
-    fig = plt.figure(figsize=(19, 22))
-    gs = GridSpec(4, 3, figure=fig, hspace=0.55, wspace=0.26,
-                  top=0.905, bottom=0.04, left=0.10, right=0.98)
+    fig = plt.figure(figsize=(19, 27.5))
+    gs = GridSpec(5, 3, figure=fig, hspace=0.55, wspace=0.26,
+                  top=0.912, bottom=0.03, left=0.10, right=0.98)
 
     # Row 1 — INT8 MLP
     mlp_lat = [("kernel_ms", "INT8 fused (ours)", C_OURS),
@@ -498,28 +615,39 @@ def main():
     panel_decode_speedup(fig.add_subplot(gs[3, 1]), decode)
     panel_kv_footprint(fig.add_subplot(gs[3, 2]))
 
+    # Row 5 — END-TO-END BLOCK integration (the first full-layer wall-clock):
+    # prefill loses → decode wins past ~8K → "is it fair?" decomposition.
+    panel_block_prefill(fig.add_subplot(gs[4, 0]), block)
+    panel_block_decode(fig.add_subplot(gs[4, 1]), block)
+    panel_block_decompose(fig.add_subplot(gs[4, 2]))
+
     fig.suptitle("INT8 Transformer Kernels — Performance & Profiling Dashboard "
                  "(A100-SXM4-40GB, sm_80)\n"
                  "line panels: batch=8, d_model=1024 (head_dim=128);  "
                  "profiling shape b=8 s=512 d_model=1024 d_ff=4096",
-                 fontsize=15, fontweight="bold", y=0.982)
+                 fontsize=15, fontweight="bold", y=0.985)
     # memory-bound thesis banner — the lens for reading the whole sheet
-    fig.text(0.5, 0.945,
+    fig.text(0.5, 0.948,
              "▸ MEMORY-BOUND, not compute-bound:  the win is FEWER HBM BYTES — "
              "INT8 halves every tensor (1 B vs FP16 2 B) and fusion removes the "
              "INT32/FP16 intermediate round-trips a separate _int_mm + "
              "dequant/GELU/requant pipeline pays.\n"
              "Peak TOPS is NOT the target (tensor-pipe util sits ~28–38%); bytes moved is. "
-             "Mid column = byte reduction driving the speedups; row ④ = vs the REAL "
-             "INT8 SOTA (SageAttention) + the decode regime where INT8's KV-cache bytes pay off.",
+             "Row ④ = vs the REAL INT8 SOTA (SageAttention) + decode regime; "
+             "row ⑤ = first end-to-end BLOCK (INT8 wins only long-context decode; prefill honestly loses).",
              ha="center", va="center", fontsize=10.5, color="#1E3A8A",
              bbox=dict(boxstyle="round,pad=0.5", fc="#EFF6FF", ec="#1E3A8A", lw=1.3))
-    # row band labels in the left margin (rotated, centred on each row band)
-    for y, txt in [(0.815, "①  INT8 MLP benchmark"),
-                   (0.600, "②  INT8 attention benchmark"),
-                   (0.385, "③  Profiling: ncu stalls · kernel-time · opt journey"),
-                   (0.165, "④  Long-context: prefill vs SOTA · decode win · KV footprint")]:
-        fig.text(0.018, y, txt, fontsize=13, fontweight="bold", color="#374151",
+    # row band labels in the left margin (rotated), centred on each row's actual
+    # grid band so they stay aligned no matter how many rows the figure has.
+    bottoms, tops, _, _ = gs.get_grid_positions(fig)
+    band_txt = ["①  INT8 MLP benchmark",
+                "②  INT8 attention benchmark",
+                "③  Profiling: ncu stalls · kernel-time · opt journey",
+                "④  Long-context: prefill vs SOTA · decode win · KV footprint",
+                "⑤  End-to-end block: prefill loss · decode win · fairness bracket"]
+    for i, txt in enumerate(band_txt):
+        yc = (bottoms[i] + tops[i]) / 2
+        fig.text(0.018, yc, txt, fontsize=13, fontweight="bold", color="#374151",
                  rotation=90, va="center", ha="center")
 
     out = os.path.join(FIGDIR, "int8_dashboard.png")

@@ -166,9 +166,14 @@ head_dim=64, s=2048):
    pinned by that dependency chain (`ldmatrix → mma → exp/MUFU → pack → mma` +
    cross-tile rescale). More warps / less smem traffic do not move it; only
    restructuring the softmax dependency does (deep, high-risk).
-3. **The MLP GEMMs are the live target instead** — compute-bound, multi-stage
-   cp.async pipelining unexplored (§4 #1). Check spills/regs with:
-   `nvcc -arch=sm_80 -O3 --std=c++17 --ptxas-options=-v -c kernels/int8_mlp.cu -o /dev/null 2>&1 | grep -E "registers|spill"`
+3. **The MLP GEMMs are CLOSED — do NOT re-open them** (this was the live target
+   through iter 8, but is now perf-exhausted; see §4 #1 and the STATUS box). In
+   particular multi-stage cp.async is a proven dead end, not "unexplored". The
+   only kernel-internal perf lever left in the whole project is the attention
+   softmax dependency chain in #2 — deep, high-risk. If you still want to inspect
+   MLP spills/regs (for an accuracy change, not perf): `nvcc -arch=sm_80 -O3
+   --std=c++17 --ptxas-options=-v -c kernels/int8_mlp.cu -o /dev/null 2>&1 | grep
+   -E "registers|spill"`
 
 Without ncu:
 
@@ -188,6 +193,31 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
 **Optimize first** (by expected return). The before/after ncu numbers behind
 every claim below are in `OPTIMIZATION_LOG.md` — this section is the distilled,
 still-actionable conclusion only.
+
+> **What "winning" means here — read before chasing any GPU metric.** These
+> kernels lose to cuBLAS on *GEMM micro-efficiency* (`tensor_op_imma` ~30–38%,
+> attention `tensor_pipe` ~28%, vs cuBLAS 60%+) and that gap is, by now, mostly
+> structural and exhausted (§4 #1–#2). **That number is NOT the project's value
+> proposition.** The value is at the *workload* level: the fused INT8 forward
+> beats a cuBLAS pipeline (`_int_mm` + separate dequant/GELU/requant) by ~2–5×
+> because the workload is **memory-bound**, and fusion eliminates the HBM
+> round-trips between GEMM/epilogue/quant stages — peak TOPS is irrelevant when
+> the bottleneck is bytes moved. So: do not optimize toward tensor-pipe % for its
+> own sake; optimize toward **fewer HBM bytes / fewer kernel launches / fused
+> epilogues**. A change that raises tensor-pipe % but adds an HBM round-trip is a
+> loss; a change that lowers it but removes a round-trip is a win. (This is also
+> why iter 11's transpose-once and the per-token fused epilogue mattered, while
+> the inner-loop mma reschedules did not.)
+
+> **Accuracy / quantization granularity is a first-class optimization axis — not
+> just the §5 gate.** Empirically it is where the *shippable* wins came from once
+> perf dried up: iter 9's per-channel weight + per-token activation/output quant
+> fixed a **+64%** real-GPT-2 perplexity regression that per-tensor output quant
+> had silently caused. When the perf levers below are exhausted (they nearly all
+> are), the right next move is usually an accuracy/granularity improvement, not
+> another inner-loop micro-opt. The remaining open accuracy target is **attention
+> K/V outliers** (per-channel / smoothing) — the one MLP-vs-attention XFAIL left
+> (README future work). Treat this as target **#0**.
 
 > **STATUS 2026-06-13: the INT8 MLP GEMM kernels are perf-EXHAUSTED.** Every
 > internal ceiling is closed or proven structurally dead — do not re-open the
@@ -260,9 +290,19 @@ still-actionable conclusion only.
   to play it safe — the validation gates + perf gate are the safety net, so a
   failed bold attempt that gets reverted is a better iteration than a committed
   no-op.
+- **Latency (sweep median) is the ONLY gate that counts. ncu metrics are
+  diagnostic, never the goal.** This is the single most-repeated lesson of the
+  journey: moving a bottleneck metric has *almost never* translated to a speedup
+  here. occupancy raised to 4 blocks/SM, smem traffic −24%, finer warp tiling
+  (which doubled `warps_active` and halved `wait`) — every one moved its metric
+  and every one was latency-neutral-or-worse. So do not let a moved metric
+  convince you a change worked; only the wall-clock does. Use metrics to form a
+  hypothesis and to *explain* a result, not to declare one.
 - **A change only counts as progress if it MOVES an ncu bottleneck metric**
   beyond run-to-run noise — `sm__warps_active`,
-  `sm__pipe_tensor_cycles_active`, or `l1tex__data_pipe_lsu_wavefronts_mem_shared`.
+  `sm__pipe_tensor_cycles_active`, or `l1tex__data_pipe_lsu_wavefronts_mem_shared`
+  — AND that shows up as a real latency drop. Moving the metric is necessary but
+  (per the point above) routinely insufficient.
   A latency-neutral micro-opt (no metric moved) is a no-op: report it as such
   and revert it rather than committing, even though it passes the gates.
   **Exception — documented negative results are KEPT, not reverted:** if a bold
@@ -289,6 +329,15 @@ still-actionable conclusion only.
   only when both pass
 - Every commit carries before/after numbers; record negative results too
   (keep them behind ablation flags)
+- **Pivot axis after 2–3 consecutive negative/neutral iterations on the same
+  kernel — that is the signal the well is dry, not a cue to grind harder.** Iters
+  10, 12, 13 were all MLP-GEMM negatives in a row; in hindsight the right move
+  was to pivot earlier. When a kernel's inner loop stops yielding, switch axis:
+  **accuracy / quantization granularity (target #0)**, a *different* kernel, or
+  full-layer integration — rather than the next variant of the same exhausted
+  lever. The do-not-retry list above + the README ablation table exist precisely
+  so you can recognize "I'm about to re-grind a dead axis" before spending an
+  iteration on it.
 
 ## 5. INT8 Accuracy Validation Process
 

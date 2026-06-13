@@ -240,12 +240,24 @@ Hard rules:
   on this shape occupancy is already maxed — a registers-only change that does
   not also reduce shared memory will NOT add a block. No spills, and do not
   drop blocks/SM below the current baseline. Check with ptxas AND re-profile.
-After editing, output exactly two lines:
+After editing, output these lines:
 CHANGE: <files + what you changed>
 TARGET: <which metric you expect to improve and why>
+
+OPTIONAL — only if this change is a NEGATIVE RESULT you want to PRESERVE rather
+than have reverted: an idea you tried that did NOT improve latency, kept solely
+as an OFF-by-default ablation flag (new code fully behind an OFF #define so the
+default path is unchanged) plus a documented note. Per CLAUDE.md §4 "record
+negative results too (keep them behind ablation flags)". If and ONLY if that is
+the case, ALSO append a one-line note to README.md explaining the negative
+result, and output a third line:
+NEGATIVE_RESULT: <one-line why it is worth keeping behind the OFF flag>
+Do NOT output this line for a normal optimization attempt — a neutral
+default-path change with no NEGATIVE_RESULT line is reverted as a no-op.
 EOF
     CHANGE_DESC=$(grep -E "^CHANGE:" "$LOG_DIR/claude_change_$i.log" | tail -1)
     TARGET_DESC=$(grep -E "^TARGET:" "$LOG_DIR/claude_change_$i.log" | tail -1)
+    NEG_DESC=$(grep -E "^NEGATIVE_RESULT:" "$LOG_DIR/claude_change_$i.log" | tail -1)
     if [ -z "$(git status --porcelain kernels/)" ]; then
         log "claude made no kernel change — skipping iteration"
         ITER_RESULTS[$i]="SKIP (no change)"; continue
@@ -312,6 +324,24 @@ EOF
         continue
     fi
     if [ "$ATTN_CODE" -ne 0 ] && [ "$MLP_CODE" -ne 0 ]; then
+        if [ -n "$NEG_DESC" ]; then
+            # Declared negative result: default-path latency is neutral BY DESIGN
+            # (the new code is behind an OFF flag). Preserve it — the value is the
+            # ablation flag + documented negative, not a speedup. Do NOT update the
+            # perf baseline (default unchanged) and do NOT count it as a PASS.
+            log "latency-neutral, but claude declared a NEGATIVE RESULT — committing to preserve it (not a speedup)"
+            git add kernels/ README.md CLAUDE.md 2>/dev/null
+            git commit -m "evolve iter $i (negative result): ${CHANGE_DESC#CHANGE: }
+
+${NEG_DESC}
+Kept behind an OFF-by-default ablation flag; default-path latency neutral
+(attn ${ATTN_DELTA}, mlp ${MLP_DELTA}). Recorded per CLAUDE.md §4.
+
+Co-Authored-By: Claude (evolve.sh) <noreply@anthropic.com>" >/dev/null
+            log "iteration $i NEGATIVE RESULT preserved ($(git rev-parse --short HEAD))"
+            ITER_RESULTS[$i]="KEPT (negative result: ${NEG_DESC#NEGATIVE_RESULT: })"
+            continue
+        fi
         log "latency-neutral (within ~2% noise) — no real improvement, reverting as no-op"
         restore_tree
         ITER_RESULTS[$i]="SKIP (no-op: attn $ATTN_DELTA mlp $MLP_DELTA — within noise)"

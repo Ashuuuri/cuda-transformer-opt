@@ -218,6 +218,13 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
   `sm__pipe_tensor_cycles_active`, or `l1tex__data_pipe_lsu_wavefronts_mem_shared`.
   A latency-neutral micro-opt (no metric moved) is a no-op: report it as such
   and revert it rather than committing, even though it passes the gates.
+  **Exception — documented negative results are KEPT, not reverted:** if a bold
+  idea did not help but is worth recording (so it is not re-attempted), keep it
+  *fully behind an OFF-by-default ablation flag* (default path unchanged) and
+  document it in README. Under `evolve.sh` this is signalled by emitting a
+  `NEGATIVE_RESULT:` line, which makes the otherwise-neutral change commit
+  (preserving the flag + note) instead of being wiped by `git reset --hard`.
+  This is the ONLY way a latency-neutral change should be committed.
 - Treat sweep latency as the **median of ≥5 runs**; run-to-run noise on this
   box is ~2%, so any |delta| < 2% is noise, not a result. Never claim a speedup
   from a single sweep.

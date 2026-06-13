@@ -486,3 +486,53 @@ behind them. Append a new `### Iteration N` here after each optimization
   **The MLP GEMM occupancy lever is now exhausted from both sides; do not
   re-attempt finer warp tiling.** The only remaining kernel-internal perf lever in
   the project stays the attention online-softmax dependency chain (§4 #2).
+
+### Iteration 13 - 2026-06-13
+- **Change**: `kernels/int8_mlp.cu` — fuse the standalone `quantize_rows` pass
+  (FP16 hidden → INT8) into GEMM2's staged smem load. New kernel
+  `gemm_int8_wmma_f16_a16fused_kernel` reads the FP16 hidden directly as its A
+  operand and quantizes each per-token row to INT8 *in shared memory* during the
+  cp.async staging (using the per-row absmax GEMM1 already wrote to
+  `s_row_absmax`), then runs the identical m16n8k32 main loop + FP16 epilogue.
+  Eliminates one kernel launch and the int8-hidden HBM write+read round-trip.
+  Uses dynamic smem (61440 B: FP16 staging double-buffer pushes past the 48 KB
+  static limit; `cudaFuncSetAttribute` opts into the larger carveout, 2 blocks/SM
+  preserved). The existing int8-input path (`mlp_int8_mainloop` +
+  `gemm_int8_wmma_f16_kernel`) is left byte-identical; the fused path is gated
+  behind `INT8_MLP_FUSE_QUANT`. Motivation: `collect_profile.py` showed
+  `quantize_rows` is the largest remaining non-GEMM slice of the graded forward
+  (8.0% of the prepacked path; the iter-11 transpose-once already removed the
+  10.4% transpose), and the GEMMs themselves are CLOSED (§4 #1).
+- **Target metric**: forward wall-clock (remove the 8% `quantize_rows` kernel +
+  its ~48 MB HBM round-trip on the hidden); torch.profiler per-kernel split.
+- **Profiling results**:
+  - ptxas: fused kernel 128 regs (launch_bounds cap held → 2 blocks/SM), small
+    48–60 B spill, 61440 B dynamic smem. No spill/occupancy red flags.
+  - sweep (median of the 12-pt grid), flag ON vs the iter-11 baseline:
+    **REGRESSED +45% to +63%** — d_model=1024/s=512 0.51→0.74 ms (+45%),
+    d_model=1024/s=4096 2.96→4.33 ms (+46%), d_model=2048/s=4096
+    9.79→15.94 ms (+63%). Regression scales with size (i.e. with GEMM2 K-stage
+    count), consistent with per-stage overhead, not a fixed cost.
+  - default path (flag OFF) re-swept: bit-restored to baseline (d1024/s512
+    0.51 ms, d2048/s4096 9.78 ms) — confirms the `#else` path is byte-identical.
+- **Accuracy validation** (flag ON, all 5 gates PASS — the math is correct, the
+  fused output is numerically identical to the unfused path):
+  - [x] Gate 1 (normal cos=1.00000)  [x] Gate 2  [x] Gate 3  [x] Gate 4
+  - [x] Gate 5 (real GPT-2, −0.068%, unchanged)
+- **Conclusion**: NEGATIVE — reverted to OFF-by-default flag. **Cause:** GEMM2 is
+  wait-bound (IMMA-result dependency, §4 #1). The on-load conversion adds a serial
+  `convert_fp16A_to_int8 + __syncthreads` per K-stage *between* the cp.async-wait
+  and the mma — it is NOT overlapped with compute (the convert writes the same
+  int8 buffer the mma then reads) — plus the FP16 staging doubles A's HBM load
+  bytes. Over the 64–128 K-stages of GEMM2 that serial per-stage overhead more
+  than doubles the kernel, swamping the 8% the removed `quantize_rows` saved.
+  **Rules out** fusing the hidden requant into GEMM2's load path: the separate
+  memory-bound `quantize_rows` (running at ~70% HBM bandwidth as its own kernel)
+  is *cheaper* than paying conversion latency inside the latency-bound GEMM. The
+  lever isn't dead in principle — decoupling the convert from the mma critical
+  path (triple-buffer, or convert stage s+1 *during* the mma of stage s) could
+  hide it — but that is a deep restructure for at most an 8% ceiling, lower
+  priority than the attention softmax chain (§4 #2). Kept behind
+  `INT8_MLP_FUSE_QUANT` (OFF) so the experiment + the "GEMM2 can't absorb on-load
+  convert" finding are preserved. **The MLP forward orchestration is now also
+  exhausted** (transpose amortized iter 11; quantize_rows fusion negative iter 13).

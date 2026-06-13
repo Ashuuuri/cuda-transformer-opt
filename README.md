@@ -189,9 +189,10 @@ is in [`OPTIMIZATION_LOG.md`](OPTIMIZATION_LOG.md)**, and the distilled
 
 Both kernels are now **perf-exhausted on every explored lever** — the MLP GEMM
 (smem bank conflicts, global-load latency, the `wait` stall, and occupancy from
-*both* directions) and attention occupancy. The only remaining kernel-internal
-lever is the attention online-softmax dependency chain (deep, high-risk). The
-proofs are in the log.
+*both* directions), the MLP forward orchestration (transpose amortized iter 11;
+fusing `quantize_rows` into GEMM2 regressed +45–63%, iter 13), and attention
+occupancy. The only remaining kernel-internal lever is the attention
+online-softmax dependency chain (deep, high-risk). The proofs are in the log.
 
 ### Accuracy — real-model, per-channel/per-token quant (iter 9)
 
@@ -211,6 +212,7 @@ MLP datasets now pass outright.
 | `INT8_ATTN_DB` | cp.async double-buffer (attention) | 0.58–0.82× (forces TILE_KV down) |
 | `INT8_ATTN_VPREFETCH` | V register prefetch (attention) | 0.75–0.9× (extra barrier) |
 | `INT8_MLP_FINE_WARP` | 4×4 / 512-thread finer tile (MLP) | +15–28% — doubles occupancy & halves `wait`, but halves operand reuse so `tensor_op_imma` net falls |
+| `INT8_MLP_FUSE_QUANT` | fuse `quantize_rows` into GEMM2's load (MLP) | +45–63% — output identical, but GEMM2 is wait-bound and the serial on-load convert per K-stage more than doubles it; the separate memory-bound quantize_rows is cheaper |
 | `INT8_MLP_DYNAMIC=0` | static (non-dynamic) MLP scales | lower accuracy; kept for the .bin flow |
 
 The denser-mma reschedule (iter 10) and the attention 4-blocks/SM raise were

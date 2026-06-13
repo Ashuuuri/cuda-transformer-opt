@@ -193,11 +193,15 @@ still-actionable conclusion only.
 > internal ceiling is closed or proven structurally dead — do not re-open the
 > GEMM inner loop. The only remaining *kernel-internal* perf lever in the project
 > is target #2 (attention online-softmax dependency chain), deep and high-risk.
-> The MLP *forward* still yielded a non-kernel win (iter 11): the per-forward W
-> transpose (~10% of forward time) is now amortized via a prepacked entry point
+> The MLP *forward* yielded a non-kernel win (iter 11): the per-forward W
+> transpose (~10% of forward time) is amortized via a prepacked entry point
 > (`int8_mlp_forward_prepacked` + `transpose_int8_weights`, transpose-once at
-> load; sweep grades this path). Lesson: the kernel well was dry, the forward
-> orchestration around it was not — look there, not at the GEMM inner loop.
+> load; sweep grades this path). **Forward orchestration is now ALSO exhausted:**
+> the only other non-GEMM slice was `quantize_rows` (8% of the graded forward),
+> and fusing it into GEMM2's load (iter 13, `INT8_MLP_FUSE_QUANT`) REGRESSED
+> +45–63% — GEMM2 is wait-bound and the serial on-load convert per K-stage more
+> than doubles it; the separate memory-bound quantize_rows is cheaper. Do not
+> re-attempt without first decoupling the convert from the mma critical path.
 
 1. ~~**MLP `int8_mlp.cu` GEMMs**~~ — **CLOSED; do not re-attempt any of these**
    (graded shape b=8, s=512, d_model=1024, d_ff=4096; numbers in the log):

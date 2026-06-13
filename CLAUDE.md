@@ -141,22 +141,23 @@ launch__occupancy_limit_shared_mem,sm__maximum_warps_per_active_cycle_pct \
 
 Priorities and how to read them, measured on the **graded** shape (b=8,
 head_dim=64, s=2048):
-1. **Occupancy is already MAXED at 3 blocks/SM** — `warps_active` ~18% equals
-   the `sm__maximum_warps_per_active_cycle_pct` ceiling (18.75% = 12 warps),
-   and it is co-limited by BOTH `launch__occupancy_limit_registers`=3 AND
-   `launch__occupancy_limit_shared_mem`=3 (164 regs at `<128,64>`). A
-   registers-only cut is therefore a **NO-OP** here: smem still caps at 3.
-   Reaching 4 blocks/SM requires cutting BOTH per-thread registers AND
-   shared-memory-per-block below their 4-block thresholds **together**. (The
-   `<64,256>` head_dim=256 config IS register-limited at 2 blocks/SM / 236 regs
-   — but head_dim=256 is NEVER in the sweep, so do not optimize it.) Check
-   spills with:
+1. **Attention occupancy is a DEAD END — do not chase it.** The default
+   `<128,64>` runs at 3 blocks/SM (`warps_active` ~18% = the 18.75% / 12-warp
+   ceiling, co-capped by `occupancy_limit_registers`=3 AND
+   `occupancy_limit_shared_mem`=3, 164 regs). Forcing the `<64,64>` config
+   (122 regs, 19.5 KB smem) DOES reach 4 blocks/SM (limits 3→4, max-warps→25%,
+   warps_active→23.5%) but produced **no speedup** (latency +0–1% seq≥1024,
+   +8% seq=512; `tensor_pipe` stayed ~28% with 16 warps as with 12). A −24%
+   smem-traffic cut also gave no speedup. **Both occupancy levers are
+   empirically exhausted** (README, 2026-06-13) — the bottleneck is the
+   per-warp online-softmax dependency chain, not occupancy or smem traffic.
+2. **Tensor pipe active %** — ~28% on the graded attention shape vs cuBLAS 60%+,
+   pinned by that dependency chain (`ldmatrix → mma → exp/MUFU → pack → mma` +
+   cross-tile rescale). More warps / less smem traffic do not move it; only
+   restructuring the softmax dependency does (deep, high-risk).
+3. **The MLP GEMMs are the live target instead** — compute-bound, multi-stage
+   cp.async pipelining unexplored (§4 #1). Check spills/regs with:
    `nvcc -arch=sm_80 -O3 --std=c++17 --ptxas-options=-v -c kernels/int8_mlp.cu -o /dev/null 2>&1 | grep -E "registers|spill"`
-2. **MIO/smem stalls** (`stalled_mio_throttle`, `mem_shared wavefronts`) — with
-   only 12 warps/SM there are too few to hide the smem round-trip + MMA
-   latency; this gates the tensor pipe. Either cut the round-trip or raise
-   per-warp ILP.
-3. **Tensor pipe active %** — ~28% on the graded shape; cuBLAS reaches 60%+.
 
 Without ncu:
 
@@ -174,27 +175,34 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
 ## 4. Optimization Targets & Rules
 
 **Optimize first** (by expected return):
-1. The WMMA main loop in `int8_attention.cu`. **What is already DONE (do not
-   re-attempt):** the `INT8_ATTN_REGPV=1` default path already keeps P in
-   registers and uses `mma.sync` m16n8k32 QK^T + m16n8k16 P@V, eliminating the
-   scores→smem→ldmatrix round-trip. Iterations 1–6 built and refined exactly
-   this (QK^T → `mma.sync`, `sV` fold, ldmatrix software-pipeline, fused pack)
-   — all latency-neutral, because **they were profiled on a grid-starved toy
-   shape (§3); on the graded shape occupancy was already maxed the whole time.**
-   The "P in registers / mma.sync rewrite" is NOT a remaining lever.
-   **The real levers, on the graded shape (occupancy maxed at 3 blocks/SM,
-   tensor pipe ~28%, see §3):**
-   - **(a) Raise occupancy to 4 blocks/SM** — requires cutting BOTH per-thread
-     registers AND shared-memory-per-block below their 4-block thresholds
-     *together* (a registers-only cut is a no-op; smem co-caps at 3). E.g. a
-     smaller KV tile, or not staging full Q in smem.
-   - **(b) Hide latency at fixed 12 warps/SM** — cut the smem round-trip
-     (`l1tex__...mem_shared` is large) or raise per-warp ILP so the existing
-     warps cover more of the MMA/smem latency that pins tensor pipe at ~28%.
-   Either is a bold, coherent main-loop rewrite — pick one and prove it on the
-   graded shape with `profile_kernel.py`, not `--quick`.
-2. GEMM tiling/pipeline in `int8_mlp.cu` (already matches bare cuBLAS INT8
-   GEMMs; beating FP16 cuBLAS needs a deeper pipeline)
+1. **GEMM tiling/pipeline in `int8_mlp.cu`** — now the PRIMARY target. The two
+   128×128-tile INT8 WMMA GEMMs already match *bare* cuBLAS INT8 GEMMs; beating
+   FP16 cuBLAS needs a deeper software pipeline. **Unexplored and the highest-
+   return lever left:** a multi-stage (3–4 stage) cp.async pipeline on the K
+   loop (the standard CUTLASS technique) to raise tensor-pipe utilization on
+   this compute-bound GEMM. NOTE: cp.async double-buffering was a *negative on
+   attention* (`INT8_ATTN_DB`), but the MLP is a different regime — a long-K
+   128×128 GEMM is exactly where multi-stage pipelining pays — so this is NOT a
+   banned retry. Prove it on the graded MLP shape with `profile_kernel.py mlp`.
+2. The WMMA main loop in `int8_attention.cu` — **occupancy well is DRY; only a
+   deep algorithmic change remains.** What is already DONE (do not re-attempt):
+   the `INT8_ATTN_REGPV=1` default path keeps P in registers and uses `mma.sync`
+   m16n8k32 QK^T + m16n8k16 P@V (iters 1–6: QK^T→`mma.sync`, `sV` fold, ldmatrix
+   software-pipeline, fused pack — all latency-neutral). **BOTH occupancy levers
+   are now empirically dead (see README "4 blocks/SM does not help", 2026-06-13):**
+   - **(a) Raise occupancy to 4 blocks/SM — TESTED, NO SPEEDUP.** The `<64,64>`
+     config reaches a genuine 4 blocks/SM (122 regs, 19.5 KB smem; occupancy
+     limits 3→4, max-warps 18.75%→25%, warps_active ~18%→23.5%) yet latency was
+     neutral-to-worse (+0–1% seq≥1024, +8% seq=512) and `tensor_pipe` stayed
+     ~28% with 16 warps just as with 12. Do not re-attempt occupancy raises.
+   - **(b) Hide latency at fixed 12 warps/SM — TESTED, NO SPEEDUP.** A −24% smem-
+     traffic cut did not move latency either.
+   The ~28% tensor-pipe ceiling is set by the **per-warp serial dependency
+   chain** (`ldmatrix → mma → exp/MUFU → pack → mma` + the cross-KV-tile online-
+   softmax rescale dependency), which neither more warps nor less smem traffic
+   relieves. The ONLY remaining attention lever is breaking that softmax
+   dependency chain itself (e.g. cheaper/approximate exp, decoupling the per-tile
+   rescale) — deeper and higher-risk; attempt only after the MLP is exhausted.
 
 **Do not touch:**
 - LayerNorm and residual paths stay FP16 (in the `validate_int8.py` block

@@ -102,13 +102,23 @@ python validate_int8.py --dataset outlier --kernel mlp   # filters
 python sweep.py --kernel int8_attn
 python sweep.py --kernel int8_mlp
 
-# Consolidated figure: ONE dashboard (results/figures/int8_dashboard.png)
-# replaced the old 20 scattered per-kernel PNGs. Build it after the sweeps:
+# Figures: a clean, seaborn-styled SET — one story per figure (replaced the old
+# single cluttered 15-panel int8_dashboard.png). Build after the sweeps:
 python collect_profile.py     # torch.profiler per-kernel time split (no sudo)
-# (optional) ncu stall metrics for the profiling row — see §3 for the sudo cmd;
+# (optional) ncu stall metrics for the profiling figure — see §3 for the sudo cmd;
 #   save raw `ncu --csv` output to results/ncu_{mlp,attn}_raw.csv
-python make_dashboard.py      # -> results/figures/int8_dashboard.png
-#   (sweep.py --legacy-figs still emits the old per-kernel PNGs if needed)
+python make_figures.py        # -> results/figures/{hero,mlp,attention,profiling,
+                              #    long_context,block,decode_sota}.png
+#   hero.png = the repo showcase headline (4-panel value proposition);
+#   the rest are themed detail figures. make_dashboard.py is KEPT as the data +
+#   panel source of truth (make_figures.py imports it); running it still emits
+#   the old combined int8_dashboard.png if ever needed.
+
+# Decode vs a real QUANTIZED-KV SOTA peer (FlashInfer FP8, equal KV bytes):
+python bench_decode_sota.py   # -> results/decode_sota.csv  (needs flashinfer-python;
+#   our INT8 decode vs FlashInfer FP8 batch decode. FlashInfer has no INT8 KV on
+#   sm_80, so FP8 (also 1 B/elem) is the apples-to-apples peer. MUST run the peer
+#   with use_tensor_cores=True (>2× faster) or the comparison is unfair.)
 ```
 
 The torch extension rebuilds automatically after `.cu` edits; if the cache

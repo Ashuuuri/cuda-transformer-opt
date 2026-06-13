@@ -734,3 +734,50 @@ behind them. Append a new `### Iteration N` here after each optimization
   but will NOT rescue prefill. The decode long-context win is the ROBUST signal —
   it survives both handicaps; the prefill loss is partly artifact but holds even
   when the artifact is removed.
+
+### Iteration 18 - 2026-06-13 (DECODE vs a real QUANTIZED-KV SOTA — FlashInfer FP8)
+- **Change**: new `bench_decode_sota.py` + `results/decode_sota.csv` (no kernel
+  change). Closes the biggest credibility gap in the project's story: the decode
+  win was only ever measured vs **FP16** SDPA (`bench_attn_decode.py`), never vs a
+  *quantized* decode kernel — an asymmetry (prefill was benched vs the INT8 SOTA
+  SageAttention, decode was not). The honest peer for a quantized-KV decode kernel
+  is another quantized-KV decode kernel.
+- **Peer choice**: **FlashInfer 0.6.12 batch decode, FP8 (e4m3) paged KV.**
+  FlashInfer does NOT support an INT8 KV cache on sm_80 (only FP8), so FP8 is the
+  apples-to-apples peer: **both stream 1 byte/elem of KV → identical KV bandwidth**,
+  isolating kernel quality at equal bytes. FP8 e4m3 is also the production-deployed
+  quantized-KV format, so it is the *stronger* peer, not a weaker one.
+- **Fairness checks (these make the comparison credible)**:
+  - `use_tensor_cores=True` on the FlashInfer wrapper is REQUIRED — it >2× speeds
+    FP8 decode at these head dims (3.29→1.52 ms @ B64 H16 D64 S8K). Leaving it at
+    the default `False` would have crippled the SOTA and produced a false win.
+  - Both kernels score cos vs the SAME fp32 SDPA reference on the original inputs,
+    so each pays for its own quantization error.
+- **Profiling results** (mean ms/decode step, 50 it; A100-40GB; ours/fp8 >1 = ours
+  faster at equal KV bytes):
+  - **D=64 (our tuned dp4a path): par-to-WIN.** ours/fp8 = 1.28/1.15/1.08/0.94/1.05
+    (B32) · 0.96/1.02/1.08/1.02/1.03 (B64) · **1.22**/1.12/1.10/1.09 (B128) across
+    S=2K..32K. Mostly ≥1.0, up to 1.28×; a couple of ~0.94–0.96 dips. AND more
+    accurate: ours cos **0.99995** vs fp8 **0.99922** (our per-token INT8 scales
+    beat FP8's per-tensor scale).
+  - **D=128 (our UNtuned split-KV path): LOSS.** ours/fp8 = 0.74/0.59/0.64/0.58/0.60
+    — FlashInfer's tuned FP8 is ~1.3–1.7× faster. Consistent with the known-weak
+    D=128 decode path (CLAUDE.md: split-KV lane-per-dim, iter 14, only 1.23×;
+    dp4a@128 is a do-not-retry regression). This is now a concrete, measured
+    optimization target, not a vague gap.
+  - **vs FlashInfer FP16** (unquantized, 2 B/elem, where it still fits): ours/fp16
+    ≈ 1.06–1.21× — the structural half-bytes win, but SMALLER than the 1.2–1.6×
+    that `bench_attn_decode.py` showed vs PyTorch SDPA. FlashInfer's FP16 decode is
+    better tuned than SDPA, so the weaker SDPA baseline had flattered us.
+- **Accuracy validation**: this adds no kernel/quant math change, so validate_int8
+  Gates 1–5 are unaffected. The per-output cos vs fp32 (above) confirms both paths
+  are gate-passing (ours ≥0.9999, fp8 ≥0.9992).
+- **Conclusion**: the decode story is now honest AND stronger. At **D=64** our INT8
+  decode is **competitive-to-slightly-ahead of the production FP8 SOTA at equal KV
+  bandwidth, and more accurate** — so the decode win is real *kernel quality*, not
+  merely "INT8 vs unquantized" (the asymmetry objection is dead). On Ampere INT8 is
+  the *right* quantized format (sm_80 has no FP8 tensor cores → FlashInfer pays a
+  software-dequant tax). The honest cost: at **D=128** our untuned path trails FP8
+  ~1.5×, and the half-bytes margin vs a *well-tuned* FP16 peer is ~1.1× (not 1.2–1.6×).
+  Next actionable kernel target: the D=128 decode path (the only place we lose to a
+  fair quantized peer).

@@ -19,10 +19,15 @@ batch per card, half the bytes streamed per token).
 
 Usage: python3 bench_attn_decode.py
 """
+import os
+import csv
 import torch
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
 from benchmark import benchmark
+
+CSV_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "results", "attn_decode.csv")
 
 # (batch, heads, head_dim) — small to serving-scale; one warp per (b,h), so
 # batch*heads is the parallelism (small b*h is grid-starved on 108 SMs).
@@ -76,6 +81,7 @@ def main():
            f"{'ours/sdpa':>9} | {'cos':>8} | {'KV int8':>9} {'KV fp16':>9} "
            f"{'ours GB/s':>9}")
     print(hdr); print("-" * len(hdr))
+    rows = []
     for (B, H, D) in CONFIGS:
         for S in SEQS:
             r = run(ext, B, H, D, S)
@@ -83,7 +89,13 @@ def main():
             print(f"{B:>4} {H:>3} {D:>4} {S:>5} | {r['ours_ms']:8.4f} {r['sdpa_ms']:8.4f} "
                   f"{spd:8.2f}x | {r['cos']:8.5f} | {r['kv_int8_mb']:8.1f}M {r['kv_fp16_mb']:8.1f}M "
                   f"{r['ours_gbps']:9.1f}")
-    print("\nours/sdpa > 1.0 = INT8 decode kernel faster than the FP16 path.")
+            r["speedup_vs_sdpa"] = spd
+            rows.append(r)
+    with open(CSV_OUT, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
+    print(f"\n[CSV] {len(rows)} rows -> {CSV_OUT}")
+    print("ours/sdpa > 1.0 = INT8 decode kernel faster than the FP16 path.")
     print("INT8 KV cache is half the FP16 bytes (more context / bigger batch per card).")
     print("A100-SXM4 HBM peak ~1555 GB/s — ours GB/s shows how bandwidth-bound we are.\n")
 

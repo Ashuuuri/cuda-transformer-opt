@@ -310,15 +310,109 @@ def panel_journey(ax):
     ax.set_ylim(0, 70)
 
 
+def panel_sota_prefill(ax, rows):
+    """Prefill latency vs the REAL INT8 SOTA peer (SageAttention), not FP16."""
+    if not rows:
+        ax.text(0.5, 0.5, "no attn_sota.csv\n(run bench_attn_sota.py)",
+                ha="center", va="center"); ax.set_axis_off(); return
+    rows = sorted(rows, key=lambda r: r["seq_len"])
+    x = [int(r["seq_len"]) for r in rows]
+    series = [("ours_ms", "INT8 fused (ours)", C_OURS),
+              ("sage_ms", "SageAttention (INT8 SOTA)", C_SOTA),
+              ("fa2_ms",  "FlashAttn-2 (FP16 ref)", C_FP16)]
+    for col, lbl, color in series:
+        y = [r[col] for r in rows if isinstance(r.get(col), float)]
+        if len(y) == len(x):
+            ax.plot(x, y, marker="o", color=color, label=lbl, linewidth=2, markersize=5)
+    for r in rows:                                   # annotate ours/sage
+        sp = r.get("speedup_vs_sage")
+        if isinstance(sp, float):
+            ax.annotate(f"{sp:.2f}×", (int(r["seq_len"]), r["ours_ms"]),
+                        textcoords="offset points", xytext=(0, -13),
+                        fontsize=8, fontweight="bold", color=C_OURS, ha="center")
+    ax.set_xscale("log", base=2); ax.set_yscale("log", base=10)
+    ax.set_xticks(x); ax.set_xticklabels(x)
+    ax.set_xlabel("seq_len (prefill, seq_q==seq_kv)"); ax.set_ylabel("latency (ms)")
+    ax.set_title("Prefill vs REAL INT8 SOTA — SageAttention (b=8 h=8 d=64)",
+                 fontweight="bold", fontsize=11)
+    ax.grid(True, which="both", alpha=0.25); ax.legend(fontsize=8, loc="upper left")
+    ax.text(0.5, -0.30,
+            "× = ours/SageAttention. Ours wins short/mid seq, ≈parity@2048, "
+            "loses@4096;\nand is slightly MORE accurate (cos 0.99995 vs sage 0.99992).",
+            transform=ax.transAxes, fontsize=8.5, ha="center", va="top",
+            color="#166534", style="italic")
+
+
+def _decode_at(rows, S):
+    sub = [r for r in rows if int(r["S"]) == S]
+    sub.sort(key=lambda r: (int(r["B"]), int(r["H"]), int(r["D"])))
+    return sub
+
+
+def _cfg_label(r):
+    return f"B{int(r['B'])}\nH{int(r['H'])} D{int(r['D'])}"
+
+
+def panel_decode_speedup(ax, rows, S):
+    if not rows:
+        ax.text(0.5, 0.5, "no attn_decode.csv\n(run bench_attn_decode.py)",
+                ha="center", va="center"); ax.set_axis_off(); return
+    sub = _decode_at(rows, S)
+    x = np.arange(len(sub))
+    y = [r["speedup_vs_sdpa"] for r in sub]
+    colors = [C_SOTA if v >= 1.0 else C_FP16 for v in y]
+    ax.bar(x, y, 0.6, color=colors, alpha=0.9)
+    for xi, v in zip(x, y):
+        ax.text(xi, v + 0.02, f"{v:.2f}×", ha="center", va="bottom",
+                fontsize=8, fontweight="bold")
+    ax.axhline(1.0, color="gray", ls="--", lw=1.2)
+    ax.set_xticks(x); ax.set_xticklabels([_cfg_label(r) for r in sub], fontsize=8)
+    ax.set_ylabel("decode speedup vs FP16 SDPA (>1 = ours faster)")
+    ax.set_title(f"Decode vs FP16 SDPA (S={S}) — INT8 KV cache",
+                 fontweight="bold", fontsize=11)
+    ax.grid(axis="y", alpha=0.25)
+    ax.text(0.5, -0.30,
+            "Serving scale (B≥32) wins 1.2–1.6×; tiny B=8 is grid-starved\n"
+            "(b·h too small for 108 SMs) — a launch-shape limit, not a kernel one.",
+            transform=ax.transAxes, fontsize=8.5, ha="center", va="top",
+            color="#1E3A8A", style="italic")
+
+
+def panel_decode_bw(ax, rows, S):
+    if not rows:
+        ax.text(0.5, 0.5, "no attn_decode.csv", ha="center", va="center")
+        ax.set_axis_off(); return
+    sub = _decode_at(rows, S)
+    x = np.arange(len(sub))
+    y = [r["ours_gbps"] for r in sub]
+    ax.bar(x, y, 0.6, color=C_OURS, alpha=0.9, label="ours achieved GB/s")
+    ax.axhline(1555, color="gray", ls="--", lw=1.3, label="A100 HBM peak ≈1555 GB/s")
+    for xi, v in zip(x, y):
+        ax.text(xi, v + 12, f"{v:.0f}", ha="center", va="bottom", fontsize=8)
+    ax.set_xticks(x); ax.set_xticklabels([_cfg_label(r) for r in sub], fontsize=8)
+    ax.set_ylabel("KV-cache HBM bandwidth (GB/s)")
+    ax.set_ylim(0, 1700)
+    ax.set_title(f"Decode achieved HBM BW (S={S}) — bandwidth-bound",
+                 fontweight="bold", fontsize=11)
+    ax.legend(fontsize=8, loc="upper left"); ax.grid(axis="y", alpha=0.25)
+    ax.text(0.5, -0.30,
+            "Up to ~826 GB/s (~53% of peak) → decode is bandwidth-bound on the KV\n"
+            "cache, and INT8 stores it at HALF the FP16 bytes/token (the serving win).",
+            transform=ax.transAxes, fontsize=8.5, ha="center", va="top",
+            color="#1E3A8A", style="italic")
+
+
 def main():
     mlp = read_sweep("int8_mlp_sweep.csv")
     attn = read_sweep("int8_attn_sweep.csv")
     ncu_mlp = read_ncu("ncu_mlp_raw.csv")
     ncu_attn = read_ncu("ncu_attn_raw.csv")
+    sota   = read_sweep("attn_sota.csv")   if os.path.exists(os.path.join(RES, "attn_sota.csv"))   else []
+    decode = read_sweep("attn_decode.csv") if os.path.exists(os.path.join(RES, "attn_decode.csv")) else []
 
-    fig = plt.figure(figsize=(19, 17))
-    gs = GridSpec(3, 3, figure=fig, hspace=0.48, wspace=0.26,
-                  top=0.885, bottom=0.05, left=0.10, right=0.98)
+    fig = plt.figure(figsize=(19, 22))
+    gs = GridSpec(4, 3, figure=fig, hspace=0.55, wspace=0.26,
+                  top=0.905, bottom=0.04, left=0.10, right=0.98)
 
     # Row 1 — INT8 MLP
     mlp_lat = [("kernel_ms", "INT8 fused (ours)", C_OURS),
@@ -366,26 +460,32 @@ def main():
     panel_kerneltime(fig.add_subplot(gs[2, 1]))
     panel_journey(fig.add_subplot(gs[2, 2]))
 
+    # Row 4 — REAL INT8 SOTA (SageAttention) + decode regime
+    panel_sota_prefill(fig.add_subplot(gs[3, 0]), sota)
+    panel_decode_speedup(fig.add_subplot(gs[3, 1]), decode, 4096)
+    panel_decode_bw(fig.add_subplot(gs[3, 2]), decode, 4096)
+
     fig.suptitle("INT8 Transformer Kernels — Performance & Profiling Dashboard "
                  "(A100-SXM4-40GB, sm_80)\n"
                  "line panels: batch=8, d_model=1024 (head_dim=128);  "
                  "profiling shape b=8 s=512 d_model=1024 d_ff=4096",
-                 fontsize=15, fontweight="bold", y=0.975)
+                 fontsize=15, fontweight="bold", y=0.982)
     # memory-bound thesis banner — the lens for reading the whole sheet
-    fig.text(0.5, 0.925,
+    fig.text(0.5, 0.945,
              "▸ MEMORY-BOUND, not compute-bound:  the win is FEWER HBM BYTES — "
              "INT8 halves every tensor (1 B vs FP16 2 B) and fusion removes the "
              "INT32/FP16 intermediate round-trips a separate _int_mm + "
              "dequant/GELU/requant pipeline pays.\n"
-             "Peak TOPS is NOT the target (tensor-pipe util sits ~28–38%); "
-             "bytes moved is.  The middle column shows the byte reduction that "
-             "drives the measured speedups in the right column.",
+             "Peak TOPS is NOT the target (tensor-pipe util sits ~28–38%); bytes moved is. "
+             "Mid column = byte reduction driving the speedups; row ④ = vs the REAL "
+             "INT8 SOTA (SageAttention) + the decode regime where INT8's KV-cache bytes pay off.",
              ha="center", va="center", fontsize=10.5, color="#1E3A8A",
              bbox=dict(boxstyle="round,pad=0.5", fc="#EFF6FF", ec="#1E3A8A", lw=1.3))
     # row band labels in the left margin (rotated, centred on each row band)
-    for y, txt in [(0.755, "①  INT8 MLP benchmark"),
-                   (0.470, "②  INT8 attention benchmark"),
-                   (0.185, "③  Profiling: ncu stalls · kernel-time · opt journey")]:
+    for y, txt in [(0.815, "①  INT8 MLP benchmark"),
+                   (0.600, "②  INT8 attention benchmark"),
+                   (0.385, "③  Profiling: ncu stalls · kernel-time · opt journey"),
+                   (0.165, "④  Real INT8 SOTA (SageAttention) + decode regime")]:
         fig.text(0.018, y, txt, fontsize=13, fontweight="bold", color="#374151",
                  rotation=90, va="center", ha="center")
 

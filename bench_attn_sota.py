@@ -28,10 +28,15 @@ Usage:  python3 bench_attn_sota.py            # graded prefill grid
         python3 bench_attn_sota.py 512 1024   # specific seq lens
 """
 import sys
+import os
+import csv
 import torch
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
 from benchmark import benchmark
+
+CSV_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "results", "attn_sota.csv")
 
 BATCH, HEADS, HEAD_DIM = 8, 8, 64
 SEQS = [512, 1024, 2048, 4096]
@@ -122,6 +127,7 @@ def main():
            f"{'ours/sage':>9} {'ours/fa2':>9} | "
            f"{'ours cos':>9} {'sage cos':>9}")
     print(hdr); print("-" * len(hdr))
+    rows = []
     for s in seqs:
         r = run_shape(int8_ext, BATCH, HEADS, s, HEAD_DIM)
         sage_ms = r["sage_ms"]
@@ -134,7 +140,19 @@ def main():
               f"{r['ours_cos']:9.5f} {sage_cos}")
         if r.get("sage_err"):
             print(f"        sage error: {r['sage_err']}")
-    print("\nspeedup > 1.0x means ours is faster.  cos vs fp32 SDPA reference.\n")
+        rows.append({
+            "seq_len": s, "ours_ms": r["ours_ms"], "sage_ms": sage_ms or "",
+            "fa2_ms": r["fa2_ms"], "ours_cos": r["ours_cos"],
+            "sage_cos": r["sage_cos"] if r["sage_cos"] is not None else "",
+            "fa2_cos": r["fa2_cos"],
+            "speedup_vs_sage": (sage_ms / r["ours_ms"]) if sage_ms else "",
+            "speedup_vs_fa2": r["fa2_ms"] / r["ours_ms"],
+        })
+    with open(CSV_OUT, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
+    print(f"\n[CSV] {len(rows)} rows -> {CSV_OUT}")
+    print("speedup > 1.0x means ours is faster.  cos vs fp32 SDPA reference.\n")
 
 
 if __name__ == "__main__":

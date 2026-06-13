@@ -294,6 +294,24 @@ is pure tiling). The new ceiling is the `wait` MMA-dependency stall
 (`tensor_op_imma` 30%/38% vs cuBLAS 60%+) at structurally-fixed 2-block
 occupancy.
 
+**Negative result — denser-mma reschedule does not help; the MLP is now
+perf-exhausted (2026-06-13, iter 10).** The `wait` ceiling above looked
+addressable by a denser warp-level mma schedule. Tested: hoist both row tiles'
+A fragments per kk and make the col-tile loop outer, so each weight (B) fragment
+loads once and is reused across row tiles, with the 4 mma per col tile issuing
+back-to-back into 4 distinct accumulators. Result: **+1.5% to +3.0% latency
+regression across all 12 sweep shapes** (median of 5 runs), reverted. Two
+reasons it cannot work: (1) GEMM2's `tensor_op_imma` (38.25→38.24%) and `wait`
+(28.17→28.18%) were **byte-identical** under the reorder — `ptxas` already
+common-subexpression-eliminates the "redundant" B loads, so the warp-level mma
+order is already at the compiler's optimum; the load redundancy was a phantom.
+(2) The `wait` stall is structural: hiding MMA-result latency needs more
+independent accumulator chains in flight, but the `acc[2][4][8]` tile is already
+64 registers and any more spills at the fixed 2-block/SM occupancy. Both MLP
+perf levers — occupancy and denser-mma — are now empirically dead; the only
+remaining perf lever in the project is the attention online-softmax dependency
+chain.
+
 ### INT8 MLP: real-model accuracy — per-channel/per-token quant (iter 9, 2026-06-13)
 
 The earlier accuracy story (per-tensor scales, "task-level ppl +0.011%") was
@@ -330,8 +348,12 @@ gitignored; regenerate it on a fresh checkout with `python prepare_real_corpus.p
 
 ### Future work
 
-- `mma.sync` PTX path (m16n8k32 for INT8 QK^T, register-resident softmax
-  weights) — the structural ceiling of the `nvcuda::wmma` API is the
-  scores smem round-trip.
+- **Attention online-softmax dependency chain (the only remaining perf lever).**
+  With the MLP now perf-exhausted (occupancy + denser-mma both dead, iter 10),
+  attention's ~28% `tensor_pipe` ceiling — pinned by the per-warp
+  `ldmatrix → mma → exp/MUFU → pack → mma` + cross-KV-tile rescale chain — is the
+  last perf target. Breaking it (cheaper/approximate exp, decoupling the per-tile
+  rescale) is deep and high-risk; both occupancy levers there are already proven
+  dead (see "4 blocks/SM does not help").
 - Per-channel / smoothing for **attention** K/V (the remaining outlier XFAIL is
   attention-only; the MLP per-token output already shipped, iter 9).

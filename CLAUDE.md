@@ -178,8 +178,16 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
 ## 4. Optimization Targets & Rules
 
 **Optimize first** (by expected return):
-1. **The `wait` (MMA dependency) stall in the `int8_mlp.cu` GEMMs** — the live
-   PRIMARY target after iters 7–8 cleared the two prior ceilings. History on the
+> **STATUS 2026-06-13: the INT8 MLP is now perf-EXHAUSTED.** All three of its
+> ceilings — smem bank conflicts (iter 7), global-load latency (iter 8), and the
+> `wait` MMA-dependency stall (iter 10) — are closed or proven structurally dead.
+> The single remaining perf lever in the project is target #2 below (attention
+> online-softmax dependency chain), which is deep and high-risk. The MLP entry
+> #1 is kept as history; **do not re-open it.**
+
+1. ~~**The `wait` (MMA dependency) stall in the `int8_mlp.cu` GEMMs**~~ —
+   **CLOSED (iter 10): the denser-mma lever is a proven dead end (see the
+   `wait` bullet below); the MLP perf well is dry.** History on the
    graded MLP shape (b=8, s=512, d_model=1024, d_ff=4096):
    - **smem bank conflicts: FIXED in iter 7** (do not re-attempt). Were
      L1/smem-pipe bound (`l1tex` 78%/67%, `dram` 3–4%, ~46% of smem-load
@@ -203,15 +211,22 @@ Profile first: `int8_wmma_attention_kernel` (largest share of time), then
      hides the latency, and a 3rd buffer would grow smem past the epilogue's
      32 KB ceiling. (cp.async double-buffer was also a *negative on attention*,
      `INT8_ATTN_DB`.)
-   - **NOW: `wait` (~21%/28%, the new top stall) = MMA-result dependency
-     latency.** `tensor_op_imma` is 30%/38% vs cuBLAS 60%+; the gap is the per-
-     warp serial chain feeding the IMMA pipe at fixed 2-block occupancy
-     (occupancy is structurally dead — the `acc[2][4][8]` register tile alone is
-     ~64 regs, so `launch_bounds(256,3)` would spill catastrophically). The
-     remaining lever is a denser-mma schedule that overlaps more independent IMMA
-     chains (e.g. reorder the rt×ct×{n8-halves} issue so back-to-back mma.sync hit
-     distinct accumulators, or restructure the warp output tile). Confirm with
-     `wait`/`tensor_op_imma` on `profile_kernel.py mlp`, not `--quick`.
+   - **`wait` (~21%/28%, top stall) = MMA-result dependency latency — and the
+     denser-mma lever is now ALSO DEAD (iter 10, do not re-attempt).**
+     `tensor_op_imma` is 30%/38% vs cuBLAS 60%+; the gap is the per-warp serial
+     chain feeding the IMMA pipe at fixed 2-block occupancy (occupancy is
+     structurally dead — the `acc[2][4][8]` register tile alone is ~64 regs, so
+     `launch_bounds(256,3)` would spill catastrophically). Iter 10 tested the
+     documented denser-mma reschedule (hoist A fragments, col-tile-outer so each
+     B fragment loads once, 4 distinct-accumulator mma back-to-back) → **+1.5% to
+     +3.0% latency REGRESSION across all 12 sweep shapes, reverted.** Two reasons
+     it cannot work: (a) GEMM2's `tensor_op_imma`/`wait` were **byte-identical**
+     under the reorder → ptxas already CSE's the "redundant" B loads and the
+     warp-level mma order is already at the compiler's optimum (no intra-warp
+     headroom); (b) the `wait` stall is structural — hiding it needs more
+     independent accumulator chains, but the 64-reg acc tile already maxes the
+     register budget. **MLP perf is exhausted on both the occupancy and the
+     denser-mma levers.** Do not re-attempt either.
 2. The WMMA main loop in `int8_attention.cu` — **occupancy well is DRY; only a
    deep algorithmic change remains.** What is already DONE (do not re-attempt):
    the `INT8_ATTN_REGPV=1` default path keeps P in registers and uses `mma.sync`
@@ -715,3 +730,40 @@ After each optimization, append a section at the bottom of this file:
 - **Conclusion**: pass — the INT8 MLP is now accurate on a real model, validated
   by a realistic gate. Perf targets (tensor_op_imma toward cuBLAS) unchanged and
   still live.
+
+### Iteration 10 - 2026-06-13  (NEGATIVE RESULT — reverted, do not re-attempt)
+- **Change (reverted)**: `kernels/int8_mlp.cu` `mlp_int8_mainloop` — the
+  documented "denser-mma schedule" lever. Restructured the inner mma issue:
+  hoisted BOTH row tiles' A fragments per kk into `a[WARP_ROW_TILES][4]`, made
+  the col-tile loop outer so each B (weight) fragment loads **once** and is
+  reused across row tiles (previously loaded inside the rt loop → looked 2×
+  redundant), with the 4 mma per col tile (2 rt × 2 n8-halves) issuing
+  back-to-back into 4 distinct accumulators.
+- **Target metric**: `l1tex__data_pipe_lsu_wavefronts_mem_shared` down (halve
+  B-LDS) and `tensor_op_imma` up / `wait` down (denser back-to-back IMMA).
+- **Profiling results** (graded shape b=8 s=512, median of 5; full 12-pt sweep):
+  - **latency: +1.5% to +3.0% across ALL 12 sweep shapes** — a systematic
+    REGRESSION, not noise.
+  - **GEMM2 metrics byte-identical**: `tensor_op_imma` 38.25→38.24%, `wait`
+    28.17→28.18%. → ptxas was **already CSE-ing the "redundant" B loads** across
+    the unrolled rt loop; there were no shared-loads to remove. The reorder
+    bought nothing.
+  - **GEMM1 got worse**: `tensor_op_imma` 30.18→28.90%, `wait` 18.96→21.62%
+    (the hoisted A fragments' larger live-register footprint traded
+    `long_scoreboard` 11.90→5.41% for more `wait`). regs 128 (held), still
+    2 blocks/SM.
+- **Accuracy validation**: all 5 gates PASS bit-identically (pure reorder, same
+  int32 accumulation order; Gate 5 real GPT-2 −0.068% unchanged) — but accuracy
+  is irrelevant here since latency regressed.
+- **Conclusion**: NEGATIVE — reverted (a regression with no metric improved is
+  not kept even behind a flag). **Two lessons, do not re-attempt:** (1) the
+  warp-level mma issue order is **already at ptxas's optimum** — GEMM2 is
+  byte-identical under reorder, so intra-warp rescheduling has no headroom; the
+  "redundant B load" was a phantom (compiler CSE'd it). (2) The `wait` stall
+  (top stall, ~28% GEMM2 = mma-result-dependency latency) is **structural**: at
+  the fixed 2-block/SM occupancy the only way to hide it is more independent
+  accumulator chains, but the `acc[2][4][8]` tile is already 64 regs and any
+  more spills. **This is the same wall the occupancy lever hit — the MLP perf
+  well is now dry for both the occupancy AND the denser-mma levers.** The ONLY
+  remaining perf lever in the whole project is the attention online-softmax
+  dependency chain (§4 #2) — deep and high-risk.

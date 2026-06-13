@@ -447,24 +447,50 @@ void int8_wmma_attention_kernel(
 
         float lsum0 = 0.f, lsum1 = 0.f;
 #if INT8_ATTN_REGPV
-        // Softmax weights → mma.m16n8k16 A fragments, packed in registers.
-        // The WMMA m16n16k16 accumulator element positions (frow0/frow1 ×
-        // fcol_lo,+1,+8,+9) are exactly the A-fragment positions of two
-        // n-halves, so no shuffle is needed: a0={w0,w1} a1={u0,u1} (rows
-        // frow0/frow1, cols fcol_lo,+1), a2={w8,w9} a3={u8,u9} (cols +8,+9).
-        uint32_t p_frag[n_kv_groups][4];
+        // Softmax weights → mma.m16n8k16 A fragments, consumed immediately by
+        // the P@V MMAs of the SAME KV group. Fusing the weight-pack with the
+        // P@V MMA keeps only one group's packed weights live (pf[4]) instead
+        // of the full p_frag[n_kv_groups][4] array, and — the point of this
+        // iteration — interleaves the softmax exp/pack (MUFU pipe) with the
+        // ldmatrix+mma (LSU/tensor pipe) across groups instead of running them
+        // as two serial phases, so the transcendental latency hides behind the
+        // MMAs. (The global register peak is set by the QK^T cast loop, not
+        // here, so the ptxas register count is unchanged.) The WMMA m16n16k16
+        // accumulator element positions (frow0/frow1 × fcol_lo,+1,+8,+9) are
+        // exactly the A-fragment positions of two n-halves, so no shuffle is
+        // needed: a0={w0,w1}
+        // a1={u0,u1} (cols fcol_lo,+1), a2={w8,w9} a3={u8,u9} (cols +8,+9).
+        // V comes via ldmatrix.trans (four 8x8 tiles = both B fragments of a
+        // 16-wide head-dim slice). s_V_fp16 has been visible since the load
+        // barrier at tile start (the prefetch path writes it after QK^T, so
+        // it needs an extra block barrier here).
+#if INT8_ATTN_VPREFETCH
+        __syncthreads();
+#endif
+        const int ld_row = lane & 15;          // k offset inside the tile
+        const int ld_col = (lane >> 4) * 8;    // n offset (low/high half)
         #pragma unroll
         for (int g = 0; g < n_kv_groups; ++g) {
             const float w0=__expf(sf[g][0]-rmax0), w1=__expf(sf[g][1]-rmax0);
             const float w8=__expf(sf[g][4]-rmax0), w9=__expf(sf[g][5]-rmax0);
             lsum0 += w0+w1+w8+w9;
-            p_frag[g][0] = attn_pack_half2(w0, w1);
-            p_frag[g][2] = attn_pack_half2(w8, w9);
             const float u0=__expf(sf[g][2]-rmax1), u1=__expf(sf[g][3]-rmax1);
             const float u8=__expf(sf[g][6]-rmax1), u9=__expf(sf[g][7]-rmax1);
             lsum1 += u0+u1+u8+u9;
-            p_frag[g][1] = attn_pack_half2(u0, u1);
-            p_frag[g][3] = attn_pack_half2(u8, u9);
+            uint32_t pf[4];
+            pf[0] = attn_pack_half2(w0, w1);
+            pf[1] = attn_pack_half2(u0, u1);
+            pf[2] = attn_pack_half2(w8, w9);
+            pf[3] = attn_pack_half2(u8, u9);
+            #pragma unroll
+            for (int s = 0; s < n_slices; ++s) {
+                uint32_t b0, b1, b2, b3;
+                attn_ldmatrix_x4_trans(b0, b1, b2, b3,
+                    &s_V_fp16[(g * ATTN_WMMA_N + ld_row) * vs
+                              + s * ATTN_WMMA_N + ld_col]);
+                attn_mma_m16n8k16(&frag_out[s][0], pf, b0, b1);
+                attn_mma_m16n8k16(&frag_out[s][4], pf, b2, b3);
+            }
         }
 #else
         // Softmax weights → s_scores (FP16, for attn × V WMMA).
@@ -490,33 +516,13 @@ void int8_wmma_attention_kernel(
         lsum1 += __shfl_xor_sync(0xffffffff, lsum1, 2);
         rsum0 += lsum0;  rsum1 += lsum1;
 
-        // attn × V.
+        // attn × V (REGPV fuses P@V into the weights loop above).
+#if !INT8_ATTN_REGPV
 #if INT8_ATTN_VPREFETCH
         __syncthreads();  // s_V_fp16 was written block-wide after QK^T
-#elif !INT8_ATTN_REGPV
+#else
         __syncwarp();     // s_scores: warp-internal write → fragment read
 #endif
-#if INT8_ATTN_REGPV
-        // P stays in registers as A fragments; V comes via ldmatrix.trans
-        // (four 8x8 tiles = both B fragments of a 16-wide head-dim slice).
-        // s_V_fp16 has been visible since the load barrier at tile start.
-        {
-            const int ld_row = lane & 15;          // k offset inside the tile
-            const int ld_col = (lane >> 4) * 8;    // n offset (low/high half)
-            #pragma unroll
-            for (int s = 0; s < n_slices; ++s) {
-                #pragma unroll
-                for (int g = 0; g < n_kv_groups; ++g) {
-                    uint32_t b0, b1, b2, b3;
-                    attn_ldmatrix_x4_trans(b0, b1, b2, b3,
-                        &s_V_fp16[(g * ATTN_WMMA_N + ld_row) * vs
-                                  + s * ATTN_WMMA_N + ld_col]);
-                    attn_mma_m16n8k16(&frag_out[s][0], p_frag[g], b0, b1);
-                    attn_mma_m16n8k16(&frag_out[s][4], p_frag[g], b2, b3);
-                }
-            }
-        }
-#else
         // k outer / s inner: each scores fragment is loaded once per k-step
         // and reused across all head_dim slices (was reloaded n_slices times).
         #pragma unroll

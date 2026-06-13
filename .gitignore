@@ -18,3 +18,8 @@ test_int8
 *.sqlite
 results/nsys_*_stats.txt
 results/ncu_*_report.txt
+
+# ...but the curated Nsight reports under results/nsight/ ARE committed (for
+# downloading + opening locally in the Nsight GUI). See results/nsight/README.md.
+!results/nsight/
+!results/nsight/*.nsys-rep
